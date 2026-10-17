@@ -1,0 +1,161 @@
+// Proof of delivery. When an order goes out for delivery it gets a 4-digit
+// code, shown to the customer in the app and sent in the WhatsApp update. The
+// rider marks it delivered by typing the code the customer reads out, or, when
+// nobody can give the code (left with security, at the door), with a photo and
+// who received it. A missed delivery needs a reason. Every attempt is a row in
+// delivery_attempts, and staff marking an order delivered from the panel is
+// recorded too, as "staff" with no proof.
+import { timingSafeEqual } from 'node:crypto'
+import { now } from './clock.js'
+import { badRequest, conflict, HttpError, notFound } from './errors.js'
+import { newId } from './ids.js'
+import { setOrderStatus } from './orders.js'
+import { checkPhoto, MAX_PHOTO_BYTES, storePhoto } from './photos.js'
+
+export const FAIL_REASONS = ['NOT_HOME', 'WRONG_ADDRESS', 'REFUSED', 'UNREACHABLE', 'OTHER']
+export const FAIL_LABEL = {
+  NOT_HOME: 'Customer not home',
+  WRONG_ADDRESS: 'Address not found',
+  REFUSED: 'Customer refused the order',
+  UNREACHABLE: 'Customer did not answer the phone',
+  OTHER: 'Could not deliver',
+}
+export const MAX_CODE_TRIES = 5
+export { MAX_PHOTO_BYTES }
+
+async function lockOrder(c, orderId) {
+  const { rows } = await c.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId])
+  if (!rows.length) throw notFound('Order not found')
+  return rows[0]
+}
+
+/** Puts a packed order (or one retrying after a missed delivery) on the road. */
+export async function dispatchOrder(c, orderId, actor) {
+  const o = await lockOrder(c, orderId)
+  if (o.status === 'OUT_FOR_DELIVERY') return false
+  if (!['PACKED', 'SHIPPED', 'DELIVERY_FAILED'].includes(o.status)) {
+    const why = ['CONFIRMED', 'PROCESSING'].includes(o.status) ? 'is not packed yet' : `is ${o.status.toLowerCase().replace(/_/g, ' ')}`
+    throw badRequest(`Order ${o.number} ${why}`, 'INVALID_TRANSITION')
+  }
+  if (o.status === 'PACKED') await setOrderStatus(c, orderId, 'SHIPPED', actor)
+  await setOrderStatus(c, orderId, 'OUT_FOR_DELIVERY', actor)
+  return true
+}
+
+/** Stores a delivery photo for an order that is out for delivery. Returns its id. */
+export async function savePhoto(c, orderId, bytes, actor) {
+  const { mime, ext } = checkPhoto(bytes)
+  const o = await lockOrder(c, orderId)
+  if (o.status !== 'OUT_FOR_DELIVERY') throw badRequest('Photos are taken while the order is out for delivery', 'INVALID_TRANSITION')
+  const id = newId('dph')
+  const stored = await storePhoto(`delivery/${o.number}`, id, bytes, ext, mime)
+  await c.query('INSERT INTO delivery_photos (id, order_id, mime, bytes, blob_path, taken_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)', [
+    id, orderId, mime, stored.bytes, stored.blobPath, actor.label ?? actor.id, now(),
+  ])
+  return id
+}
+
+export async function photo(c, orderId, photoId) {
+  const { rows } = await c.query('SELECT mime, bytes, blob_path FROM delivery_photos WHERE id = $1 AND order_id = $2', [photoId, orderId])
+  if (!rows.length) throw notFound('Photo not found')
+  return rows[0]
+}
+
+async function insertAttempt(c, orderId, a, actor) {
+  await c.query(
+    `INSERT INTO delivery_attempts (id, order_id, outcome, method, received_by, reason, note, photo_id, lat, lng, actor, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [newId('dat'), orderId, a.outcome, a.method ?? null, a.receivedBy ?? null, a.reason ?? null, a.note ?? null, a.photoId ?? null,
+      a.lat ?? null, a.lng ?? null, actor.label ?? actor.id, now()],
+  )
+}
+
+const codesMatch = (given, expected) => {
+  const a = Buffer.from(String(given))
+  const b = Buffer.from(String(expected))
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+/**
+ * Records a delivery or a missed delivery with its proof and moves the order.
+ * A wrong code is counted and returned (not thrown) so the count commits.
+ */
+export async function recordDelivery(c, orderId, input, actor) {
+  const o = await lockOrder(c, orderId)
+  if (o.status !== 'OUT_FOR_DELIVERY') {
+    if (['DELIVERED', 'DELIVERY_FAILED'].includes(o.status)) throw conflict('This delivery was already recorded.')
+    throw badRequest(`Order ${o.number} is not out for delivery`, 'INVALID_TRANSITION')
+  }
+  if (input.photoId) {
+    const { rows } = await c.query('SELECT 1 FROM delivery_photos WHERE id = $1 AND order_id = $2', [input.photoId, orderId])
+    if (!rows.length) throw badRequest('That photo is not from this order', 'PHOTO_INVALID')
+  }
+  const where = { lat: input.lat ?? null, lng: input.lng ?? null }
+
+  if (input.outcome === 'FAILED') {
+    if (!FAIL_REASONS.includes(input.reason)) throw badRequest('Say why the delivery could not be made', 'REASON_REQUIRED')
+    await insertAttempt(c, orderId, { outcome: 'FAILED', reason: input.reason, note: input.note, photoId: input.photoId, ...where }, actor)
+    const reason = input.reason === 'OTHER' && input.note ? input.note : FAIL_LABEL[input.reason]
+    await setOrderStatus(c, orderId, 'DELIVERY_FAILED', actor, { reason })
+    return { outcome: 'FAILED' }
+  }
+
+  let method
+  if (input.code) {
+    if (o.delivery_code_tries >= MAX_CODE_TRIES) {
+      throw new HttpError(429, 'CODE_LOCKED', 'Too many wrong codes. Take a photo of the handover instead.')
+    }
+    if (!o.delivery_code || !codesMatch(input.code, o.delivery_code)) {
+      const { rows } = await c.query('UPDATE orders SET delivery_code_tries = delivery_code_tries + 1 WHERE id = $1 RETURNING delivery_code_tries', [orderId])
+      return { wrongCode: true, triesLeft: Math.max(0, MAX_CODE_TRIES - rows[0].delivery_code_tries) }
+    }
+    method = 'code'
+  } else if (input.photoId) {
+    if (!input.receivedBy?.trim()) throw badRequest('Say who took the order, or where it was left', 'RECEIVER_REQUIRED')
+    method = 'photo'
+  } else {
+    throw badRequest("Enter the customer's code, or take a photo of the handover", 'PROOF_REQUIRED')
+  }
+  await insertAttempt(c, orderId, { outcome: 'DELIVERED', method, receivedBy: input.receivedBy?.trim() || null, note: input.note, photoId: input.photoId, ...where }, actor)
+  await setOrderStatus(c, orderId, 'DELIVERED', actor)
+  return { outcome: 'DELIVERED', method }
+}
+
+/** Staff moved the order from the panel: recorded as an attempt without proof. */
+export async function recordStaffDelivery(c, orderId, status, actor) {
+  if (status === 'DELIVERED') await insertAttempt(c, orderId, { outcome: 'DELIVERED', method: 'staff' }, actor)
+  if (status === 'DELIVERY_FAILED') await insertAttempt(c, orderId, { outcome: 'FAILED', method: 'staff', reason: 'OTHER' }, actor)
+}
+
+const attemptView = (a) => ({
+  id: a.id, outcome: a.outcome, method: a.method, receivedBy: a.received_by, reason: a.reason, reasonLabel: a.reason ? FAIL_LABEL[a.reason] : null,
+  note: a.note, photoId: a.photo_id, lat: a.lat === null ? null : Number(a.lat), lng: a.lng === null ? null : Number(a.lng), actor: a.actor, at: a.created_at,
+})
+
+export async function attemptsFor(c, orderId) {
+  const { rows } = await c.query('SELECT * FROM delivery_attempts WHERE order_id = $1 ORDER BY created_at, id', [orderId])
+  return rows.map(attemptView)
+}
+
+/** What the customer sees: the code while it's on the way, then how it was delivered. */
+export async function customerDelivery(c, o) {
+  const { rows } = await c.query(
+    "SELECT * FROM delivery_attempts WHERE order_id = $1 AND outcome = 'DELIVERED' ORDER BY created_at DESC LIMIT 1",
+    [o.id],
+  )
+  const d = rows[0]
+  return {
+    deliveryCode: o.status === 'OUT_FOR_DELIVERY' ? o.delivery_code : null,
+    delivery: d && o.status === 'DELIVERED' ? { at: d.created_at, method: d.method, receivedBy: d.received_by, hasPhoto: Boolean(d.photo_id) } : null,
+  }
+}
+
+export async function customerPhoto(c, o) {
+  const { rows } = await c.query(
+    `SELECT p.mime, p.bytes, p.blob_path FROM delivery_attempts a JOIN delivery_photos p ON p.id = a.photo_id
+      WHERE a.order_id = $1 AND a.outcome = 'DELIVERED' ORDER BY a.created_at DESC LIMIT 1`,
+    [o.id],
+  )
+  if (!rows.length || o.status !== 'DELIVERED') throw notFound('No delivery photo for this order')
+  return rows[0]
+}

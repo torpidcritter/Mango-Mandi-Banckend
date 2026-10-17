@@ -1,0 +1,27 @@
+# Local development: Postgres 16 plus the API with demo data.
+# docker compose up --build, then point the panel at VITE_API_URL=http://localhost:3000
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mango
+      POSTGRES_PASSWORD: mango
+      POSTGRES_DB: mango
+    ports: ['5432:5432']
+    volumes: [mango-db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U mango']
+      interval: 5s
+      retries: 10
+  api:
+    build: .
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://mango:mango@db:5432/mango
+      COOKIE_SECURE: 'false'
+      ADMIN_ORIGIN: http://localhost:5173
+    ports: ['3000:3000']
+volumes:
+  mango-db:

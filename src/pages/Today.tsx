@@ -1,8 +1,9 @@
 import { Link, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../api'
-import { ORDER_STATUS_LABEL, istTime } from '../format'
+import { ORDER_STATUS_LABEL, date, istTime } from '../format'
 import type { OrderStatus } from '../types'
+import NeedsAttention from './NeedsAttention'
 import { ClickableRow, EmptyState, QueryError, Spinner, scrollRegion } from '../ui'
 
 const TILE_STATUSES: OrderStatus[] = [
@@ -24,6 +25,7 @@ export default function Today() {
   if (q.isPending) return <Spinner />
   if (q.isError) return <QueryError error={q.error} onRetry={() => q.refetch()} />
   const s = q.data
+  const atRisk = s.atRiskOrders ?? []
   const healthy = s.batchesNearLimit.length === 0 && s.lowStock.length === 0
 
   return (
@@ -33,6 +35,8 @@ export default function Today() {
         <span className="spacer" />
         <span className="muted small">Last updated {istTime(new Date(q.dataUpdatedAt))}</span>
       </div>
+
+      <NeedsAttention />
 
       <div className="tiles">
         {TILE_STATUSES.map((status) => (
@@ -50,6 +54,33 @@ export default function Today() {
           <div className="label">Payment pending</div>
         </div>
       </div>
+
+      {atRisk.length > 0 && (
+        <section className="card">
+          <h2>Orders at risk</h2>
+          <p className="muted">The stock for these orders went bad or ran out. Each needs a new date or new stock.</p>
+          <div {...scrollRegion('Orders at risk')}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Order</th>
+                  <th>Delivery</th>
+                  <th>Problem</th>
+                </tr>
+              </thead>
+              <tbody>
+                {atRisk.map((o) => (
+                  <ClickableRow key={o.id} label={`Open order ${o.number}`} onActivate={() => navigate(`/orders/${o.id}`)}>
+                    <td>{o.number}</td>
+                    <td>{date(o.deliveryDate)}</td>
+                    <td>{o.reason ?? '—'}</td>
+                  </ClickableRow>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       {healthy ? (
         <div className="card">

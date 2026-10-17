@@ -1,12 +1,38 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, api, isConflict } from '../api'
-import { ORDER_STATUS_LABEL, PAYMENT_LABEL, date, dateTime, rupees } from '../format'
-import type { OrderDetail as Order, OrderStatus } from '../types'
+import { ORDER_STATUS_LABEL, PAYMENT_LABEL, date, dateTime, istDate, rupees } from '../format'
+import type { DeliveryAttempt, NotificationKind, OrderDetail as Order, OrderNotification, OrderStatus } from '../types'
+import { PACKER_STATUSES, can, canSee } from '../permissions'
+import { useSession } from '../session'
 import { Badge, Dialog, FormError, OrderBadge, QueryError, Spinner, useToast, scrollRegion } from '../ui'
 
 const CONFLICT_MESSAGE = 'This order was just updated by someone else.'
+
+const MESSAGE_LABEL: Record<NotificationKind, string> = {
+  ORDER_CONFIRMED: 'Order confirmed',
+  REPLACEMENT_CONFIRMED: 'Replacement confirmed',
+  OUT_FOR_DELIVERY: 'Out for delivery',
+  DELIVERED: 'Delivered',
+  DELIVERY_FAILED: 'Delivery missed',
+  CANCELLED: 'Order cancelled',
+  REFUNDED: 'Refund sent',
+  DATE_MOVED: 'Delivery date moved',
+}
+
+function messageState(n: OrderNotification) {
+  switch (n.status) {
+    case 'SENT':
+      return <Badge tone="good">Sent</Badge>
+    case 'PENDING':
+      return <Badge tone="info">{n.attempts > 0 ? `Retrying (try ${n.attempts + 1})` : 'Queued'}</Badge>
+    case 'FAILED':
+      return <Badge tone="bad">Failed</Badge>
+    default:
+      return <Badge tone="neutral">Not sent</Badge>
+  }
+}
 
 type Move = { to: OrderStatus; label: string; primary?: boolean }
 
@@ -70,9 +96,12 @@ function useOrderRefresh(orderId: string) {
 }
 
 function OrderView({ order }: { order: Order }) {
+  const { me } = useSession()
+  const changeOrder = can(me?.role, 'changeOrder')
+  const openBatches = canSee(me?.role, 'batches')
   const toast = useToast()
   const refresh = useOrderRefresh(order.id)
-  const [dialog, setDialog] = useState<'cancel' | null>(null)
+  const [dialog, setDialog] = useState<'cancel' | 'reschedule' | null>(null)
 
   const awaitingPack = order.stock.some((s) => s.state === 'committed')
 
@@ -100,7 +129,7 @@ function OrderView({ order }: { order: Order }) {
   })
 
   const busy = move.isPending || allocate.isPending
-  const moves = movesFor(order.status)
+  const moves = movesFor(order.status).filter((m) => me?.role !== 'PACKER' || PACKER_STATUSES.includes(m.to))
 
   return (
     <>
@@ -109,6 +138,18 @@ function OrderView({ order }: { order: Order }) {
         <OrderBadge status={order.status} />
         <span className="muted">Placed {dateTime(order.placedAt)}</span>
       </div>
+
+      {order.atRisk && (
+        <div className="notice notice-warn" role="status">
+          <strong>At risk:</strong> {order.atRiskReason ?? 'this order no longer has valid stock.'} Move it to a date with
+          stock, or wait for new stock to arrive.
+        </div>
+      )}
+      {order.replacementFor && (
+        <div className="notice notice-info" role="status">
+          Free replacement for order <Link to={`/orders/${order.replacementFor.id}`}>{order.replacementFor.number}</Link>.
+        </div>
+      )}
 
       {order.status === 'PAYMENT_PENDING' && (
         <div className="notice notice-warn" role="status">
@@ -142,12 +183,17 @@ function OrderView({ order }: { order: Order }) {
             </button>
           )
         })}
-        {CANCELLABLE.includes(order.status) && (
+        {changeOrder && ALLOCATABLE.includes(order.status) && (
+          <button type="button" className="btn" disabled={busy} onClick={() => setDialog('reschedule')}>
+            Move delivery date
+          </button>
+        )}
+        {changeOrder && CANCELLABLE.includes(order.status) && (
           <button type="button" className="btn btn-danger" disabled={busy} onClick={() => setDialog('cancel')}>
             Cancel order
           </button>
         )}
-        {moves.length === 0 && !CANCELLABLE.includes(order.status) && (
+        {moves.length === 0 && !(changeOrder && CANCELLABLE.includes(order.status)) && (
           <span className="muted">No actions available.</span>
         )}
       </div>
@@ -180,6 +226,12 @@ function OrderView({ order }: { order: Order }) {
                   ))}
                 </tbody>
                 <tfoot>
+                  {!!order.discount && (
+                    <tr>
+                      <td colSpan={3}>Promo {order.promoCode ?? ''}</td>
+                      <td className="num">−{rupees(order.discount)}</td>
+                    </tr>
+                  )}
                   <tr>
                     <th colSpan={3}>Total</th>
                     <th className="num">{rupees(order.total)}</th>
@@ -208,9 +260,13 @@ function OrderView({ order }: { order: Order }) {
                     {order.stock.map((s, i) => (
                       <tr key={s.id ?? i}>
                         <td>
-                          <Link to={`/batches/${s.batchId}`}>
-                            {s.variety} · {date(s.pluckedOn)}
-                          </Link>
+                          {openBatches ? (
+                            <Link to={`/batches/${s.batchId}`}>
+                              {s.variety} · {date(s.pluckedOn)}
+                            </Link>
+                          ) : (
+                            `${s.variety} · ${date(s.pluckedOn)}`
+                          )}
                         </td>
                         <td>{s.sku ?? '—'}</td>
                         <td className="num">{s.quantity}</td>
@@ -236,12 +292,39 @@ function OrderView({ order }: { order: Order }) {
               <dd>{order.customerName ?? '—'}</dd>
               <dt>Phone</dt>
               <dd>{order.phone ?? '—'}</dd>
+              {order.gift && (
+                <>
+                  <dt>Gift for</dt>
+                  <dd>
+                    {order.gift.recipientName} · {order.gift.recipientPhone}
+                  </dd>
+                  {order.gift.message && (
+                    <>
+                      <dt>Gift note</dt>
+                      <dd>{order.gift.message}</dd>
+                    </>
+                  )}
+                </>
+              )}
               <dt>Address</dt>
               <dd>{order.deliveryAddress ?? '—'}</dd>
               <dt>Pincode</dt>
               <dd>{order.pincode ?? '—'}</dd>
+              <dt>Placed via</dt>
+              <dd>{order.channel === 'whatsapp' ? 'WhatsApp chat' : 'App'}</dd>
               <dt>Delivery date</dt>
               <dd>{date(order.deliveryDate)}</dd>
+              {order.slot && (
+                <>
+                  <dt>Delivery slot</dt>
+                  <dd>
+                    {order.slot.label}{' '}
+                    <span className="muted small">
+                      {order.slot.startsAt}–{order.slot.endsAt}
+                    </span>
+                  </dd>
+                </>
+              )}
             </dl>
           </section>
           <section className="card">
@@ -254,11 +337,48 @@ function OrderView({ order }: { order: Order }) {
                 <dd>{order.payment.method ?? '—'}</dd>
                 <dt>Amount</dt>
                 <dd>{rupees(order.payment.amount)}</dd>
+                {order.payment.refund && (
+                  <>
+                    <dt>Refund</dt>
+                    <dd>
+                      {order.payment.refund.refundedAt
+                        ? `Refunded ${dateTime(order.payment.refund.refundedAt)}`
+                        : 'Pending: the customer cancelled after paying'}
+                    </dd>
+                  </>
+                )}
               </dl>
             ) : (
               <p className="muted">No payment recorded.</p>
             )}
           </section>
+          {order.deliveryAttempts && order.deliveryAttempts.length > 0 && (
+            <section className="card">
+              <h2>Proof of delivery</h2>
+              <ol className="timeline">
+                {order.deliveryAttempts.map((a) => (
+                  <li key={a.id}>
+                    <strong>{a.outcome === 'DELIVERED' ? 'Delivered' : (a.reasonLabel ?? 'Not delivered')}</strong>{' '}
+                    <span className="muted small">{dateTime(a.at)}</span>
+                    <div className="small">{proofText(a)}</div>
+                    {a.note && <div className="small">{a.note}</div>}
+                    <div className="small muted">
+                      by {a.actor}
+                      {a.lat !== null && a.lng !== null && (
+                        <>
+                          {' · '}
+                          <a href={`https://www.google.com/maps/search/?api=1&query=${a.lat},${a.lng}`} target="_blank" rel="noreferrer">
+                            where
+                          </a>
+                        </>
+                      )}
+                    </div>
+                    {a.photoId && <ProofPhoto orderId={order.id} photoId={a.photoId} />}
+                  </li>
+                ))}
+              </ol>
+            </section>
+          )}
           <section className="card">
             <h2>Timeline</h2>
             {order.events.length === 0 ? (
@@ -276,10 +396,25 @@ function OrderView({ order }: { order: Order }) {
               </ol>
             )}
           </section>
+          {order.notifications && order.notifications.length > 0 && (
+            <section className="card">
+              <h2>WhatsApp updates</h2>
+              <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+                {order.notifications.map((n, i) => (
+                  <li key={i} style={{ marginBottom: '0.5rem' }}>
+                    {MESSAGE_LABEL[n.kind] ?? n.kind} {messageState(n)}{' '}
+                    <span className="muted small">{dateTime(n.sentAt ?? n.createdAt)}</span>
+                    {n.error && n.status !== 'SENT' && <div className="small muted">{n.error}</div>}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
         </div>
       </div>
 
       {dialog === 'cancel' && <CancelDialog order={order} onClose={() => setDialog(null)} onDone={refresh} />}
+      {dialog === 'reschedule' && <RescheduleDialog order={order} onClose={() => setDialog(null)} onDone={refresh} />}
     </>
   )
 }
@@ -337,4 +472,99 @@ function CancelDialog({ order, onClose, onDone }: { order: Order; onClose: () =>
       </form>
     </Dialog>
   )
+}
+
+function RescheduleDialog({ order, onClose, onDone }: { order: Order; onClose: () => void; onDone: () => void }) {
+  const toast = useToast()
+  const [when, setWhen] = useState(order.deliveryDate > istDate(1) ? order.deliveryDate : istDate(1))
+  const [slotId, setSlotId] = useState(order.slot?.id ?? '')
+  const slots = useQuery({ queryKey: ['slots'], queryFn: api.slots })
+  const activeSlots = (slots.data ?? []).filter((s) => s.active)
+
+  const move = useMutation({
+    mutationFn: () => api.rescheduleOrder(order.id, when, slotId || null),
+    onSuccess: () => {
+      toast.success(`Order ${order.number} now delivers on ${date(when)}`)
+      onDone()
+      onClose()
+    },
+  })
+
+  function onSubmit(e: FormEvent) {
+    e.preventDefault()
+    move.mutate()
+  }
+
+  return (
+    <Dialog
+      title={`Move order ${order.number}`}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn" onClick={onClose}>
+            Keep {date(order.deliveryDate)}
+          </button>
+          <button type="submit" form="reschedule-form" className="btn btn-primary" disabled={move.isPending || !when}>
+            {move.isPending ? 'Moving…' : 'Move order'}
+          </button>
+        </>
+      }
+    >
+      <form id="reschedule-form" onSubmit={onSubmit}>
+        <div className="field">
+          <label htmlFor="reschedule-date">New delivery date</label>
+          <input id="reschedule-date" type="date" min={istDate(1)} value={when} onChange={(e) => setWhen(e.target.value)} data-autofocus />
+          <p className="hint">
+            The order keeps its ripeness. Stock is re-picked for the new date; if there isn't enough, nothing changes.
+          </p>
+        </div>
+        {activeSlots.length > 0 && (
+          <div className="field">
+            <label htmlFor="reschedule-slot">Delivery slot</label>
+            <select id="reschedule-slot" value={slotId} onChange={(e) => setSlotId(e.target.value)}>
+              <option value="">Any slot with room</option>
+              {activeSlots.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label} ({s.startsAt}–{s.endsAt})
+                </option>
+              ))}
+            </select>
+            <p className="hint">A full slot is refused. "Any slot with room" keeps the current slot if it fits.</p>
+          </div>
+        )}
+        <FormError error={move.error} />
+      </form>
+    </Dialog>
+  )
+}
+
+function proofText(a: DeliveryAttempt): string {
+  if (a.method === 'code') return "The customer's code matched"
+  if (a.method === 'photo') return a.outcome === 'DELIVERED' ? `Left with ${a.receivedBy ?? 'someone'}, with a photo` : 'With a photo'
+  if (a.method === 'staff') return 'Marked from the panel, without proof'
+  return ''
+}
+
+function ProofPhoto({ orderId, photoId }: { orderId: string; photoId: string }) {
+  const [url, setUrl] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let made: string | null = null
+    let live = true
+    api
+      .deliveryPhotoUrl(orderId, photoId)
+      .then((u) => {
+        made = u
+        if (live) setUrl(u)
+        else URL.revokeObjectURL(u)
+      })
+      .catch(() => live && setFailed(true))
+    return () => {
+      live = false
+      if (made) URL.revokeObjectURL(made)
+    }
+  }, [orderId, photoId])
+  if (failed) return <div className="small muted">The photo could not be loaded.</div>
+  if (!url) return <div className="small muted">Loading photo…</div>
+  return <img className="delivery-photo" src={url} alt="Delivery photo taken by the rider" />
 }

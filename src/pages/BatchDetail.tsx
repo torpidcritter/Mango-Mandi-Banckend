@@ -129,7 +129,7 @@ function StatusControls({ batch }: { batch: Batch }) {
   const toast = useToast()
   const queryClient = useQueryClient()
   const [confirmCondemn, setConfirmCondemn] = useState(false)
-  const [cancelled, setCancelled] = useState<string[] | null>(null)
+  const [condemned, setCondemned] = useState<{ moved: string[]; atRisk: string[] } | null>(null)
 
   const move = useMutation({
     mutationFn: (status: BatchStatus) => api.setBatchStatus(batch.id, status),
@@ -139,7 +139,7 @@ function StatusControls({ batch }: { batch: Batch }) {
       queryClient.invalidateQueries({ queryKey: ['summary'] })
       if (status === 'CONDEMNED') {
         setConfirmCondemn(false)
-        setCancelled(res?.rebalancedOrders ?? [])
+        setCondemned({ moved: res?.rebalancedOrders ?? [], atRisk: res?.atRiskOrders ?? [] })
       } else {
         toast.success(`Batch moved to ${BATCH_STATUS_LABEL[status]}`)
       }
@@ -198,36 +198,49 @@ function StatusControls({ batch }: { batch: Batch }) {
                 disabled={move.isPending}
                 onClick={() => move.mutate('CONDEMNED')}
               >
-                {move.isPending ? 'Condemning…' : 'Condemn and cancel orders'}
+                {move.isPending ? 'Condemning…' : 'Condemn and move orders'}
               </button>
             </>
           }
         >
           <p>
-            This cannot be undone. Every open order holding stock from this batch will be <strong>cancelled</strong> and
-            its stock released.
+            This cannot be undone. Its remaining stock is written off. Open orders holding this batch are moved to
+            another batch of the same ripeness where stock allows; any that can't be moved are flagged{' '}
+            <strong>at risk</strong> for you to sort out. No order is cancelled.
           </p>
           <FormError error={move.error} />
         </Dialog>
       )}
 
-      {cancelled && (
+      {condemned && (
         <Dialog
           title="Batch condemned"
-          onClose={() => setCancelled(null)}
+          onClose={() => setCondemned(null)}
           footer={
-            <button type="button" className="btn btn-primary" onClick={() => setCancelled(null)}>
+            <button type="button" className="btn btn-primary" onClick={() => setCondemned(null)}>
               Done
             </button>
           }
         >
-          {cancelled.length === 0 ? (
-            <p>No open orders were holding this batch.</p>
-          ) : (
+          {condemned.moved.length === 0 && condemned.atRisk.length === 0 && <p>No open orders were holding this batch.</p>}
+          {condemned.moved.length > 0 && (
             <>
-              <p>These orders were cancelled:</p>
+              <p>These orders were moved to other batches:</p>
               <ul>
-                {cancelled.map((n) => (
+                {condemned.moved.map((n) => (
+                  <li key={n}>{n}</li>
+                ))}
+              </ul>
+            </>
+          )}
+          {condemned.atRisk.length > 0 && (
+            <>
+              <p>
+                <strong>These orders are at risk</strong> because no other stock could cover them. Find them on the
+                Today page:
+              </p>
+              <ul>
+                {condemned.atRisk.map((n) => (
                   <li key={n}>{n}</li>
                 ))}
               </ul>

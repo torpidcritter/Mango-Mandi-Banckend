@@ -109,6 +109,7 @@ export default function Orders() {
                   <ClickableRow key={o.id} label={`Open order ${o.number}`} onActivate={() => navigate(`/orders/${o.id}`)}>
                     <td>
                       <strong>{o.number}</strong>
+                      {o.channel === 'whatsapp' && <div className="muted small">via WhatsApp</div>}
                     </td>
                     <td>
                       {o.customerName ?? '—'}

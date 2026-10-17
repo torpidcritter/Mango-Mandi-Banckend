@@ -1,0 +1,76 @@
+# Production: one server running Postgres, mango-api, nightly backups, and Caddy
+# (automatic HTTPS) serving the customer shop, the staff panel and the API.
+#   cp deploy/.env.example deploy/.env   # fill it in
+#   ./deploy/deploy.sh                   # build, preflight, start
+name: mandimangoes
+
+x-db-url: &db-url postgres://mango:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@db:5432/mango
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mango
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: mango
+    volumes: [db:/var/lib/postgresql/data]
+    shm_size: 256mb
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U mango']
+      interval: 5s
+      retries: 20
+
+  api:
+    build: ../mango-api
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: *db-url
+      ADMIN_ORIGIN: https://${ADMIN_DOMAIN:?set ADMIN_DOMAIN}
+      CUSTOMER_ORIGIN: https://${SHOP_DOMAIN:?set SHOP_DOMAIN},https://www.${SHOP_DOMAIN}
+      COOKIE_SECURE: 'true'
+      TRUST_PROXY: '1'
+      SEED_DEMO_DATA: 'false'
+    logging: &logs
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+      args:
+        VITE_API_URL: https://${API_DOMAIN:?set API_DOMAIN}
+    restart: unless-stopped
+    depends_on: [api]
+    ports: ['80:80', '443:443', '443:443/udp']
+    environment:
+      SHOP_DOMAIN: ${SHOP_DOMAIN}
+      ADMIN_DOMAIN: ${ADMIN_DOMAIN}
+      API_DOMAIN: ${API_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    volumes: [caddy-data:/data, caddy-config:/config]
+    logging: *logs
+
+  backup:
+    image: postgres:16
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: *db-url
+      BACKUP_DIR: /backups
+      RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-14}
+    volumes: ['../mango-api/ops:/ops:ro', './backups:/backups']
+    # One backup at start, then every 24 hours. Copy deploy/backups off this server too.
+    entrypoint: ['/bin/bash', '-c', 'while true; do /ops/backup.sh || echo "backup FAILED"; sleep 86400; done']
+    logging: *logs
+
+volumes:
+  db:
+  caddy-data:
+  caddy-config:

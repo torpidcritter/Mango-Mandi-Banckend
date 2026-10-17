@@ -17,6 +17,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      - name: Build the customer app
+        run: npm run shop:build
       - run: npx playwright install --with-deps chromium
       - name: Backend-free specs (smoke, screens, accessibility)
         run: npx playwright test tests/smoke.spec.ts tests/screens.spec.ts tests/a11y.spec.ts
@@ -30,3 +32,143 @@ jobs:
             playwright-report
             test-results
           retention-days: 7
+
+  api:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mango-api
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mango
+          POSTGRES_PASSWORD: mango
+          POSTGRES_DB: mango_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U mango" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mango-api/package-lock.json
+      - run: npm ci
+      - name: API tests (engine, flows, concurrency)
+        run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://mango:mango@localhost:5432/mango_test
+      # Neon puts PgBouncer in transaction mode in front of the database. Run the
+      # whole suite (the concurrency races included) through the same kind of
+      # pooler, so stock locking is proven to hold there before it ships.
+      - name: Start PgBouncer in transaction mode
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq pgbouncer
+          # The package starts its own PgBouncer on 6432; ours runs on 6543.
+          sudo systemctl stop pgbouncer || true
+          echo "127.0.0.1 db-pooler.local" | sudo tee -a /etc/hosts
+          mkdir -p /tmp/pgb
+          printf '"mango" "mango"\n' > /tmp/pgb/users.txt
+          cat > /tmp/pgb/pgbouncer.ini <<'INI'
+          [databases]
+          mango_test = host=127.0.0.1 port=5432 dbname=mango_test user=mango password=mango
+          [pgbouncer]
+          listen_addr = 127.0.0.1
+          listen_port = 6543
+          auth_type = trust
+          auth_file = /tmp/pgb/users.txt
+          pool_mode = transaction
+          max_client_conn = 500
+          default_pool_size = 20
+          ignore_startup_parameters = extra_float_digits
+          logfile = /tmp/pgb/pgb.log
+          pidfile = /tmp/pgb/pgb.pid
+          INI
+          pgbouncer -d /tmp/pgb/pgbouncer.ini
+          sleep 1
+          PGPASSWORD=mango psql -h db-pooler.local -p 6543 -U mango -d mango_test -c 'select 1' > /dev/null
+      - name: API tests through the pooler (as on Neon)
+        run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://mango:mango@db-pooler.local:6543/mango_test
+          DATABASE_URL_UNPOOLED: postgres://mango:mango@localhost:5432/mango_test
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, api]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mango
+          POSTGRES_PASSWORD: mango
+          POSTGRES_DB: mango
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U mango" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            mango-api/package-lock.json
+      - run: npm ci
+      - run: npm ci
+        working-directory: mango-api
+      - name: Start mango-api with demo data
+        working-directory: mango-api
+        run: |
+          nohup node src/index.js > ../api.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:3000/ready && exit 0; sleep 1; done
+          cat ../api.log; exit 1
+        env:
+          NODE_ENV: development
+          COOKIE_SECURE: 'false'
+          LOG_LEVEL: warn
+      - run: npx playwright install --with-deps chromium
+      - name: Day in the life against the real API
+        run: npx playwright test tests/day-in-the-life.spec.ts
+        env:
+          CI: 'true'
+          VITE_API_URL: http://localhost:3000
+          E2E_EMAIL: manager@mandimangoes.test
+          E2E_PASSWORD: manager123
+      - name: Customer app journey against the real API
+        working-directory: customer-app
+        run: npx playwright test
+        env:
+          CI: 'true'
+          VITE_API_URL: http://localhost:3000
+      - if: failure()
+        run: cat api.log
+
+  production-images:
+    # Builds the production images and checks the server config, so a broken
+    # Dockerfile or Caddyfile shows up here rather than on deploy day.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy
+    env:
+      SHOP_DOMAIN: example.in
+      ADMIN_DOMAIN: admin.example.in
+      API_DOMAIN: api.example.in
+      ACME_EMAIL: ops@example.in
+      POSTGRES_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v4
+      - run: touch .env
+      - name: Compose file is valid
+        run: docker compose -f compose.yml config -q
+      - name: Caddyfile is valid
+        run: >-
+          docker run --rm -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro"
+          -e SHOP_DOMAIN -e ADMIN_DOMAIN -e API_DOMAIN -e ACME_EMAIL
+          caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Build the API and web images
+        run: docker compose -f compose.yml build api web

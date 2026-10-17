@@ -7,6 +7,11 @@
 import type {
   ApiErrorBody,
   BatchDetail,
+  Analytics,
+  Attention,
+  AuditPage,
+  BulkMoveResult,
+  Manifest,
   BatchListItem,
   BatchStatus,
   Claim,
@@ -15,6 +20,9 @@ import type {
   Condition,
   LedgerEntry,
   Me,
+  SignInResult,
+  Promo,
+  NewPromo,
   OrderDetail,
   OrderListItem,
   OrderStatus,
@@ -23,6 +31,17 @@ import type {
   Pincode,
   Product,
   Ripeness,
+  Rules,
+  RulesVersion,
+  CalendarDay,
+  CoverageDay,
+  FailReason,
+  DeliverySlot,
+  Preorder,
+  PreorderCapacity,
+  PreorderStatus,
+  Role,
+  StaffMember,
   Summary,
 } from './types'
 
@@ -87,24 +106,31 @@ function signOutLocally() {
   window.dispatchEvent(new CustomEvent(SIGNOUT_EVENT, { detail: { reason: 'expired' } }))
 }
 
-async function request<T>(method: string, path: string, body?: unknown, retried = false): Promise<T> {
+/** A Blob body is sent as-is (photos); anything else as JSON. */
+async function send(method: string, path: string, body?: unknown, retried = false): Promise<Response> {
   const headers: Record<string, string> = {}
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  const blob = body instanceof Blob
+  if (body !== undefined) headers['Content-Type'] = blob ? body.type : 'application/json'
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`
 
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers,
     credentials: 'include',
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: body === undefined ? undefined : blob ? body : JSON.stringify(body),
   })
 
   if (res.status === 401 && !retried) {
-    if (await refreshOnce()) return request<T>(method, path, body, true)
+    if (await refreshOnce()) return send(method, path, body, true)
     signOutLocally()
     throw new ApiError(401, 'SESSION_ENDED', 'Your session has ended. Please sign in again.')
   }
   if (!res.ok) throw await toApiError(res)
+  return res
+}
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await send(method, path, body)
   if (res.status === 204) return undefined as T
   const text = await res.text()
   return (text ? JSON.parse(text) : undefined) as T
@@ -121,6 +147,21 @@ function qs(params: Record<string, string | number | undefined | null>): string 
 
 const id = encodeURIComponent
 
+/** Password, Google or the second step: either a session or a ticket for the code. */
+async function firstStep(path: string, body: unknown): Promise<SignInResult> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw await toApiError(res)
+  const data = (await res.json()) as { accessToken?: string; twoStep?: boolean; ticket?: string }
+  if (data.twoStep && data.ticket) return { ticket: data.ticket }
+  accessToken = data.accessToken ?? null
+  return { me: await request<Me>('GET', '/auth/me') }
+}
+
 export const api = {
   /** Restores a session from the refresh cookie. Returns null if there is none. */
   async bootstrap(): Promise<Me | null> {
@@ -134,18 +175,40 @@ export const api = {
     }
   },
 
-  async login(email: string, password: string): Promise<Me> {
-    const res = await fetch(`${BASE}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ email, password }),
-    })
-    if (!res.ok) throw await toApiError(res)
-    const data = (await res.json()) as { accessToken: string }
-    accessToken = data.accessToken
-    return request<Me>('GET', '/auth/me')
+  async login(email: string, password: string): Promise<SignInResult> {
+    return firstStep('/auth/login', { email, password })
   },
+
+  /** The code from the authenticator app (or a recovery code) after the password or Google. */
+  async twoStep(ticket: string, code: string): Promise<Me> {
+    const r = await firstStep('/auth/two-step', { ticket, code })
+    if (!('me' in r)) throw new ApiError(401, 'TICKET_EXPIRED', 'Sign in again.')
+    return r.me
+  },
+
+  /** Whether "Sign in with Google" is set up. */
+  async authConfig(): Promise<{ googleClientId: string | null }> {
+    if (!API_URL) return { googleClientId: null }
+    const res = await fetch(`${BASE}/auth/config`)
+    if (!res.ok) return { googleClientId: null }
+    return (await res.json()) as { googleClientId: string | null }
+  },
+
+  async loginWithGoogle(credential: string): Promise<SignInResult> {
+    return firstStep('/auth/google', { credential })
+  },
+
+  /** Starts setting up two-step sign-in: the secret for the authenticator app. */
+  twoStepSetup: () => request<{ secret: string; otpauthUrl: string }>('POST', '/me/two-step/setup'),
+  /** Confirms a code from the app. Returns the recovery codes, shown this once. */
+  async twoStepEnable(code: string): Promise<string[]> {
+    const r = await request<{ recoveryCodes: string[]; accessToken: string }>('POST', '/me/two-step/enable', { code })
+    accessToken = r.accessToken
+    return r.recoveryCodes
+  },
+  twoStepDisable: (code: string) => request<void>('POST', '/me/two-step/disable', { code }),
+  me: () => request<Me>('GET', '/auth/me'),
+  resetTwoStep: (staffId: string) => request<void>('POST', `/staff/${id(staffId)}/two-step/reset`),
 
   /** Best-effort: a network failure still clears the local token. */
   async logout(): Promise<void> {
@@ -163,6 +226,8 @@ export const api = {
   },
 
   summary: () => request<Summary>('GET', '/summary'),
+  attention: () => request<Attention>('GET', '/attention'),
+  retryMessage: (notificationId: string) => request<void>('POST', `/notifications/${id(notificationId)}/retry`),
   products: () => request<Product[]>('GET', '/products'),
 
   batches: (status?: BatchStatus | null) =>
@@ -175,9 +240,12 @@ export const api = {
     farm?: string
     lines: { sku: string; onHand: number }[]
   }) => request<BatchDetail>('POST', '/batches', input),
-  /** 204 for normal moves; CONDEMNED returns the cancelled order numbers. */
+  /**
+   * 204 for normal moves. CONDEMNED returns the orders moved to other batches
+   * and the ones left at-risk; no order is cancelled.
+   */
   setBatchStatus: (batchId: string, status: BatchStatus) =>
-    request<{ rebalancedOrders?: string[] } | undefined>(
+    request<{ rebalancedOrders?: string[]; atRiskOrders?: string[] } | undefined>(
       'PATCH',
       `/batches/${id(batchId)}/status`,
       { status },
@@ -198,6 +266,12 @@ export const api = {
   allocate: (orderId: string) => request<void>('POST', `/orders/${id(orderId)}/allocate`),
   cancelOrder: (orderId: string, reason: string) =>
     request<void>('POST', `/orders/${id(orderId)}/cancel`, { reason }),
+  /** Moves a confirmed order to another bookable date that has stock (409 if it doesn't), optionally into a slot. */
+  rescheduleOrder: (orderId: string, deliveryDate: string, slotId?: string | null) =>
+    request<void>('POST', `/orders/${id(orderId)}/reschedule`, slotId ? { deliveryDate, slotId } : { deliveryDate }),
+  /** Moves every confirmed order on one date (optionally some pincodes) to another; managers only. */
+  bulkReschedule: (input: { fromDate: string; toDate: string; pincodes?: string[]; reason: string; dryRun?: boolean }) =>
+    request<BulkMoveResult>('POST', '/orders/bulk-reschedule', input),
 
   async packList(date: string): Promise<PackListOrder[]> {
     const res = await request<PackListOrder[] | { orders: PackListOrder[] }>(
@@ -207,11 +281,47 @@ export const api = {
     return Array.isArray(res) ? res : (res?.orders ?? [])
   },
 
+  analytics: (f: { from?: string | null; to?: string | null } = {}) => request<Analytics>('GET', `/analytics${qs(f)}`),
+  manifest: (date: string) => request<Manifest>('GET', `/manifest${qs({ date })}`),
+  /** Puts every packed order of a run (one slot, null for orders without one) out for delivery. */
+  dispatchRun: (date: string, slotId: string | null) =>
+    request<{ dispatched: string[]; skipped: { number: string; reason: string }[] }>('POST', '/manifest/dispatch', { date, slotId }),
+  dispatch: (orderId: string) => request<void>('POST', `/orders/${id(orderId)}/dispatch`),
+  uploadDeliveryPhoto: (orderId: string, photo: Blob) => request<{ id: string }>('POST', `/orders/${id(orderId)}/delivery-photos`, photo),
+  /** An object URL for a delivery photo (the image needs the staff sign-in, so it is fetched, not linked). */
+  async deliveryPhotoUrl(orderId: string, photoId: string): Promise<string> {
+    const res = await send('GET', `/orders/${id(orderId)}/delivery-photos/${id(photoId)}`)
+    return URL.createObjectURL(await res.blob())
+  },
+  recordDelivery: (
+    orderId: string,
+    body:
+      | { outcome: 'DELIVERED'; code?: string; photoId?: string; receivedBy?: string; lat?: number; lng?: number }
+      | { outcome: 'FAILED'; reason: FailReason; note?: string; photoId?: string; lat?: number; lng?: number },
+  ) => request<{ outcome: 'DELIVERED' | 'FAILED'; method?: string }>('POST', `/orders/${id(orderId)}/delivery`, body),
+
   claims: (status?: ClaimStatus | null) => request<Claim[]>('GET', `/claims${qs({ status })}`),
+  /** An object URL for a claim photo (fetched with the staff sign-in). */
+  async claimPhotoUrl(claimId: string, photoId: string): Promise<string> {
+    const res = await send('GET', `/claims/${id(claimId)}/photos/${id(photoId)}`)
+    return URL.createObjectURL(await res.blob())
+  },
   reviewClaim: (claimId: string) => request<void>('POST', `/claims/${id(claimId)}/review`),
-  /** VMR doesn't refund: a claim is resolved by a replacement or rejected. */
+  /** MandiMangoes doesn't refund: a claim is resolved by a replacement or rejected. */
   resolveClaim: (claimId: string, resolution: Exclude<ClaimResolution, 'REFUND_APPROVED'>) =>
     request<void>('POST', `/claims/${id(claimId)}/resolve`, { resolution }),
+
+  promos: () => request<Promo[]>('GET', '/promos'),
+  addPromo: (p: NewPromo) => request<Promo>('POST', '/promos', p),
+  updatePromo: (code: string, patch: { active?: boolean; endsOn?: string | null; maxUses?: number | null; description?: string | null }) =>
+    request<Promo>('PATCH', `/promos/${id(code)}`, patch),
+  staff: () => request<StaffMember[]>('GET', '/staff'),
+  addStaff: (input: { email: string; role: Role; password: string }) => request<StaffMember>('POST', '/staff', input),
+  updateStaff: (staffId: string, patch: { role?: Role; password?: string }) =>
+    request<StaffMember>('PATCH', `/staff/${id(staffId)}`, patch),
+  removeStaff: (staffId: string) => request<void>('DELETE', `/staff/${id(staffId)}`),
+  audit: (f: { staff?: string | null; from?: string | null; to?: string | null; page?: number } = {}) =>
+    request<AuditPage>('GET', `/audit${qs(f)}`),
 
   pincodes: () => request<Pincode[]>('GET', '/pincodes'),
   addPincode: (input: { pincode: string; city: string; zone?: string }) =>
@@ -219,6 +329,23 @@ export const api = {
   updatePincode: (pincode: string, patch: Partial<Pick<Pincode, 'city' | 'zone' | 'active'>>) =>
     request<Pincode | undefined>('PATCH', `/pincodes/${id(pincode)}`, patch),
   deletePincode: (pincode: string) => request<void>('DELETE', `/pincodes/${id(pincode)}`),
+
+  coverage: () => request<CoverageDay[]>('GET', '/coverage'),
+  calendar: () => request<CalendarDay[]>('GET', '/calendar'),
+  setCalendarDay: (day: CalendarDay) =>
+    request<void>('PUT', `/calendar/${id(day.date)}`, { isOpen: day.isOpen, maxBoxes: day.maxBoxes, note: day.note }),
+  clearCalendarDay: (date: string) => request<void>('DELETE', `/calendar/${id(date)}`),
+  preorders: (status?: PreorderStatus | null) => request<Preorder[]>('GET', `/preorders${qs({ status })}`),
+  preorderCapacity: () => request<PreorderCapacity[]>('GET', '/preorder-capacity'),
+  setPreorderCapacity: (weekStart: string, sku: string, capacity: number) =>
+    request<unknown>('PUT', `/preorder-capacity/${id(weekStart)}/${id(sku)}`, { capacity }),
+  slots: () => request<DeliverySlot[]>('GET', '/slots'),
+  addSlot: (input: Omit<DeliverySlot, 'id' | 'active' | 'sort'> & { sort?: number }) =>
+    request<DeliverySlot>('POST', '/slots', input),
+  updateSlot: (slotId: string, patch: Partial<Omit<DeliverySlot, 'id'>>) =>
+    request<DeliverySlot>('PATCH', `/slots/${id(slotId)}`, patch),
+  rules: () => request<RulesVersion>('GET', '/config'),
+  saveRules: (rules: Rules) => request<RulesVersion>('PUT', '/config', { rules }),
 }
 
 export interface ErrorInfo {

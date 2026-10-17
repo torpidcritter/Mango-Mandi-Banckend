@@ -37,7 +37,7 @@ test('keyboard reaches email, password, then sign in', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Sign in' })).toBeFocused()
 })
 
-for (const path of ['/today', '/batches', '/batches/b1', '/orders', '/orders/o1', '/pack-list', '/claims', '/pincodes']) {
+for (const path of ['/today', '/batches', '/batches/b1', '/orders', '/orders/o1', '/pack-list', '/deliveries', '/claims', '/pincodes', '/planning', '/preorders', '/analytics', '/staff']) {
   test(`${path} has no WCAG A/AA violations`, async ({ page }) => {
     await mockApi(page, { signedIn: true })
     await page.goto(path)

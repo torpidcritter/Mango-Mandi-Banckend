@@ -13,14 +13,35 @@ import BatchDetail from './pages/BatchDetail'
 import Orders from './pages/Orders'
 import OrderDetail from './pages/OrderDetail'
 import PackList from './pages/PackList'
+import Analytics from './pages/Analytics'
+import Deliveries from './pages/Deliveries'
 import Claims from './pages/Claims'
 import Pincodes from './pages/Pincodes'
+import Planning from './pages/Planning'
+import Preorders from './pages/Preorders'
 import NotFound from './pages/NotFound'
+import Staff from './pages/Staff'
+import Promos from './pages/Promos'
+import TwoStepPage, { TwoStepGate } from './pages/TwoStep'
+import { canSee, homeFor, type Screen } from './permissions'
+import { useSession } from './session'
 
 function RequireAuth({ me, children }: { me: Me | null; children: ReactNode }) {
   const location = useLocation()
   if (!me) return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />
+  if (me.twoStep?.required && !me.twoStep.enabled) return <TwoStepGate />
   return <>{children}</>
+}
+
+/** Shows a screen only to roles allowed to open it; the API refuses the rest anyway. */
+function Only({ screen, children }: { screen: Screen; children: ReactNode }) {
+  const { me } = useSession()
+  return canSee(me?.role, screen) ? <>{children}</> : <NotFound notAllowed />
+}
+
+function Home() {
+  const { me } = useSession()
+  return <Navigate to={homeFor(me?.role)} replace />
 }
 
 /** Catches the sign-out event from api.ts (logout or a failed refresh) and navigates. */
@@ -78,15 +99,22 @@ export default function App() {
               </RequireAuth>
             }
           >
-            <Route path="/" element={<Navigate to="/today" replace />} />
-            <Route path="/today" element={<Today />} />
-            <Route path="/batches" element={<Batches />} />
-            <Route path="/batches/:id" element={<BatchDetail />} />
-            <Route path="/orders" element={<Orders />} />
-            <Route path="/orders/:id" element={<OrderDetail />} />
-            <Route path="/pack-list" element={<PackList />} />
-            <Route path="/claims" element={<Claims />} />
-            <Route path="/pincodes" element={<Pincodes />} />
+            <Route path="/" element={<Home />} />
+            <Route path="/today" element={<Only screen="today"><Today /></Only>} />
+            <Route path="/batches" element={<Only screen="batches"><Batches /></Only>} />
+            <Route path="/batches/:id" element={<Only screen="batches"><BatchDetail /></Only>} />
+            <Route path="/orders" element={<Only screen="orders"><Orders /></Only>} />
+            <Route path="/orders/:id" element={<Only screen="orderDetail"><OrderDetail /></Only>} />
+            <Route path="/pack-list" element={<Only screen="packList"><PackList /></Only>} />
+            <Route path="/deliveries" element={<Only screen="deliveries"><Deliveries /></Only>} />
+            <Route path="/analytics" element={<Only screen="analytics"><Analytics /></Only>} />
+            <Route path="/claims" element={<Only screen="claims"><Claims /></Only>} />
+            <Route path="/pincodes" element={<Only screen="pincodes"><Pincodes /></Only>} />
+            <Route path="/planning" element={<Only screen="planning"><Planning /></Only>} />
+            <Route path="/preorders" element={<Only screen="preorders"><Preorders /></Only>} />
+            <Route path="/staff" element={<Only screen="staff"><Staff /></Only>} />
+            <Route path="/promos" element={<Only screen="promos"><Promos /></Only>} />
+            <Route path="/two-step" element={<TwoStepPage />} />
             <Route path="*" element={<NotFound />} />
           </Route>
         </Routes>

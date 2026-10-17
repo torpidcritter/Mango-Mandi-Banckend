@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { date, istDate } from '../format'
 import type { PackListOrder } from '../types'
+import { canSee } from '../permissions'
+import { useSession } from '../session'
 import { Badge, EmptyState, OrderBadge, QueryError, Spinner, useToast, scrollRegion } from '../ui'
 
 interface BatchGroup {
@@ -142,6 +144,8 @@ function ByOrder({ orders, day }: { orders: PackListOrder[]; day: string }) {
               </h2>
               <span>{o.customerName ?? '—'}</span>
               {o.pincode && <span className="muted">{o.pincode}</span>}
+              {o.slot && <Badge tone="info">{o.slot.label}</Badge>}
+              {o.gift && <Badge tone="info">Gift</Badge>}
               <OrderBadge status={o.status} />
               <span className="spacer" />
               {needsPacking && (o.status === 'CONFIRMED' || o.status === 'PROCESSING') && (
@@ -155,6 +159,12 @@ function ByOrder({ orders, day }: { orders: PackListOrder[]; day: string }) {
                 </button>
               )}
             </div>
+            {o.gift && (
+              <p className="small">
+                <strong>Gift for {o.gift.recipientName}.</strong> Leave the price slip out.
+                {o.gift.message && <> Card note: “{o.gift.message}”</>}
+              </p>
+            )}
             <div {...scrollRegion(`Items for ${o.number}`)}>
               <table>
                 <thead>
@@ -200,12 +210,14 @@ function ByOrder({ orders, day }: { orders: PackListOrder[]; day: string }) {
 
 function ByBatch({ orders }: { orders: PackListOrder[] }) {
   const { groups, unallocated } = useMemo(() => groupByBatch(orders), [orders])
+  const { me } = useSession()
+  const openBatches = canSee(me?.role, 'batches')
   return (
     <>
       {groups.map((g) => (
         <article key={g.batchId} className="card pack-order">
           <h2>
-            <Link to={`/batches/${g.batchId}`}>{g.variety}</Link>{' '}
+            {openBatches ? <Link to={`/batches/${g.batchId}`}>{g.variety}</Link> : g.variety}{' '}
             <span className="muted small">plucked {date(g.pluckedOn)}</span>
           </h2>
           <div {...scrollRegion(`Picks from ${g.variety} plucked ${date(g.pluckedOn)}`)}>

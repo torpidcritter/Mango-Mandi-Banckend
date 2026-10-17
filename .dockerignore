@@ -1,0 +1,10 @@
+**/node_modules
+dist
+customer-app/dist
+mango-api
+deploy/.env
+deploy/backups
+playwright-report*
+test-results*
+.git
+*.tsbuildinfo

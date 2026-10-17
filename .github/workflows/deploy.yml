@@ -1,0 +1,40 @@
+name: Deploy
+
+# Deploys main to the production server after CI passes on it, or on demand
+# (Actions > Deploy > Run workflow). Does nothing until the repository variable
+# DEPLOY_HOST is set. Setup: deploy/README.md, "Automatic deploys".
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or branch to deploy (default main)
+        required: false
+
+concurrency: production-deploy
+
+jobs:
+  deploy:
+    if: >-
+      vars.DEPLOY_HOST != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR || 'mandimangoes' }}
+          REF: ${{ inputs.ref || github.event.workflow_run.head_sha || 'origin/main' }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          case "$REF" in *[!A-Za-z0-9._/-]*) echo "bad ref"; exit 1;; esac
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$HOST" "cd '$DEPLOY_DIR' && ./deploy/deploy.sh '$REF'"

@@ -22,7 +22,7 @@ test('sign-in button stays disabled until both fields are filled', async ({ page
   await page.goto('/login')
   const button = page.getByRole('button', { name: 'Sign in' })
   await expect(button).toBeDisabled()
-  await page.getByLabel('Work email').fill('ops@vmr.test')
+  await page.getByLabel('Work email').fill('ops@mandimangoes.test')
   await expect(button).toBeDisabled()
   await page.getByLabel('Password').fill('x')
   await expect(button).toBeEnabled()
@@ -31,7 +31,7 @@ test('sign-in button stays disabled until both fields are filled', async ({ page
 test('wrong credentials show a generic error', async ({ page }) => {
   await mockApi(page)
   await page.goto('/login')
-  await page.getByLabel('Work email').fill('ops@vmr.test')
+  await page.getByLabel('Work email').fill('ops@mandimangoes.test')
   await page.getByLabel('Password').fill('wrong')
   await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page.getByRole('alert')).toHaveText('Invalid credentials')
@@ -41,7 +41,7 @@ test('a deep link goes to /login and back after signing in', async ({ page }) =>
   await mockApi(page)
   await page.goto('/pincodes')
   await expect(page).toHaveURL(/\/login$/)
-  await page.getByLabel('Work email').fill('manager@vmr.test')
+  await page.getByLabel('Work email').fill('manager@mandimangoes.test')
   await page.getByLabel('Password').fill('correct')
   await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page).toHaveURL(/\/pincodes$/)
@@ -52,7 +52,7 @@ test('a returning user is restored from the refresh cookie', async ({ page }) =>
   await mockApi(page, { signedIn: true })
   await page.goto('/today')
   await expect(page.getByRole('heading', { name: 'Today' })).toBeVisible()
-  await expect(page.getByText('manager@vmr.test')).toBeVisible()
+  await expect(page.getByText('manager@mandimangoes.test')).toBeVisible()
 })
 
 test('?reason=expired shows the session-ended banner', async ({ page }) => {

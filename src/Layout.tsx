@@ -1,15 +1,22 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { api } from './api'
+import { ROLE_LABEL, canSee, homeFor, type Screen } from './permissions'
 import { useSession } from './session'
 import { ErrorBoundary } from './ui'
 
-const LINKS: [string, string][] = [
-  ['/today', 'Today'],
-  ['/batches', 'Batches'],
-  ['/orders', 'Orders'],
-  ['/pack-list', 'Pack list'],
-  ['/claims', 'Claims'],
-  ['/pincodes', 'Pincodes'],
+const LINKS: [string, string, Screen][] = [
+  ['/today', 'Today', 'today'],
+  ['/batches', 'Batches', 'batches'],
+  ['/orders', 'Orders', 'orders'],
+  ['/pack-list', 'Pack list', 'packList'],
+  ['/deliveries', 'Deliveries', 'deliveries'],
+  ['/claims', 'Claims', 'claims'],
+  ['/pincodes', 'Pincodes', 'pincodes'],
+  ['/planning', 'Planning', 'planning'],
+  ['/preorders', 'Preorders', 'preorders'],
+  ['/analytics', 'Analytics', 'analytics'],
+  ['/promos', 'Promos', 'promos'],
+  ['/staff', 'Staff', 'staff'],
 ]
 
 export default function Layout() {
@@ -18,11 +25,11 @@ export default function Layout() {
   return (
     <div className="app">
       <nav className="app-nav" aria-label="Main">
-        <NavLink to="/today" className="brand">
+        <NavLink to={homeFor(me?.role)} className="brand">
           Mango Ops
         </NavLink>
         <ul>
-          {LINKS.map(([to, label]) => (
+          {LINKS.filter(([, , screen]) => canSee(me?.role, screen)).map(([to, label]) => (
             <li key={to}>
               <NavLink to={to} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
                 {label}
@@ -33,9 +40,12 @@ export default function Layout() {
         <div className="who">
           {me && (
             <span>
-              {me.email} · {me.role === 'MANAGER' ? 'Manager' : 'Operator'}
+              {me.email} · {ROLE_LABEL[me.role]}
             </span>
           )}
+          <NavLink to="/two-step" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
+            Two-step sign-in{me?.twoStep && !me.twoStep.enabled ? ' (off)' : ''}
+          </NavLink>
           <button type="button" className="btn btn-small" onClick={() => void api.logout()}>
             Sign out
           </button>

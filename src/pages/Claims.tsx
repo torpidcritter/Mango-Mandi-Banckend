@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
@@ -101,6 +101,16 @@ function ClaimCard({ claim, onResolve }: { claim: Claim; onResolve: () => void }
         <dd>{rupees(claim.orderTotal)}</dd>
         <dt>Affected items</dt>
         <dd>{claim.affectedItems.length ? claim.affectedItems.join(', ') : '—'}</dd>
+        {!!claim.photos?.length && (
+          <>
+            <dt>Photos</dt>
+            <dd className="claim-photos">
+              {claim.photos.map((p, i) => (
+                <ClaimPhoto key={p.id} claimId={claim.id} photoId={p.id} n={i + 1} />
+              ))}
+            </dd>
+          </>
+        )}
         {claim.photoUrl && (
           <>
             <dt>Photo</dt>
@@ -115,6 +125,14 @@ function ClaimCard({ claim, onResolve }: { claim: Claim; onResolve: () => void }
           <>
             <dt>Resolution</dt>
             <dd>{RESOLUTION_LABEL[claim.resolution] ?? claim.resolution}</dd>
+          </>
+        )}
+        {claim.replacementOrder && (
+          <>
+            <dt>Replacement</dt>
+            <dd>
+              <Link to={`/orders/${claim.replacementOrder.id}`}>{claim.replacementOrder.number}</Link>
+            </dd>
           </>
         )}
       </dl>
@@ -182,5 +200,34 @@ function ResolveDialog({ claim, onClose }: { claim: Claim; onClose: () => void }
         <FormError error={resolve.error} />
       </form>
     </Dialog>
+  )
+}
+
+function ClaimPhoto({ claimId, photoId, n }: { claimId: string; photoId: string; n: number }) {
+  const [url, setUrl] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let made: string | null = null
+    let live = true
+    api
+      .claimPhotoUrl(claimId, photoId)
+      .then((u) => {
+        made = u
+        if (live) setUrl(u)
+        else URL.revokeObjectURL(u)
+      })
+      .catch(() => live && setFailed(true))
+    return () => {
+      live = false
+      if (made) URL.revokeObjectURL(made)
+    }
+  }, [claimId, photoId])
+  if (failed) return <span className="small muted">Photo {n} could not be loaded.</span>
+  if (!url) return <span className="small muted">Loading photo {n}…</span>
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer">
+      <img src={url} alt={`Customer's photo ${n}`} />
+      <span className="sr-only"> (opens in a new tab)</span>
+    </a>
   )
 }

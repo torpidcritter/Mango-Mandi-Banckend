@@ -2,11 +2,14 @@
 
 A static single-page admin tool for warehouse and operations staff. It replaces the
 Postman-based admin workflow with buttons that only ever offer valid actions, so staff
-can run the shop without a developer and without risking an oversell. VMR does not refund: a
-problem with a delivered order is settled by sending a replacement.
+can run the shop without a developer and without risking an oversell. MandiMangoes settles a problem
+with a delivered order by sending a replacement, not a refund.
 
-Built against the spec in [`../vmr_mangoes_admin.md`](../vmr_mangoes_admin.md). The
-customer-facing API and its rules live in [`../vmr_mangoes.md`](../vmr_mangoes.md).
+The backend it talks to, **mango-api**, lives in [`mango-api/`](mango-api/README.md) in
+this repo: the `/admin/v1` API this panel uses, the `/v1` storefront API, payments, and
+the ripeness and stock engine. The customer shop is in
+[`customer-app/`](customer-app/README.md) (`npm run shop:dev`). Going live on Vercel and Neon is in
+[`deploy/VERCEL.md`](deploy/VERCEL.md); on a single server, [`deploy/README.md`](deploy/README.md).
 
 ## What it does
 
@@ -21,6 +24,11 @@ customer-facing API and its rules live in [`../vmr_mangoes.md`](../vmr_mangoes.m
 | Pack list | `/pack-list` | PACK-1 to PACK-4 |
 | Claims | `/claims` | CLM-1 to CLM-5 |
 | Pincodes | `/pincodes` | PIN-1 to PIN-3 |
+| Deliveries | `/deliveries` | Rider manifest: each slot's run by pincode, with addresses, phones and boxes; prints |
+| Planning | `/planning` | Stock by delivery date and ripeness, delivery calendar, Move a day's orders (managers), slots, selling rules (managers edit) |
+| Preorders | `/preorders` | Weekly preorder capacity (managers set) and bookings |
+| Analytics | `/analytics` | Season numbers: sales, wastage, at-risk and claims by week and product |
+| Staff | `/staff` | Managers add people, set roles and passwords, and read the activity log of every change |
 
 **Thin client.** The UI never computes stock or money. Every total and availability
 figure is formatted straight from the API; the backend stays the single authority.
@@ -91,8 +99,10 @@ npx playwright test tests/smoke.spec.ts tests/screens.spec.ts tests/a11y.spec.ts
 # Using an already-installed Chromium instead of Playwright's download:
 PW_CHROMIUM_PATH=/path/to/chrome npm run test:e2e
 
-# Full day-in-the-life script (needs a seeded backend + admin credentials):
-E2E_EMAIL=ops@example.com E2E_PASSWORD=... npm run test:e2e
+# Full day-in-the-life script against a local mango-api with demo data
+# (start it first: cd mango-api && COOKIE_SECURE=false npm start):
+E2E_EMAIL=manager@mandimangoes.test E2E_PASSWORD=manager123 VITE_API_URL=http://localhost:3000 \
+  npx playwright test tests/day-in-the-life.spec.ts
 ```
 
 - **Smoke** (`tests/smoke.spec.ts`) — auth guard, session-ended banner, offline
@@ -103,7 +113,9 @@ E2E_EMAIL=ops@example.com E2E_PASSWORD=... npm run test:e2e
 - **Accessibility** (`tests/a11y.spec.ts`) — axe-core WCAG 2 A/AA scan of the login
   screens and every signed-in screen, plus keyboard-operability checks. Runs without a backend.
 - **Day-in-the-life** (`tests/day-in-the-life.spec.ts`) — the full §10 acceptance
-  flow; skips unless `E2E_EMAIL`/`E2E_PASSWORD` are set and the backend is reachable.
+  flow against the real mango-api: receive and QC a batch, a customer checks out and
+  pays, ops pack, ship and deliver, the customer claims, ops approve a replacement.
+  Skips unless `E2E_EMAIL`/`E2E_PASSWORD` are set.
 
 Both viewports (390px phone, 1280px desktop) run on every spec, and a shared fixture
 fails any test that logs a console error.
@@ -111,9 +123,12 @@ fails any test that logs a console error.
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push to `main` and every PR: `npm ci`,
-typecheck (app and tests), production build, then the smoke, screens and accessibility
-specs on Chromium. The
-Playwright report is uploaded as an artifact on failure.
+typecheck (panel, tests and customer app), production builds of both apps, then the
+smoke, screens and accessibility specs on Chromium. A second job runs the mango-api tests
+against Postgres 16, and a third starts mango-api with demo data and runs the
+day-in-the-life spec and the customer app's journey against it. A fourth builds the
+production Docker images and validates the server config in `deploy/`.
+The Playwright report is uploaded as an artifact on failure.
 
 ## Resilience
 
@@ -135,40 +150,34 @@ Playwright report is uploaded as an artifact on failure.
 - On any 401 the client refreshes once and retries once; concurrent 401s share a
   single refresh call. A failed refresh signs the user out.
 
-## Roles (v2)
+## Roles
 
-The app expects `GET /admin/v1/auth/me` to return `{ email, role }` with role
-`OPERATOR` or `MANAGER`. The signed-in identity shows in the nav. Irreversible actions
-are **manager-only** and appear disabled with "Requires manager role" for operators:
-condemning a batch and deleting a pincode. Everything else (receiving stock, QC, stock
-adjustments, status moves, cancelling orders, adding/deactivating pincodes, starting
-a claim review, resolving a claim as replacement or reject) is open to both roles.
-See `src/permissions.ts` — confirm this split before launch (PRD Q1).
+`GET /admin/v1/auth/me` returns `{ email, role }` with role `MANAGER`, `OPERATOR`,
+`PACKER` or `QC`. The signed-in identity shows in the nav.
 
-## No refunds
+- **Packer**: Pack list, Deliveries and order pages; allocate, pack and move orders
+  through delivery. No cancelling or moving dates.
+- **QC**: Batches only; receive, log QC, adjust counts, move a batch forward.
+- **Operator**: every screen except Staff. Irreversible actions are **manager-only** and
+  appear disabled with "Requires manager role": condemning a batch, deleting a pincode,
+  editing the selling rules and moving a whole day's orders.
+- **Manager**: everything, plus the Staff screen and its activity log.
+
+Packers and QC land on their own screen; other screens show "Not available for your
+role" and are hidden from the nav. The API enforces the same split on its own
+(`mango-api/src/access.js`); the panel's copy is `src/permissions.ts`.
+
+## Replacements, not refunds
 
 The business replaces products instead of refunding. The panel has no refund button
-on orders, and a claim can only be resolved as **Replacement** or **Reject**. The
-API's `POST /orders/:id/refund` and the `REFUND_APPROVED` claim resolution are never
-called. Note that mango-api still marks a paid order's payment `REFUNDED` when the
-order is cancelled or its batch is condemned; that is backend behaviour.
+on orders, and a claim can only be resolved as **Replacement** or **Reject**. The one
+refund is automatic: a customer who cancels a paid order before it is packed gets the
+full amount back, and the order page shows the refund. Condemning a batch moves its
+orders to other stock or flags them **at risk** (listed on Today and on the order);
+it never cancels them.
 
-## Known gaps (v1 → being closed in v2)
+## Known gaps
 
 - `RTO` order status is shown as **"Returned"** in the UI.
-- Dry-fruit batch intake still needs backend availability modelling first.
-
-## Assumed backend changes (v2 — hand to the mango-api team)
-
-The v2 UI is built against these endpoint contracts. Until the backend ships them,
-the affected screens will show errors rather than succeed.
-
-| Endpoint | Change |
-|----------|--------|
-| `GET /admin/v1/auth/me` | new — `{ email, role: 'OPERATOR' \| 'MANAGER' }` |
-| `POST /admin/v1/auth/login` | set httpOnly refresh cookie; drop `refreshToken` from the body |
-| `POST /admin/v1/auth/refresh` | read the cookie (empty body), return `{ accessToken }` |
-| `POST /admin/v1/auth/logout` | new — clear the refresh cookie |
-| CORS | `Access-Control-Allow-Credentials: true`, exact `ADMIN_ORIGIN` |
 
 See §12 of the admin PRD for the open questions (Q1–Q7) and risks.
