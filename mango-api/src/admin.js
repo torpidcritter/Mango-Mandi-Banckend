@@ -41,6 +41,7 @@ import { refundOrder } from './payments.js'
 import { logger } from './logger.js'
 import { allProducts, findProduct, loadProducts, productName, sellable, shopProducts } from './products.js'
 import { STAGES } from './stage.js'
+import { router as unlockRouter } from './unlock-admin.js'
 
 export const router = express.Router()
 
@@ -207,6 +208,7 @@ const needsSetupFirst = (req, _res, next) =>
   next(req.admin.setup && !SETUP_ROUTES.has(`${req.method} ${req.path}`) ? new HttpError(403, 'TWO_STEP_SETUP_REQUIRED', 'Set up two-step sign-in first') : undefined)
 
 router.use(requireAdmin, needsSetupFirst, limitByRole, riderScope, auditStaffChanges)
+router.use(unlockRouter) // Neighborhood Unlock: zones, campaigns, templates
 
 router.get(
   '/auth/me',
@@ -1561,7 +1563,10 @@ router.put(
   '/config',
   requireManager,
   asyncHandler(async (req, res) => {
-    const rules = parse(rulesSchema, req.body?.rules ?? req.body)
+    const body = req.body?.rules ?? req.body
+    // The Planning page saves the rules it knows; it never switches Neighborhood Unlock off by leaving it out.
+    if (body && typeof body === 'object' && !('unlock' in body)) body.unlock = currentConfig().rules.unlock
+    const rules = parse(rulesSchema, body)
     const saved = await saveConfig(rules, req.admin.email)
     await triggerRebalanceAll() // new windows can invalidate allocations
     res.json(saved)

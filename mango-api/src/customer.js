@@ -25,6 +25,7 @@ import { sendOtp } from './sms.js'
 import { googleOn, verifyGoogleCredential } from './google.js'
 import { STAGES } from './stage.js'
 import { applyPromo, recordRedemption } from './promos.js'
+import { progressFor, unlockSettings } from './unlock.js'
 import { checkPhoto, dropPhoto, MAX_PHOTO_BYTES, sendPhoto, storePhoto } from './photos.js'
 import { eraseCustomer } from './privacy.js'
 import { requireHuman } from './turnstile.js'
@@ -309,6 +310,35 @@ router.get(
   }),
 )
 
+// ---------------------------------------------------------------- neighborhood unlock
+
+const unlockLimiter = sharedLimiter('unlock-progress', { windowMs: 60_000, limit: 60 })
+
+/**
+ * Public progress for a pincode and delivery date: counts only, never names,
+ * addresses, phones, order ids or times, so nobody can tell who ordered.
+ * Cached briefly: the number shown is always a real count, at most a few
+ * seconds old. Empty when the feature is off.
+ */
+router.get(
+  '/unlock/progress',
+  unlockLimiter,
+  asyncHandler(async (req, res) => {
+    const pincode = parse(PIN, req.query.pincode)
+    const settings = unlockSettings()
+    // Shared caches (the CDN) may keep it a few seconds, which absorbs a burst
+    // from a shared link; browsers always ask again, so a customer who just
+    // ordered sees their own order counted.
+    res.set('Cache-Control', `public, max-age=0, s-maxage=${settings.publicCacheSeconds}`)
+    if (!settings.enabled) return res.json({ enabled: false, deliveryDate: null, campaigns: [] })
+    let date = req.query.date ?? req.query.delivery_date ?? null
+    if (date != null && !isDate(String(date))) throw badRequest('date must be YYYY-MM-DD')
+    if (!date) date = (await orderableDates({ query }))[0] ?? null
+    const campaigns = date ? await progressFor({ query }, pincode, String(date)) : []
+    res.json({ enabled: true, deliveryDate: date, campaigns })
+  }),
+)
+
 // ---------------------------------------------------------------- cart
 
 /** Weeks open for preorders, with capacity left per SKU. */
@@ -482,6 +512,8 @@ router.post(
         [me.id, target.id],
       )
       await c.query('DELETE FROM customer_addresses WHERE customer_id = $1', [me.id])
+      // Neighborhood Unlock keeps the count but forgets who.
+      await c.query('UPDATE unlock_participants SET customer_id = NULL, order_id = NULL WHERE customer_id = $1', [me.id])
       await c.query('UPDATE order_ratings SET comment = NULL WHERE customer_id = $1', [me.id])
       await c.query('DELETE FROM carts WHERE customer_id = $1', [me.id])
       await c.query('DELETE FROM quotes WHERE customer_id = $1', [me.id])

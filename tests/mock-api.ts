@@ -1,5 +1,5 @@
 import type { Page, Route } from '@playwright/test'
-import type { Attention, AuditEntry, Product, Promo, StaffMember } from '../src/types'
+import type { Attention, AuditEntry, Campaign, CampaignDetail, Product, Promo, StaffMember, UnlockTemplate, Zone } from '../src/types'
 
 /** A 1×1 PNG. */
 const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64')
@@ -186,8 +186,17 @@ export function seed() {
       { id: 'c1', orderId: 'o2', orderNumber: 'ORD-1043', orderTotal: 129900, customerPhone: '9123456780', issueType: 'DAMAGED', description: 'Two mangoes were crushed.', affectedItems: ['ALP-3'], photoUrl: 'https://example.com/p.jpg', photos: [{ id: 'cph1' }], status: 'SUBMITTED', resolution: null, createdAt: '2026-10-14T07:00:00Z' },
       { id: 'c2', orderId: 'o2', orderNumber: 'ORD-1043', orderTotal: 129900, customerPhone: '9123456780', issueType: 'WRONG_ITEM', description: 'Got Kesar instead of Alphonso.', affectedItems: ['ALP-3'], photoUrl: null, status: 'UNDER_REVIEW', resolution: null, createdAt: '2026-10-14T07:30:00Z' },
     ],
+    zones: [
+      { id: 'zon1', label: 'Colaba', active: true, pincodes: ['400001'], liveCampaigns: 1, createdBy: 'manager@mandimangoes.test', createdAt: '2026-10-10T05:00:00Z' },
+    ] as Zone[],
+    campaigns: [
+      { id: 'unl1', zoneId: 'zon1', pincode: null, zoneLabel: 'Colaba', deliveryDate: '2026-10-17', slotId: null, slotLabel: null, threshold: 10, minOrderValue: 0, rewardType: null, rewardValue: null, rewardBudget: null, orderBy: '2026-10-16T12:30:00Z', status: 'OPEN', current: 7, remaining: 3, counted: null, openedAt: '2026-10-14T05:00:00Z', evaluatedAt: null, note: null, templateId: null, createdBy: 'manager@mandimangoes.test', createdAt: '2026-10-14T05:00:00Z' },
+    ] as Campaign[],
+    unlockTemplates: [] as UnlockTemplate[],
+    unlockEnabled: false,
     pincodes: [
       { pincode: '400001', city: 'Mumbai', zone: 'South', active: true },
+      { pincode: '400005', city: 'Mumbai', zone: 'South', active: true },
       { pincode: '411001', city: 'Pune', zone: null, active: false },
     ],
     coverage: [
@@ -433,6 +442,59 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
       const code = decodeURIComponent(path.split('/')[2])
       state.promos = state.promos.map((x) => (x.code === code ? { ...x, ...(body as object) } : x))
       return json(route, 200, state.promos.find((x) => x.code === code))
+    }
+    if (path === '/zones' || path.startsWith('/zones/') || path.startsWith('/unlock/')) {
+      if (state.role !== 'MANAGER' && state.role !== 'OPERATOR') return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Not available to your role', requestId: 'req_f' } })
+      if (path === '/zones' && method === 'GET') return json(route, 200, state.zones)
+      if (path === '/zones' && method === 'POST') {
+        const b = body as { label: string; pincodes: string[] }
+        const zone: Zone = { id: `zon${state.zones.length + 1}`, label: b.label, pincodes: b.pincodes, active: true, liveCampaigns: 0, createdBy: EMAIL[state.role], createdAt: '2026-10-17T05:00:00Z' }
+        state.zones = [...state.zones, zone]
+        return json(route, 201, zone)
+      }
+      const zm = /^\/zones\/([^/]+)(\/pincodes)?$/.exec(path)
+      if (zm) {
+        state.zones = state.zones.map((z) => (z.id === zm[1] ? { ...z, ...(body as object) } : z))
+        return json(route, 200, state.zones.find((z) => z.id === zm[1]))
+      }
+      if (path === '/unlock/campaigns' && method === 'GET') return json(route, 200, { enabled: state.unlockEnabled, campaigns: state.campaigns })
+      if (path === '/unlock/campaigns' && method === 'POST') {
+        const b = body as Partial<Campaign>
+        const zone = state.zones.find((z) => z.id === b.zoneId)
+        const camp = { ...state.campaigns[0], id: `unl${state.campaigns.length + 1}`, pincode: null, slotId: null, ...b, zoneLabel: zone?.label ?? `Pincode ${b.pincode}`, status: 'DRAFT', current: 0, remaining: b.threshold ?? 0, openedAt: null } as Campaign
+        state.campaigns = [camp, ...state.campaigns]
+        return json(route, 201, camp)
+      }
+      const cm = /^\/unlock\/campaigns\/([^/]+)(?:\/(open|cancel))?$/.exec(path)
+      if (cm) {
+        const camp = state.campaigns.find((c) => c.id === cm[1])
+        if (!camp) return json(route, 404, { error: { code: 'NOT_FOUND', message: 'Campaign not found', requestId: 'req_n' } })
+        if (cm[2]) {
+          camp.status = cm[2] === 'open' ? 'OPEN' : 'CANCELLED'
+          return json(route, 200, camp)
+        }
+        const detail: CampaignDetail = {
+          ...camp,
+          forecast: { projected: 11, recentSameWeekday: [{ date: '2026-10-10', customers: 8 }, { date: '2026-10-03', customers: 6 }, { date: '2026-09-26', customers: 9 }], recentAverage: 8 },
+          clusters: [{ kind: 'SAME_ADDRESS', customers: 3, orders: 3, orderNumbers: ['ORD-1050', 'ORD-1051', 'ORD-1052'], firstAt: '2026-10-15T05:00:00Z', lastAt: '2026-10-15T05:06:00Z', withinMinutes: 6 }],
+          snapshotCount: 0,
+          events: [{ from: null, to: 'DRAFT', actor: EMAIL.MANAGER, counted: null, note: null, at: '2026-10-14T04:55:00Z' }, { from: 'DRAFT', to: 'OPEN', actor: EMAIL.MANAGER, counted: null, note: null, at: '2026-10-14T05:00:00Z' }],
+        }
+        return json(route, 200, detail)
+      }
+      if (path === '/unlock/templates' && method === 'GET') return json(route, 200, state.unlockTemplates)
+      if (path === '/unlock/templates' && method === 'POST') {
+        const t = { id: `utp${state.unlockTemplates.length + 1}`, slotId: null, rewardType: null, rewardValue: null, rewardBudget: null, active: true, createdBy: EMAIL[state.role], createdAt: '2026-10-17T05:00:00Z', ...(body as object) } as UnlockTemplate
+        state.unlockTemplates = [...state.unlockTemplates, t]
+        return json(route, 201, t)
+      }
+      if (path === '/unlock/settings') {
+        if (method === 'PUT') {
+          if (state.role !== 'MANAGER') return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Requires manager role', requestId: 'req_f' } })
+          state.unlockEnabled = (body as { enabled: boolean }).enabled
+        }
+        return json(route, 200, { enabled: state.unlockEnabled, evaluationGraceMinutes: 10, publicCacheSeconds: 10, clusterWindowMinutes: 30, clusterMinCustomers: 3 })
+      }
     }
     if (path === '/pincodes' && method === 'GET') return json(route, 200, state.pincodes)
     if (path === '/pincodes' && method === 'POST') return json(route, 201, { ...(body as object), active: true })

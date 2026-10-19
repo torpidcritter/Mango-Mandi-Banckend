@@ -66,6 +66,8 @@ export async function eraseCustomer(c, customerId, { force = false, deletedAt = 
   )
   const pics = await c.query('DELETE FROM claim_photos WHERE customer_id = $1 RETURNING blob_path', [me.id])
   await c.query('DELETE FROM customer_addresses WHERE customer_id = $1', [me.id])
+  // Neighborhood Unlock keeps the count but forgets who.
+  await c.query('UPDATE unlock_participants SET customer_id = NULL, order_id = NULL WHERE customer_id = $1', [me.id])
   await c.query('UPDATE stock_alerts SET cancelled_at = COALESCE(cancelled_at, $2) WHERE customer_id = $1', [me.id, now()])
   await c.query(
     `UPDATE notifications SET phone = '', status = CASE WHEN status = 'PENDING' THEN 'SKIPPED' ELSE status END

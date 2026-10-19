@@ -12,7 +12,7 @@
 
 import type { OrderStatus, Role } from './types'
 
-export type Action = 'condemnBatch' | 'deletePincode' | 'editRules' | 'moveDay' | 'manageStaff' | 'changeOrder'
+export type Action = 'condemnBatch' | 'deletePincode' | 'editRules' | 'moveDay' | 'manageStaff' | 'changeOrder' | 'unlockSwitch'
 
 const MANAGER_ONLY: ReadonlySet<Action> = new Set<Action>([
   'condemnBatch',
@@ -20,6 +20,7 @@ const MANAGER_ONLY: ReadonlySet<Action> = new Set<Action>([
   'editRules',
   'moveDay',
   'manageStaff',
+  'unlockSwitch',
 ])
 
 export const MANAGER_ONLY_HINT = 'Requires manager role'
@@ -54,10 +55,12 @@ export type Screen =
   | 'staff'
   | 'promos'
   | 'products'
+  | 'zones'
+  | 'campaigns'
 
 const SCREENS: Record<Role, ReadonlySet<Screen> | 'all'> = {
   MANAGER: 'all',
-  OPERATOR: new Set<Screen>(['today', 'batches', 'orders', 'orderDetail', 'packList', 'deliveries', 'claims', 'pincodes', 'planning', 'preorders', 'analytics']),
+  OPERATOR: new Set<Screen>(['today', 'batches', 'orders', 'orderDetail', 'packList', 'deliveries', 'claims', 'pincodes', 'planning', 'preorders', 'analytics', 'zones', 'campaigns']),
   PACKER: new Set<Screen>(['packList', 'deliveries', 'orderDetail']),
   QC: new Set<Screen>(['batches']),
   RIDER: new Set<Screen>(['deliveries']),

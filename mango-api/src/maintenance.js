@@ -28,6 +28,7 @@ import { sendReorderReminders, sendStockAlerts } from './engagement.js'
 import { processDueRefunds, reconcilePendingPayments, refundDuplicatePayments } from './payments.js'
 import { cronCheckIn } from './sentry.js'
 import { now } from './clock.js'
+import { evaluateDueCampaigns, runTemplates } from './unlock.js'
 
 /** The run's time budget, under Vercel's 60-second limit. */
 export const RUN_BUDGET_MS = 45_000
@@ -236,6 +237,8 @@ async function steps(forceAll) {
   out.reminders = await step('reminders', () => sendReorderReminders(), { sliceMs: SLICE.alerts })
   out.notified = await step('notifications', () => sendDueNotifications(), { sliceMs: SLICE.notifications })
   out.preorders = await step('preorders', runPreorderJobs, { sliceMs: SLICE.preorders })
+  out.unlock = await step('unlock-evaluate', () => evaluateDueCampaigns())
+  out.unlockTemplates = await step('unlock-templates', () => runTemplates())
   await step('cleanup', () => cleanupExpired())
   const lastFull = last['rebalance-all'] ?? 0
   if (forceAll || (last['rebalance-requested'] ?? 0) > lastFull || t - lastFull > DAILY_MS) {

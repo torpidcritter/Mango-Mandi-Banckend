@@ -20,6 +20,29 @@ const profile = z
     'stages must run RAW → SEMI_RIPE → RIPE',
   )
 
+/** Neighborhood Unlock settings. Off until a manager turns it on. */
+export const unlockSettingsSchema = z
+  .object({
+    enabled: z.boolean(),
+    // Minutes after the order-by time before a campaign is judged, so a
+    // payment started before the cutoff can finish (the payment hold).
+    evaluationGraceMinutes: z.number().int().min(0).max(120),
+    publicCacheSeconds: z.number().int().min(0).max(300),
+    // Suspicious clusters: this many customers at one address, or orders from
+    // one address within this many minutes.
+    clusterWindowMinutes: z.number().int().min(1).max(1440),
+    clusterMinCustomers: z.number().int().min(2).max(50),
+  })
+  .strict()
+
+export const DEFAULT_UNLOCK = {
+  enabled: false,
+  evaluationGraceMinutes: 10,
+  publicCacheSeconds: 10,
+  clusterWindowMinutes: 30,
+  clusterMinCustomers: 3,
+}
+
 export const rulesSchema = z
   .object({
     maxSellableAge: z.number().int().min(1).max(30),
@@ -35,6 +58,7 @@ export const rulesSchema = z
     lowStockThreshold: z.number().int().min(0),
     claimWindowHours: z.number().int().min(1),
     stageProfiles: z.record(profile).refine((p) => 'default' in p, 'a "default" profile is required'),
+    unlock: unlockSettingsSchema.default(DEFAULT_UNLOCK),
   })
   .strict()
   .refine((r) => r.retireAge > r.maxSellableAge, { message: 'retireAge must be greater than maxSellableAge' })
@@ -60,6 +84,7 @@ export const DEFAULT_RULES = {
       { stage: 'RIPE', minAge: 6, maxAge: 7 },
     ],
   },
+  unlock: DEFAULT_UNLOCK,
 }
 
 let live = { version: 0, rules: DEFAULT_RULES }

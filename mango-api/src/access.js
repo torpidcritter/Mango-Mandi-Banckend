@@ -78,6 +78,21 @@ export const OPERATOR_ROUTES = [
   route('GET', '/preorders'),
   route('GET', '/preorder-capacity'),
   route('GET', '/coverage'),
+  // Neighborhood Unlock (switching the feature on or off is manager-only).
+  route('GET', '/zones'),
+  route('POST', '/zones'),
+  route('PATCH', '/zones/:id'),
+  route('PUT', '/zones/:id/pincodes'),
+  route('GET', '/unlock/campaigns'),
+  route('POST', '/unlock/campaigns'),
+  route('GET', '/unlock/campaigns/:id'),
+  route('PATCH', '/unlock/campaigns/:id'),
+  route('POST', '/unlock/campaigns/:id/open'),
+  route('POST', '/unlock/campaigns/:id/cancel'),
+  route('GET', '/unlock/templates'),
+  route('POST', '/unlock/templates'),
+  route('PATCH', '/unlock/templates/:id'),
+  route('GET', '/unlock/settings'),
 ]
 
 const LIMITED = {

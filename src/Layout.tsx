@@ -17,6 +17,8 @@ const LINKS: [string, string, Screen][] = [
   ['/analytics', 'Analytics', 'analytics'],
   ['/products', 'Products', 'products'],
   ['/promos', 'Promos', 'promos'],
+  ['/zones', 'Zones', 'zones'],
+  ['/campaigns', 'Unlock', 'campaigns'],
   ['/staff', 'Staff', 'staff'],
 ]
 
