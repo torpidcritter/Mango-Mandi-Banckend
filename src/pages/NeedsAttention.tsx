@@ -1,8 +1,10 @@
 import { Link } from 'react-router-dom'
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { dateTime } from '../format'
-import { useToast } from '../ui'
+import type { PhotoDelivery } from '../types'
+import { Dialog, FormError, useToast } from '../ui'
 
 const STEP_LABEL: Record<string, string> = {
   reconcile: 'Checking missed payments',
@@ -37,11 +39,29 @@ export default function NeedsAttention() {
     onError: (err) => toast.error(err),
   })
 
+  const [doubting, setDoubting] = useState<PhotoDelivery | null>(null)
+  const check = useMutation({
+    mutationFn: ({ d, ok, note }: { d: PhotoDelivery; ok: boolean; note?: string }) => api.reviewDelivery(d.id, ok, note),
+    onSuccess: (_r, { d, ok }) => {
+      toast.success(ok ? `Delivery of ${d.order.number} checked` : `${d.order.number} flagged: call the customer`)
+      setDoubting(null)
+      queryClient.invalidateQueries({ queryKey: ['attention'] })
+    },
+    onError: (err) => toast.error(err),
+  })
+
   if (!q.data) return null
   const a = q.data
   const calls = a.failedDeliveries ?? []
+  const photos = a.photoDeliveries ?? []
   const count =
-    (a.loop.stale ? 1 : 0) + a.loop.failingSteps.length + a.failedMessages.length + a.stuckRefunds.length + a.webhookFailures.length + calls.length
+    (a.loop.stale ? 1 : 0) +
+    a.loop.failingSteps.length +
+    a.failedMessages.length +
+    a.stuckRefunds.length +
+    a.webhookFailures.length +
+    calls.length +
+    photos.length
   if (count === 0) return null
 
   return (
@@ -68,6 +88,20 @@ export default function NeedsAttention() {
             sent out again until someone dispatches it from the order page.
           </li>
         ))}
+        {photos.map((d) => (
+          <li key={`photo-${d.id}`}>
+            <strong>Check a photo delivery</strong> of <Link to={`/orders/${d.order.id}`}>{d.order.number}</Link> by {d.actor} at{' '}
+            {dateTime(d.at)}
+            {d.receivedBy ? <span className="muted">, left with {d.receivedBy}</span> : null}
+            {d.flags.length ? <span className="badge badge-warn"> {d.flags.join(', ')}</span> : null}{' '}
+            <button type="button" className="btn btn-small" disabled={check.isPending} onClick={() => check.mutate({ d, ok: true })}>
+              Looks right<span className="sr-only"> for {d.order.number}</span>
+            </button>{' '}
+            <button type="button" className="btn btn-small" onClick={() => setDoubting(d)}>
+              Doubtful<span className="sr-only"> for {d.order.number}</span>
+            </button>
+          </li>
+        ))}
         {a.stuckRefunds.map((r) => (
           <li key={`${r.type}-${r.id}-${r.number}`}>
             <strong>Refund not sent</strong> for {r.type === 'order' ? <Link to={`/orders/${r.id}`}>{r.number}</Link> : r.number}, asked
@@ -91,6 +125,34 @@ export default function NeedsAttention() {
           </li>
         ))}
       </ul>
+      {doubting && <DoubtDialog d={doubting} pending={check.isPending} error={check.error} onClose={() => setDoubting(null)} onSave={(note) => check.mutate({ d: doubting, ok: false, note })} />}
     </section>
+  )
+}
+
+function DoubtDialog({ d, pending, error, onClose, onSave }: { d: PhotoDelivery; pending: boolean; error: unknown; onClose: () => void; onSave: (note: string) => void }) {
+  const [note, setNote] = useState('')
+  return (
+    <Dialog
+      title={`What looks wrong with ${d.order.number}?`}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="button" className="btn btn-primary" disabled={pending || !note.trim()} onClick={() => onSave(note.trim())}>
+            Flag for a call
+          </button>
+        </>
+      }
+    >
+      <div className="field">
+        <label htmlFor="doubt-note">Note for the order history</label>
+        <textarea id="doubt-note" rows={3} maxLength={300} value={note} onChange={(e) => setNote(e.target.value)} />
+        <p className="hint">The order stays delivered. Someone calls the customer to check they got it.</p>
+      </div>
+      <FormError error={error} />
+    </Dialog>
   )
 }

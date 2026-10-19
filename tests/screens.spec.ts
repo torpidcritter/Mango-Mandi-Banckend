@@ -113,25 +113,31 @@ test('Orders list filters and opens a detail page', async ({ page }) => {
   await expect(page).toHaveURL(/\/orders\/o1$/)
 })
 
-test('Order detail: mark packed waits for allocation; cancel needs a reason', async ({ page }) => {
+test('Order detail: mark packed waits for allocation; cancelling a paid order refunds it and needs a reason', async ({ page }) => {
   const api = await mockApi(page, { signedIn: true })
   await page.goto('/orders/o1')
   await expect(page.getByRole('button', { name: 'Mark packed (allocate first)' })).toBeDisabled()
   await page.getByRole('button', { name: 'Allocate and pack' }).click()
   await expect.poll(() => api.calls.some((c) => c.path === '/orders/o1/allocate')).toBe(true)
 
-  await page.getByRole('button', { name: 'Cancel order' }).click()
-  const dialog = page.getByRole('dialog')
+  await page.getByRole('button', { name: 'Cancel and refund' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Cancel and refund order ORD-1042?' })
   await expect(dialog).toContainText('Stock held for this order will be released.')
-  await expect(dialog).not.toContainText(/refund/i)
-  const confirm = dialog.getByRole('button', { name: 'Cancel order' })
+  await expect(dialog).toContainText('It goes back to them in full')
+  const confirm = dialog.getByRole('button', { name: 'Cancel and refund' })
   await expect(confirm).toBeDisabled()
-  await dialog.getByLabel('Reason').fill('Customer asked')
+  await dialog.getByLabel('Reason').fill('Truck came short')
   await confirm.click()
-  await expect.poll(() => api.calls.find((c) => c.path === '/orders/o1/cancel')?.body).toEqual({ reason: 'Customer asked' })
+  await expect.poll(() => api.calls.find((c) => c.path === '/orders/o1/cancel')?.body).toEqual({ reason: 'Truck came short', refund: true })
 })
 
-test('Orders never offer a refund', async ({ page }) => {
+test('only managers can cancel a paid order', async ({ page }) => {
+  await mockApi(page, { signedIn: true, role: 'OPERATOR' })
+  await page.goto('/orders/o1')
+  await expect(page.getByRole('button', { name: /Cancel and refund/ })).toBeDisabled()
+})
+
+test('Delivered orders never offer a refund', async ({ page }) => {
   await mockApi(page, { signedIn: true })
   await page.goto('/orders/o2')
   await expect(page.getByRole('heading', { name: 'Order ORD-1043' })).toBeVisible()

@@ -1,0 +1,58 @@
+# Nightly encrypted copy of the production database, kept outside Neon.
+# Neon's own history covers the last 7 days; this covers Neon itself being
+# unavailable, or a mistake noticed after the history window.
+#
+# Needs two repository secrets (Settings > Secrets and variables > Actions):
+#   BACKUP_DATABASE_URL     Neon main, direct (no -pooler) connection, read-only role
+#   BACKUP_GPG_PUBLIC_KEY   an ASCII-armoured GPG public key; keep the private key offline
+# Without them the job does nothing. Each dump is kept 30 days as a workflow
+# artifact. Decrypt with: gpg --decrypt mango-....dump.gpg > mango.dump
+name: Backup
+
+on:
+  schedule:
+    - cron: '30 21 * * *' # 03:00 IST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+      BACKUP_GPG_PUBLIC_KEY: ${{ secrets.BACKUP_GPG_PUBLIC_KEY }}
+    steps:
+      - name: Skip when not set up
+        id: check
+        run: |
+          if [ -z "$BACKUP_DATABASE_URL" ] || [ -z "$BACKUP_GPG_PUBLIC_KEY" ]; then
+            echo "Backup secrets are not set; nothing to do."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.ready == 'true'
+      - name: Install pg_dump 17
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-17
+      - name: Dump and encrypt
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          echo "$BACKUP_GPG_PUBLIC_KEY" | gpg --batch --import
+          recipient=$(gpg --list-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+          PATH="/usr/lib/postgresql/17/bin:$PATH" DATABASE_URL="$BACKUP_DATABASE_URL" BACKUP_DIR=backups \
+            BACKUP_GPG_RECIPIENT="$recipient" ./mango-api/ops/backup.sh
+          ls backups/*.gpg >/dev/null # never upload an unencrypted dump
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.ready == 'true'
+        with:
+          name: mango-backup-${{ github.run_id }}
+          path: backups/*.gpg
+          retention-days: 30
+          if-no-files-found: error

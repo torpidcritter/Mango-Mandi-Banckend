@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api } from '../api'
+import { api, type StockAlert } from '../api'
+import { STAGE_LABEL, day } from '../format'
 import { useStore } from '../store'
 import { Dialog, ErrorNote, Spinner } from '../ui'
 
@@ -38,6 +39,8 @@ export default function Account() {
           How we use these details is in our <Link to="/privacy">privacy notice</Link>.
         </p>
       </section>
+
+      <Messages />
 
       <SavedAddresses />
 
@@ -108,6 +111,76 @@ function SavedAddresses() {
         </ul>
       )}
       <ErrorNote error={forget.error} />
+    </section>
+  )
+}
+
+/** WhatsApp messages the customer chooses: the reminder, and back-in-stock alerts. */
+function Messages() {
+  const queryClient = useQueryClient()
+  const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings })
+  const alerts = useQuery({ queryKey: ['stock-alerts'], queryFn: api.stockAlerts })
+  // Shown at once, put back if the save fails.
+  const [wanted, setWanted] = useState<boolean | null>(null)
+  const save = useMutation({
+    mutationFn: api.saveSettings,
+    onSuccess: (s) => queryClient.setQueryData(['settings'], s),
+    onSettled: () => setWanted(null),
+  })
+  const remove = useMutation({
+    mutationFn: api.removeStockAlert,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['stock-alerts'] }),
+  })
+  const status = (a: StockAlert) =>
+    a.notifiedAt ? `Back in stock${a.availableOn ? ` from ${day(a.availableOn)}` : ''}: we sent you a message` : `Waiting, until ${day(a.expiresAt.slice(0, 10))}`
+  return (
+    <section className="card narrow" aria-labelledby="messages">
+      <h2 id="messages">WhatsApp messages</h2>
+      <p className="small muted">Order updates always come. These are up to you.</p>
+      {settings.isError ? (
+        <ErrorNote error={settings.error} onRetry={() => settings.refetch()} />
+      ) : (
+        <label className="option">
+          <input
+            type="checkbox"
+            checked={wanted ?? !!settings.data?.remindersOptIn}
+            disabled={!settings.data || save.isPending}
+            onChange={(e) => {
+              setWanted(e.target.checked)
+              save.mutate({ remindersOptIn: e.target.checked })
+            }}
+          />
+          <span>Remind me to order again a week after a delivery</span>
+        </label>
+      )}
+      <ErrorNote error={save.error} />
+      <h3 className="sub-title">Tell me when it's back</h3>
+      {alerts.isPending ? (
+        <Spinner label="Loading alerts" />
+      ) : alerts.isError ? (
+        <ErrorNote error={alerts.error} onRetry={() => alerts.refetch()} />
+      ) : alerts.data.length === 0 ? (
+        <p className="muted small">When a box is sold out, tap "Tell me when it's back" and we'll message you once it's in stock.</p>
+      ) : (
+        <ul className="address-list">
+          {alerts.data.map((a) => (
+            <li key={a.id}>
+              <div>
+                <strong>
+                  {a.name}, {STAGE_LABEL[a.stage].toLowerCase()}
+                </strong>
+                <span className="muted small">{status(a)}</span>
+              </div>
+              {!a.notifiedAt && (
+                <button type="button" className="link-btn" disabled={remove.isPending} onClick={() => remove.mutate(a.id)} aria-label={`Stop the alert for ${a.name}, ${STAGE_LABEL[a.stage]}`}>
+                  Stop
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <ErrorNote error={remove.error} />
     </section>
   )
 }

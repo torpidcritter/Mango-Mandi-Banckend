@@ -5,7 +5,7 @@ import { api } from '../api'
 import { RIPENESS_LABEL, date, istDate, rupees, type Tone } from '../format'
 import { MANAGER_ONLY_HINT, can } from '../permissions'
 import { useSession } from '../session'
-import type { PreorderStatus } from '../types'
+import type { Preorder, PreorderStatus } from '../types'
 import { Badge, Dialog, EmptyState, FormError, GatedButton, QueryError, Spinner, scrollRegion, useToast } from '../ui'
 
 const STATUS_LABEL: Record<PreorderStatus, string> = {
@@ -182,6 +182,8 @@ function PreorderList() {
   const [params, setParams] = useSearchParams()
   const status = (params.get('status') as PreorderStatus | null) || null
   const q = useQuery({ queryKey: ['preorders', status], queryFn: () => api.preorders(status) })
+  const { me } = useSession()
+  const [cancelling, setCancelling] = useState<Preorder | null>(null)
 
   function setStatus(s: PreorderStatus | null) {
     const p = new URLSearchParams(params)
@@ -217,6 +219,9 @@ function PreorderList() {
                 <th>Week</th>
                 <th className="num">Total</th>
                 <th>State</th>
+                <th>
+                  <span className="sr-only">Actions</span>
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -254,12 +259,78 @@ function PreorderList() {
                       <div className="small muted">{p.refund.refundedAt ? 'Refunded' : 'Refund pending'}</div>
                     )}
                   </td>
+                  <td>
+                    {OPEN.includes(p.status) && (
+                      <GatedButton allowed={me?.role === 'MANAGER'} className="btn btn-small" onClick={() => setCancelling(p)}>
+                        Cancel<span className="sr-only"> {p.number}</span>
+                      </GatedButton>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
+      {cancelling && <CancelPreorderDialog preorder={cancelling} onClose={() => setCancelling(null)} />}
     </section>
+  )
+}
+
+/** Bookings a manager can still cancel. One already turned into an order is cancelled from the order page. */
+const OPEN: PreorderStatus[] = ['PAYMENT_PENDING', 'BOOKED', 'WAITLISTED']
+
+function CancelPreorderDialog({ preorder, onClose }: { preorder: Preorder; onClose: () => void }) {
+  const toast = useToast()
+  const queryClient = useQueryClient()
+  const [reason, setReason] = useState('')
+  const paid = preorder.paymentStatus === 'SUCCEEDED'
+  const cancel = useMutation({
+    mutationFn: () => api.cancelPreorder(preorder.id, reason.trim()),
+    onSuccess: (r) => {
+      toast.success(r.refunded ? `${preorder.number} cancelled; ${rupees(preorder.total)} is being refunded` : `${preorder.number} cancelled`)
+      void queryClient.invalidateQueries({ queryKey: ['preorders'] })
+      void queryClient.invalidateQueries({ queryKey: ['preorder-capacity'] })
+      onClose()
+    },
+  })
+  const valid = reason.trim().length >= 3
+  return (
+    <Dialog
+      title={`Cancel preorder ${preorder.number}?`}
+      tone="danger"
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn" onClick={onClose}>
+            Keep booking
+          </button>
+          <button type="submit" form="cancel-preorder-form" className="btn btn-danger" disabled={!valid || cancel.isPending}>
+            {cancel.isPending ? 'Cancelling…' : paid ? 'Cancel and refund' : 'Cancel booking'}
+          </button>
+        </>
+      }
+    >
+      <form
+        id="cancel-preorder-form"
+        onSubmit={(e: FormEvent) => {
+          e.preventDefault()
+          if (valid) cancel.mutate()
+        }}
+      >
+        <p>
+          {paid
+            ? `The customer paid ${rupees(preorder.total)}. It goes back to them in full. Use this when we can't fill the booking (crop failure, the season ending).`
+            : 'The booking has not been paid, so there is nothing to refund.'}{' '}
+          The boxes go back into the week's capacity.
+        </p>
+        <div className="field">
+          <label htmlFor="cancel-preorder-reason">Reason</label>
+          <textarea id="cancel-preorder-reason" value={reason} onChange={(e) => setReason(e.target.value)} data-autofocus />
+          <p className="hint">At least 3 characters. Saved on the booking's history.</p>
+        </div>
+        <FormError error={cancel.error} />
+      </form>
+    </Dialog>
   )
 }

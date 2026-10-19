@@ -60,14 +60,16 @@ export async function seed() {
         newId('adm'), email, await bcrypt.hash(password, 10), role,
       ])
     }
-  } else if (env.ADMIN_BOOTSTRAP_EMAIL && env.ADMIN_BOOTSTRAP_PASSWORD) {
-    // First production start: create one manager if there are no staff yet.
-    const { rows } = await query('SELECT COUNT(*)::int AS n FROM admin_users')
+  } else {
+    // First start: create one manager if there are no staff yet. Previews use
+    // their own login, never production's.
+    const [email, password] = deployEnv === 'preview' ? [env.PREVIEW_ADMIN_EMAIL, env.PREVIEW_ADMIN_PASSWORD] : [env.ADMIN_BOOTSTRAP_EMAIL, env.ADMIN_BOOTSTRAP_PASSWORD]
+    const { rows } = email && password ? await query('SELECT COUNT(*)::int AS n FROM admin_users') : { rows: [{ n: 1 }] }
     if (rows[0].n === 0) {
       await query(`INSERT INTO admin_users (id, email, password_hash, role) VALUES ($1, $2, $3, 'MANAGER')`, [
-        newId('adm'), env.ADMIN_BOOTSTRAP_EMAIL.toLowerCase(), await bcrypt.hash(env.ADMIN_BOOTSTRAP_PASSWORD, 12),
+        newId('adm'), email.toLowerCase(), await bcrypt.hash(password, 12),
       ])
-      logger.info({ email: env.ADMIN_BOOTSTRAP_EMAIL }, 'bootstrap manager created')
+      logger.info({ email }, 'bootstrap manager created')
     }
   }
 

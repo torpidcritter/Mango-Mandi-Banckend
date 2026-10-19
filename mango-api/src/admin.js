@@ -14,7 +14,7 @@ import { currentConfig, rulesSchema, saveConfig } from './config.js'
 import { sendPhoto } from './photos.js'
 import { normaliseCode, promoView } from './promos.js'
 import { hashRecovery, newRecoveryCodes, newSecret, otpauthUrl, verifyCode } from './totp.js'
-import { attemptsFor, dispatchOrder, FAIL_REASONS, MAX_PHOTO_BYTES, photo, recordDelivery, recordStaffDelivery, savePhoto } from './delivery-proof.js'
+import { attemptsFor, dispatchOrder, FAIL_REASONS, MAX_PHOTO_BYTES, photo, photoReviews, recordDelivery, recordStaffDelivery, reviewDelivery, savePhoto } from './delivery-proof.js'
 import { query, tx } from './db.js'
 import { orderableDates, slotsForDate, slotView } from './delivery.js'
 import { env } from './env.js'
@@ -36,7 +36,9 @@ import {
   takeBatchOutOfService,
 } from './orders.js'
 import { enqueue } from './notify.js'
-import { isMonday, preorderView, PREORDER_STATUSES, promoteWaitlist } from './preorders.js'
+import { isMonday, preorderView, PREORDER_STATUSES, promoteWaitlist, refundPreorder, staffCancelPreorder } from './preorders.js'
+import { refundOrder } from './payments.js'
+import { logger } from './logger.js'
 import { allProducts, findProduct, loadProducts, productName, sellable, shopProducts } from './products.js'
 import { STAGES } from './stage.js'
 import { router as unlockRouter } from './unlock-admin.js'
@@ -484,6 +486,7 @@ async function batchDetail(c, batchId) {
   return {
     id: b.id, variety: b.variety, pluckedOn: b.plucked_on, ageDays: diffDays(todayIST(), b.plucked_on), farm: b.farm,
     status: b.status, etaDate: b.eta_date, arrivedAt: b.arrived_at, createdAt: b.created_at,
+    // The QR printed on each box opens this page in the shop.
     lines: lines.rows.map((l) => ({
       id: l.id, sku: l.sku, productName: productName(l.sku), onHand: l.on_hand, held: l.held, committed: l.committed,
       reserveBuffer: l.reserve_buffer, available: available(l),
@@ -768,8 +771,14 @@ router.post(
 router.post(
   '/orders/:id/cancel',
   asyncHandler(async (req, res) => {
-    const { reason } = parse(z.object({ reason: z.string().trim().min(1, 'reason is required').max(500) }), req.body ?? {})
-    await tx((c) => cancelOrder(c, req.params.id, req.actor, reason))
+    const { reason, refund } = parse(
+      z.object({ reason: z.string().trim().min(1, 'reason is required').max(500), refund: z.boolean().default(false) }),
+      req.body ?? {},
+    )
+    const refundDue = await tx((c) => cancelOrder(c, req.params.id, req.actor, reason, { manager: req.admin.role === 'MANAGER', refund }))
+    if (refundDue) {
+      await refundOrder(req.params.id).catch((err) => logger.error({ err, orderId: req.params.id }, 'refund failed; maintenance will retry'))
+    }
     res.status(204).end()
   }),
 )
@@ -1077,6 +1086,18 @@ router.post(
   }),
 )
 
+/** Photo deliveries waiting for someone other than the rider to check them. */
+router.get('/delivery-reviews', asyncHandler(async (_req, res) => res.json(await photoReviews({ query }))))
+
+router.post(
+  '/delivery-reviews/:id',
+  asyncHandler(async (req, res) => {
+    const b = parse(z.object({ ok: z.boolean(), note: z.string().trim().max(300).optional() }), req.body)
+    await tx((c) => reviewDelivery(c, req.params.id, b, req.actor))
+    res.status(204).end()
+  }),
+)
+
 // ---------------------------------------------------------------- analytics
 
 /** Week-by-week season numbers. Defaults to the last 8 weeks up to the end of this week. */
@@ -1109,7 +1130,7 @@ router.get(
   asyncHandler(async (_req, res) => {
     const at = now()
     const week = new Date(at.getTime() - 7 * 86_400_000)
-    const [runs, failed, refunds, hooks, calls] = await Promise.all([
+    const [runs, failed, refunds, hooks, calls, photos] = await Promise.all([
       query('SELECT * FROM maintenance_runs ORDER BY step'),
       query(
         `SELECT n.id, n.kind, n.phone, n.last_error, n.created_at, n.attempts, o.id AS order_id, o.number AS order_number, p.number AS preorder_number
@@ -1135,6 +1156,7 @@ router.get(
           WHERE status = 'DELIVERY_FAILED' AND delivery_failures >= $1 ORDER BY placed_at LIMIT 50`,
         [MAX_DELIVERY_ATTEMPTS],
       ),
+      photoReviews({ query }),
     ])
     const tick = runs.rows.find((r) => r.step === 'tick')
     res.json({
@@ -1154,6 +1176,8 @@ router.get(
       failedDeliveries: calls.rows.map((o) => ({
         id: o.id, number: o.number, name: o.gift_recipient_name ?? o.customer_name, phone: o.gift_recipient_phone ?? o.phone, attempts: o.delivery_failures,
       })),
+      // Delivered with only a photo: someone other than the rider checks it.
+      photoDeliveries: photos,
       webhookFailures: hooks.rows.map((w) => ({ id: w.id, source: w.source, reason: w.reason, eventKey: w.event_key, createdAt: w.created_at })),
     })
   }),
@@ -1377,6 +1401,37 @@ router.get(
 
 // ---------------------------------------------------------------- claims
 
+/** Replacements in 90 days after which the next one needs a manager. */
+export const CLAIM_MANAGER_AFTER = 2
+
+/**
+ * What staff should know before approving a replacement: how many claims the
+ * customer made lately, and how the order was delivered. A frequent claimant,
+ * or "not delivered" on an order the customer's own code confirmed, needs a
+ * manager to approve.
+ */
+async function claimRisk(c, claim) {
+  const since = new Date(now().getTime() - 90 * 86_400_000)
+  const [hist, del] = await Promise.all([
+    c.query(
+      `SELECT COUNT(*)::int AS claims, COUNT(*) FILTER (WHERE resolution = 'REPLACEMENT_APPROVED')::int AS replacements
+         FROM claims WHERE customer_id = $1 AND created_at >= $2 AND id <> $3`,
+      [claim.customer_id, since, claim.id],
+    ),
+    c.query(`SELECT method, created_at FROM delivery_attempts WHERE order_id = $1 AND outcome = 'DELIVERED' ORDER BY created_at DESC LIMIT 1`, [claim.order_id]),
+  ])
+  const h = hist.rows[0]
+  const d = del.rows[0]
+  const reasons = []
+  if (h.replacements >= CLAIM_MANAGER_AFTER) reasons.push(`${h.replacements} replacements in the last 90 days`)
+  if (claim.issue_type === 'NOT_DELIVERED' && d?.method === 'code') reasons.push("the customer's own code confirmed the delivery")
+  return {
+    history: { claims90d: h.claims, replacements90d: h.replacements },
+    delivery: d ? { method: d.method, at: d.created_at } : null,
+    managerNeeded: reasons.length ? reasons : null,
+  }
+}
+
 router.get(
   '/claims',
   asyncHandler(async (req, res) => {
@@ -1389,8 +1444,11 @@ router.get(
       [status],
     )
     const pics = await query('SELECT id, claim_id FROM claim_photos WHERE claim_id = ANY($1) ORDER BY created_at', [rows.map((c) => c.id)])
+    const risks = new Map()
+    for (const c of rows) if (c.status !== 'RESOLVED') risks.set(c.id, await claimRisk({ query }, c))
     res.json(
       rows.map((c) => ({
+        ...(risks.has(c.id) ? risks.get(c.id) : {}),
         photos: pics.rows.filter((p) => p.claim_id === c.id).map((p) => ({ id: p.id })),
         id: c.id, orderId: c.order_id, orderNumber: c.order_number, orderTotal: c.order_total, customerPhone: c.phone,
         issueType: c.issue_type, description: c.description, affectedItems: c.affected_items, photoUrl: c.photo_url,
@@ -1431,6 +1489,10 @@ router.post(
       if (claim.status === 'RESOLVED') throw conflict('This claim is already resolved')
       let replacementId = null
       if (resolution === 'REPLACEMENT_APPROVED') {
+        const risk = await claimRisk(c, claim)
+        if (risk.managerNeeded && req.admin.role !== 'MANAGER') {
+          throw new HttpError(403, 'MANAGER_REQUIRED', `A manager has to approve this replacement: ${risk.managerNeeded.join(', and ')}.`)
+        }
         const { rows: o } = await c.query('SELECT * FROM orders WHERE id = $1', [claim.order_id])
         replacementId = (await createReplacement(c, claim, o[0], req.actor)).id
       }
@@ -1617,6 +1679,19 @@ router.get(
       ...preorderView(p),
       order: p.order_id ? { id: p.order_id, number: p.order_number, status: p.order_status, deliveryDate: p.order_date } : null,
     })))
+  }),
+)
+
+/** Manager cancel of a booking we can't fill: frees the capacity and refunds a paid booking in full. */
+router.post(
+  '/preorders/:id/cancel',
+  requireManager,
+  asyncHandler(async (req, res) => {
+    const { reason } = parse(z.object({ reason: z.string().trim().min(1, 'reason is required').max(500) }), req.body ?? {})
+    const r = await tx((c) => staffCancelPreorder(c, req.params.id, req.actor, reason))
+    const send = r.refund === 'order' ? refundOrder : r.refund === 'preorder' ? refundPreorder : null
+    if (send) await send(r.id).catch((err) => logger.error({ err, id: r.id }, 'refund failed; maintenance will retry'))
+    res.json({ refunded: Boolean(r.refund) })
   }),
 )
 

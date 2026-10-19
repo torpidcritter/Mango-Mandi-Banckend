@@ -221,9 +221,10 @@ describe('orders', () => {
     const cust = await customerToken(api)
     const first = await checkout(api, cust.accessToken, [{ sku: 'ALP-3', stage: 'RIPE', qty: 2 }], { key: 'k-1' })
     assert.equal(first.status, 201)
-    const again = await api.post('/v1/checkout/confirm', { quoteId: 'gone', address: 'anything at all here' }, { token: cust.accessToken, headers: { 'Idempotency-Key': 'k-1' } })
-    assert.equal(again.status, 200)
-    assert.equal(again.body.orderId, first.body.orderId)
+    // A different body with the same key is refused, not replayed as the first order.
+    const reused = await api.post('/v1/checkout/confirm', { quoteId: 'gone', address: 'anything at all here' }, { token: cust.accessToken, headers: { 'Idempotency-Key': 'k-1' } })
+    assert.equal(reused.status, 422)
+    assert.equal(reused.body.error.code, 'IDEMPOTENCY_KEY_REUSED')
 
     const other = await customerToken(api)
     const short = await checkout(api, other.accessToken, [{ sku: 'ALP-3', stage: 'RIPE', qty: 2 }])

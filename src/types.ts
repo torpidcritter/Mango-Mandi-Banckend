@@ -335,6 +335,11 @@ export interface Claim {
   resolution?: ClaimResolution | null
   createdAt?: string
   replacementOrder?: { id: string; number: string } | null
+  /** Open claims only: the customer's last 90 days, and how the order was delivered. */
+  history?: { claims90d: number; replacements90d: number }
+  delivery?: { method: 'code' | 'photo' | 'staff'; at: string } | null
+  /** Why a replacement needs a manager's approval, if it does. */
+  managerNeeded?: string[] | null
 }
 
 export interface Pincode {
@@ -522,6 +527,18 @@ export interface Attention {
   webhookFailures: { id: string; source: 'razorpay' | 'whatsapp'; reason: string; eventKey: string | null; createdAt: string }[]
   /** Orders missed too many times: call the customer before sending them out again. */
   failedDeliveries?: { id: string; number: string; name: string | null; phone: string | null; attempts: number }[]
+  /** Delivered with only a photo: someone other than the rider checks it. */
+  photoDeliveries?: PhotoDelivery[]
+}
+
+export interface PhotoDelivery {
+  id: string
+  receivedBy: string | null
+  photoId: string | null
+  actor: string
+  at: string
+  order: { id: string; number: string; name: string | null }
+  flags: string[]
 }
 
 export interface StaffMember {

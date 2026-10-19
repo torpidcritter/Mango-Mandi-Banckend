@@ -38,6 +38,15 @@ const schema = z.object({
   STAFF_TWO_STEP: z.enum(['managers', 'all', 'optional']).optional(),
   // Login codes sent per day across the shop before sending pauses (SMS pumping guard).
   OTP_DAILY_LIMIT: z.coerce.number().int().positive().default(3000),
+  // The part of that budget numbers with no account may use; the rest is kept for existing customers.
+  OTP_NEW_NUMBER_SHARE: z.coerce.number().min(0.05).max(1).default(0.6),
+  // Cloudflare Turnstile: the secret key. Set, the shop must pass a Turnstile check before a code is sent.
+  TURNSTILE_SECRET_KEY: z.string().default(''),
+  TURNSTILE_SITE_KEY: z.string().default(''),
+  // The production database's host (Neon main). Production must use it; previews and staging must not.
+  PRODUCTION_DB_HOST: z.string().default(''),
+  // Requests per address per 15 minutes before 429 (shared by everyone behind one carrier NAT).
+  API_RATE_LIMIT: z.coerce.number().int().positive().default(3000),
   REFRESH_REUSE_GRACE_MS: z.coerce.number().int().min(0).default(10_000),
   RAZORPAY_WEBHOOK_SECRET: z.string().default('whsec_dev'),
   RAZORPAY_KEY_ID: z.string().default(''),
@@ -45,6 +54,9 @@ const schema = z.object({
   METRICS_TOKEN: z.string().default(''),
   ADMIN_BOOTSTRAP_EMAIL: z.string().email().optional(),
   ADMIN_BOOTSTRAP_PASSWORD: z.string().min(12).optional(),
+  // Previews get their own first manager, so the production password is never in a preview.
+  PREVIEW_ADMIN_EMAIL: z.string().email().optional(),
+  PREVIEW_ADMIN_PASSWORD: z.string().min(12).optional(),
   SMS_PROVIDER: z.enum(['log', 'jio']).default('log'),
   JIO_SMS_URL: z.string().url().optional(),
   JIO_SMS_API_KEY: z.string().optional(),

@@ -14,6 +14,74 @@ declare global {
         }
       }
     }
+    turnstile?: {
+      render: (el: HTMLElement, o: Record<string, unknown>) => string
+      reset: (id: string) => void
+      remove: (id: string) => void
+    }
+  }
+}
+
+let cf: Promise<void> | null = null
+function loadTurnstile() {
+  cf ??= new Promise<void>((resolve, reject) => {
+    const s = document.createElement('script')
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+    s.async = true
+    s.onload = () => resolve()
+    s.onerror = () => {
+      cf = null
+      reject(new Error('Could not load the security check. Check your connection and try again.'))
+    }
+    document.head.appendChild(s)
+  })
+  return cf
+}
+
+/**
+ * Cloudflare's check that a person, not a script, is asking for a code. Off
+ * unless the API has a site key. Each token works once, so the widget is
+ * reset after every request and solves itself again (usually invisibly).
+ */
+function useTurnstile(onError: (message: string) => void) {
+  const config = useQuery({ queryKey: ['auth-config'], queryFn: api.authConfig, staleTime: Infinity, retry: false })
+  const siteKey = config.data?.turnstileSiteKey ?? null
+  const box = useRef<HTMLDivElement>(null)
+  const widget = useRef<string | null>(null)
+  const [token, setToken] = useState<string | null>(null)
+  const fail = useRef(onError)
+  fail.current = onError
+
+  useEffect(() => {
+    if (!siteKey || !box.current) return
+    let live = true
+    loadTurnstile()
+      .then(() => {
+        if (!live || !box.current || !window.turnstile) return
+        widget.current = window.turnstile.render(box.current, {
+          sitekey: siteKey,
+          size: 'flexible',
+          callback: (t: string) => setToken(t),
+          'expired-callback': () => setToken(null),
+          'error-callback': () => setToken(null),
+        })
+      })
+      .catch((err: Error) => live && fail.current(err.message))
+    return () => {
+      live = false
+      if (widget.current) window.turnstile?.remove(widget.current)
+      widget.current = null
+    }
+  }, [siteKey])
+
+  return {
+    needed: Boolean(siteKey),
+    token,
+    box,
+    used() {
+      setToken(null)
+      if (widget.current) window.turnstile?.reset(widget.current)
+    },
   }
 }
 
@@ -92,10 +160,14 @@ export function PhoneCodeForm({ mode, onDone, intro }: { mode: 'signin' | 'add';
   const [code, setCode] = useState('')
   const [sent, setSent] = useState<{ channel: 'sms' | 'whatsapp'; devCode?: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const human = useTurnstile(setError)
 
   const request = useMutation({
-    mutationFn: (channel?: 'sms' | 'whatsapp') =>
-      mode === 'signin' ? api.requestCode(tenDigits(phone), channel) : api.requestPhoneCode(tenDigits(phone), channel),
+    mutationFn: (channel?: 'sms' | 'whatsapp') => {
+      const t = human.token ?? undefined
+      human.used()
+      return mode === 'signin' ? api.requestCode(tenDigits(phone), channel, t) : api.requestPhoneCode(tenDigits(phone), channel, t)
+    },
     onSuccess: (r) => {
       setSent(r)
       setCode('')
@@ -113,8 +185,16 @@ export function PhoneCodeForm({ mode, onDone, intro }: { mode: 'signin' | 'add';
     e.preventDefault()
     setError(null)
     if (!/^[6-9]\d{9}$/.test(tenDigits(phone))) return setError('Enter your 10-digit mobile number.')
+    if (human.needed && !human.token) return setError('One moment: finishing a quick security check. Try again in a second.')
     request.mutate(undefined)
   }
+  const resend = (channel: 'sms' | 'whatsapp') => {
+    setError(null)
+    if (human.needed && !human.token) return setError('One moment: finishing a quick security check. Try again in a second.')
+    request.mutate(channel)
+  }
+  // Stays mounted across both steps, so the check can run again for a resend.
+  const check = human.needed ? <div ref={human.box} className="turnstile" /> : null
   function checkCode(e: FormEvent) {
     e.preventDefault()
     setError(null)
@@ -129,65 +209,71 @@ export function PhoneCodeForm({ mode, onDone, intro }: { mode: 'signin' | 'add';
 
   if (!sent) {
     return (
-      <form onSubmit={sendCode} noValidate>
-        <p className="muted">{intro ?? "We'll send a 6-digit code to your phone. No password needed."}</p>
-        <div className="field">
-          <label htmlFor="phone">Mobile number</label>
-          <div className="prefixed">
-            <span aria-hidden="true">+91</span>
-            <input
-              id="phone"
-              type="tel"
-              inputMode="numeric"
-              autoComplete="tel-national"
-              maxLength={14}
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              aria-describedby={error ? 'phone-error' : undefined}
-            />
+      <>
+        <form onSubmit={sendCode} noValidate>
+          <p className="muted">{intro ?? "We'll send a 6-digit code to your phone. No password needed."}</p>
+          <div className="field">
+            <label htmlFor="phone">Mobile number</label>
+            <div className="prefixed">
+              <span aria-hidden="true">+91</span>
+              <input
+                id="phone"
+                type="tel"
+                inputMode="numeric"
+                autoComplete="tel-national"
+                maxLength={14}
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                aria-describedby={error ? 'phone-error' : undefined}
+              />
+            </div>
           </div>
-        </div>
-        {errorNote}
-        <button type="submit" className="btn btn-primary btn-block" disabled={request.isPending}>
-          {request.isPending ? 'Sending…' : 'Send code'}
-        </button>
-      </form>
+          {errorNote}
+          <button type="submit" className="btn btn-primary btn-block" disabled={request.isPending}>
+            {request.isPending ? 'Sending…' : 'Send code'}
+          </button>
+        </form>
+        {check}
+      </>
     )
   }
   return (
-    <form onSubmit={checkCode} noValidate>
-      <p className="muted">
-        We sent a code by {sent.channel === 'whatsapp' ? 'WhatsApp' : 'SMS'} to +91 {tenDigits(phone)}.{' '}
-        <button type="button" className="link-btn" onClick={() => setSent(null)}>
-          Change number
+    <>
+      <form onSubmit={checkCode} noValidate>
+        <p className="muted">
+          We sent a code by {sent.channel === 'whatsapp' ? 'WhatsApp' : 'SMS'} to +91 {tenDigits(phone)}.{' '}
+          <button type="button" className="link-btn" onClick={() => setSent(null)}>
+            Change number
+          </button>
+        </p>
+        {sent.devCode && <p className="note">Test mode: your code is {sent.devCode}.</p>}
+        <div className="field">
+          <label htmlFor="code">6-digit code</label>
+          <input
+            id="code"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            maxLength={6}
+            value={code}
+            onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
+            aria-describedby={error ? 'phone-error' : undefined}
+          />
+        </div>
+        {errorNote}
+        <button type="submit" className="btn btn-primary btn-block" disabled={verify.isPending}>
+          {verify.isPending ? 'Checking…' : mode === 'signin' ? 'Sign in' : 'Add number'}
         </button>
-      </p>
-      {sent.devCode && <p className="note">Test mode: your code is {sent.devCode}.</p>}
-      <div className="field">
-        <label htmlFor="code">6-digit code</label>
-        <input
-          id="code"
-          inputMode="numeric"
-          autoComplete="one-time-code"
-          maxLength={6}
-          value={code}
-          onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
-          aria-describedby={error ? 'phone-error' : undefined}
-        />
-      </div>
-      {errorNote}
-      <button type="submit" className="btn btn-primary btn-block" disabled={verify.isPending}>
-        {verify.isPending ? 'Checking…' : mode === 'signin' ? 'Sign in' : 'Add number'}
-      </button>
-      <div className="resend">
-        <button type="button" className="link-btn" disabled={request.isPending} onClick={() => request.mutate('sms')}>
-          Send again by SMS
-        </button>
-        <button type="button" className="link-btn" disabled={request.isPending} onClick={() => request.mutate('whatsapp')}>
-          Send on WhatsApp instead
-        </button>
-      </div>
-    </form>
+        <div className="resend">
+          <button type="button" className="link-btn" disabled={request.isPending} onClick={() => resend('sms')}>
+            Send again by SMS
+          </button>
+          <button type="button" className="link-btn" disabled={request.isPending} onClick={() => resend('whatsapp')}>
+            Send on WhatsApp instead
+          </button>
+        </div>
+      </form>
+      {check}
+    </>
   )
 }
 

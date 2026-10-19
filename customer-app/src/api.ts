@@ -117,7 +117,7 @@ export interface Order {
   razorpayOrderId: string | null
   holdExpiresAt: string | null
   slot: Slot | null
-  items: { sku: string; name: string; stage: Stage | null; quantity: number; unitPrice: number; linePrice: number; eatBy: string | null }[]
+  items: { sku: string; name: string; stage: Stage | null; quantity: number; unitPrice: number; linePrice: number; eatBy: string | null; readyOn?: string | null }[]
   timeline: { status: OrderStatus; at: string }[]
   /** Give this to the rider; set while the order is out for delivery. */
   deliveryCode?: string | null
@@ -132,6 +132,22 @@ export interface SavedAddress {
   address: string
   pincode: string
   lastUsedAt: string
+}
+export interface StockAlert {
+  id: string
+  sku: string
+  name: string
+  stage: Stage
+  pincode: string
+  createdAt: string
+  expiresAt: string
+  /** Set once we have sent the WhatsApp message. */
+  notifiedAt: string | null
+  /** The first delivery day with stock, as told in the message. */
+  availableOn: string | null
+}
+export interface Settings {
+  remindersOptIn: boolean
 }
 export type IssueType = 'DAMAGED' | 'WRONG_ITEM' | 'NOT_DELIVERED'
 export interface Claim {
@@ -343,18 +359,18 @@ const qs = (params: Record<string, string | null | undefined>) => {
 const id = encodeURIComponent
 
 export const api = {
-  requestCode: (phone: string, channel?: 'sms' | 'whatsapp') =>
-    raw<{ sent: boolean; channel: 'sms' | 'whatsapp'; devCode?: string }>('POST', '/auth/otp/request', channel ? { phone, channel } : { phone }),
+  requestCode: (phone: string, channel?: 'sms' | 'whatsapp', captchaToken?: string) =>
+    raw<{ sent: boolean; channel: 'sms' | 'whatsapp'; devCode?: string }>('POST', '/auth/otp/request', { phone, ...(channel ? { channel } : {}), ...(captchaToken ? { captchaToken } : {}) }),
   async verifyCode(phone: string, code: string) {
     signedIn(await raw<TokenResponse>('POST', '/auth/otp/verify', { phone, code }))
   },
-  authConfig: () => raw<{ googleClientId: string | null }>('GET', '/auth/config'),
+  authConfig: () => raw<{ googleClientId: string | null; turnstileSiteKey?: string | null }>('GET', '/auth/config'),
   async signInWithGoogle(credential: string) {
     signedIn(await raw<TokenResponse>('POST', '/auth/google', { credential }))
   },
   /** Adds a mobile number to an account made with Google. */
-  requestPhoneCode: (phone: string, channel?: 'sms' | 'whatsapp') =>
-    request<{ sent: boolean; channel: 'sms' | 'whatsapp'; devCode?: string }>('POST', '/me/phone/request', channel ? { phone, channel } : { phone }),
+  requestPhoneCode: (phone: string, channel?: 'sms' | 'whatsapp', captchaToken?: string) =>
+    request<{ sent: boolean; channel: 'sms' | 'whatsapp'; devCode?: string }>('POST', '/me/phone/request', { phone, ...(channel ? { channel } : {}), ...(captchaToken ? { captchaToken } : {}) }),
   async verifyPhoneCode(phone: string, code: string) {
     signedIn(await request<TokenResponse>('POST', '/me/phone/verify', { phone, code }))
   },
@@ -386,6 +402,11 @@ export const api = {
   reschedule: (orderId: string, deliveryDate: string, slotId: string | null) =>
     request<void>('POST', `/orders/${id(orderId)}/reschedule`, { deliveryDate, slotId }),
   rate: (orderId: string, stars: number, comment: string | null) => request<void>('PUT', `/orders/${id(orderId)}/rating`, { stars, comment }),
+  settings: () => request<Settings>('GET', '/me'),
+  saveSettings: (settings: Settings) => request<Settings>('PATCH', '/me', settings),
+  stockAlerts: () => request<StockAlert[]>('GET', '/stock-alerts'),
+  addStockAlert: (input: { sku: string; stage: Stage; pincode: string }) => request<StockAlert>('POST', '/stock-alerts', input),
+  removeStockAlert: (alertId: string) => request<void>('DELETE', `/stock-alerts/${id(alertId)}`),
   addresses: () => request<SavedAddress[]>('GET', '/me/addresses'),
   forgetAddress: (addressId: string) => request<void>('DELETE', `/me/addresses/${id(addressId)}`),
   claims: () => request<Claim[]>('GET', '/claims'),

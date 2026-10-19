@@ -9,7 +9,7 @@ import { timingSafeEqual } from 'node:crypto'
 import { now } from './clock.js'
 import { badRequest, conflict, HttpError, notFound } from './errors.js'
 import { newId } from './ids.js'
-import { setOrderStatus } from './orders.js'
+import { addEvent, setOrderStatus } from './orders.js'
 import { checkPhoto, MAX_PHOTO_BYTES, storePhoto } from './photos.js'
 
 export const FAIL_REASONS = ['NOT_HOME', 'WRONG_ADDRESS', 'REFUSED', 'UNREACHABLE', 'OTHER']
@@ -158,4 +158,46 @@ export async function customerPhoto(c, o) {
   )
   if (!rows.length || o.status !== 'DELIVERED') throw notFound('No delivery photo for this order')
   return rows[0]
+}
+
+/**
+ * Deliveries proven only by a photo, not yet checked by someone other than the
+ * rider. A photo after wrong codes, or with no location, is flagged: those are
+ * how a delivery would be faked.
+ */
+export async function photoReviews(c, limit = 50) {
+  const { rows } = await c.query(
+    `SELECT a.*, o.number, o.delivery_code_tries, o.customer_name, o.gift_recipient_name
+       FROM delivery_attempts a JOIN orders o ON o.id = a.order_id
+      WHERE a.outcome = 'DELIVERED' AND a.method = 'photo' AND a.reviewed_at IS NULL
+      ORDER BY a.created_at LIMIT $1`,
+    [limit],
+  )
+  return rows.map((a) => ({
+    ...attemptView(a),
+    order: { id: a.order_id, number: a.number, name: a.gift_recipient_name ?? a.customer_name },
+    flags: [
+      ...(a.delivery_code_tries > 0 ? [`${a.delivery_code_tries} wrong code${a.delivery_code_tries === 1 ? '' : 's'} first`] : []),
+      ...(a.lat === null ? ['no location'] : []),
+    ],
+  }))
+}
+
+/** Marks a photo delivery checked. A doubtful one goes on the order's history for follow-up. */
+export async function reviewDelivery(c, attemptId, { ok, note }, actor) {
+  const { rows } = await c.query(
+    `SELECT a.*, o.status FROM delivery_attempts a JOIN orders o ON o.id = a.order_id WHERE a.id = $1 FOR UPDATE OF a`,
+    [attemptId],
+  )
+  const a = rows[0]
+  if (!a || a.method !== 'photo' || a.outcome !== 'DELIVERED') throw notFound('Photo delivery not found')
+  if (a.reviewed_at) throw conflict('This delivery was already checked.')
+  if (a.actor === (actor.label ?? actor.id)) throw new HttpError(403, 'FORBIDDEN', 'Someone other than the rider has to check this delivery.')
+  if (!ok && !note?.trim()) throw badRequest('Say what looks wrong', 'NOTE_REQUIRED')
+  await c.query('UPDATE delivery_attempts SET reviewed_at = $2, reviewed_by = $3, review_note = $4 WHERE id = $1', [
+    a.id, now(), actor.label ?? actor.id, ok ? note?.trim() || null : `Doubtful: ${note.trim()}`,
+  ])
+  if (!ok) {
+    await addEvent(c, a.order_id, a.status, a.status, actor, `Delivery photo doubted: ${note.trim()}. Call the customer.`)
+  }
 }

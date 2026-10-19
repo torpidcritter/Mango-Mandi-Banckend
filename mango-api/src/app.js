@@ -178,9 +178,12 @@ export function createApp() {
   app.use(express.json({ limit: '100kb' }))
   app.use((_req, _res, next) => ensureLoaded().then(() => next(), next))
 
+  // Per address. Indian mobile networks put many customers behind one address
+  // (carrier NAT), so this is a flood guard, not a per-person limit: floods
+  // are stopped earlier by the Vercel firewall rule (deploy/VERCEL.md).
   const apiLimiter = rateLimit({
     windowMs: 15 * 60_000,
-    limit: 600,
+    limit: env.API_RATE_LIMIT,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     skip: () => env.NODE_ENV === 'test',

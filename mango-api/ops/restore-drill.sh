@@ -12,7 +12,7 @@
 # 2. DRILL_URL=<that connection string> ./ops/restore-drill.sh
 # 3. Delete the branch afterwards (it is a full copy of customer data).
 set -euo pipefail
-: "${DRILL_URL:?set DRILL_URL to the restored branch's connection string}"
+: "${DRILL_URL:?set DRILL_URL to the connection string of the restored branch}"
 start=$(date +%s)
 q() { psql "$DRILL_URL" -Atqc "$1"; }
 echo "belongs to: $(q "SELECT value FROM app_meta WHERE key = 'environment'")"

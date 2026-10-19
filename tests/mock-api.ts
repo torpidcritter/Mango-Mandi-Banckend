@@ -505,6 +505,16 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
       const status = url.searchParams.get('status')
       return json(route, 200, status ? state.preorders.filter((p) => p.status === status) : state.preorders)
     }
+    if (/^\/preorders\/[^/]+\/cancel$/.test(path)) {
+      if (state.role !== 'MANAGER') return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Requires manager role', requestId: 'req_f' } })
+      const p = state.preorders.find((x) => x.id === path.split('/')[2])
+      if (p) p.status = 'CANCELLED'
+      return json(route, 200, { refunded: p?.paymentStatus === 'SUCCEEDED' })
+    }
+    if (/^\/delivery-reviews\/[^/]+$/.test(path)) {
+      state.attention = { ...state.attention, photoDeliveries: (state.attention.photoDeliveries ?? []).filter((d) => d.id !== path.split('/')[2]) }
+      return route.fulfill({ status: 204 })
+    }
     if (path === '/preorder-capacity') return json(route, 200, state.preorderCapacity)
     if (path.startsWith('/preorder-capacity/')) {
       if (state.role !== 'MANAGER') return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Requires manager role', requestId: 'req_f' } })

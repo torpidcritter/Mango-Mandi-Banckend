@@ -6,7 +6,7 @@ import { ORDER_STATUS_LABEL, PAYMENT_LABEL, date, dateTime, istDate, rupees } fr
 import type { DeliveryAttempt, NotificationKind, OrderDetail as Order, OrderNotification, OrderStatus } from '../types'
 import { PACKER_STATUSES, can, canSee } from '../permissions'
 import { useSession } from '../session'
-import { Badge, Dialog, FormError, OrderBadge, QueryError, Spinner, useToast, scrollRegion } from '../ui'
+import { Badge, Dialog, FormError, GatedButton, OrderBadge, QueryError, Spinner, useToast, scrollRegion } from '../ui'
 
 const CONFLICT_MESSAGE = 'This order was just updated by someone else.'
 
@@ -63,6 +63,8 @@ function movesFor(status: OrderStatus): Move[] {
 }
 
 const CANCELLABLE: OrderStatus[] = ['PAYMENT_PENDING', 'CONFIRMED', 'PROCESSING', 'PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY']
+/** A paid order a manager can cancel with a full refund: anything not yet delivered (mirrors MANAGER_REFUNDABLE in the API). */
+const REFUNDABLE: OrderStatus[] = [...CANCELLABLE, 'DELIVERY_FAILED', 'RTO']
 const ALLOCATABLE: OrderStatus[] = ['CONFIRMED', 'PROCESSING']
 
 export default function OrderDetail() {
@@ -104,6 +106,10 @@ function OrderView({ order }: { order: Order }) {
   const [dialog, setDialog] = useState<'cancel' | 'reschedule' | null>(null)
 
   const awaitingPack = order.stock.some((s) => s.state === 'committed')
+  const paid = order.payment?.status === 'SUCCEEDED'
+  const manager = me?.role === 'MANAGER'
+  // Unpaid: any staff who can change orders cancels it. Paid: only a manager, with a full refund.
+  const canCancel = changeOrder && (paid ? REFUNDABLE : CANCELLABLE).includes(order.status)
 
   function onActionError(err: unknown) {
     if (isConflict(err)) toast.error(CONFLICT_MESSAGE)
@@ -188,12 +194,17 @@ function OrderView({ order }: { order: Order }) {
             Move delivery date
           </button>
         )}
-        {changeOrder && CANCELLABLE.includes(order.status) && (
-          <button type="button" className="btn btn-danger" disabled={busy} onClick={() => setDialog('cancel')}>
-            Cancel order
-          </button>
-        )}
-        {moves.length === 0 && !(changeOrder && CANCELLABLE.includes(order.status)) && (
+        {canCancel &&
+          (paid ? (
+            <GatedButton allowed={manager} className="btn btn-danger" disabled={busy} onClick={() => setDialog('cancel')}>
+              Cancel and refund
+            </GatedButton>
+          ) : (
+            <button type="button" className="btn btn-danger" disabled={busy} onClick={() => setDialog('cancel')}>
+              Cancel order
+            </button>
+          ))}
+        {moves.length === 0 && !canCancel && (
           <span className="muted">No actions available.</span>
         )}
       </div>
@@ -343,7 +354,7 @@ function OrderView({ order }: { order: Order }) {
                     <dd>
                       {order.payment.refund.refundedAt
                         ? `Refunded ${dateTime(order.payment.refund.refundedAt)}`
-                        : 'Pending: the customer cancelled after paying'}
+                        : 'Pending: being sent back to the customer'}
                     </dd>
                   </>
                 )}
@@ -435,10 +446,11 @@ function OrderView({ order }: { order: Order }) {
 function CancelDialog({ order, onClose, onDone }: { order: Order; onClose: () => void; onDone: () => void }) {
   const toast = useToast()
   const [reason, setReason] = useState('')
+  const paid = order.payment?.status === 'SUCCEEDED'
   const cancel = useMutation({
-    mutationFn: () => api.cancelOrder(order.id, reason.trim()),
+    mutationFn: () => api.cancelOrder(order.id, reason.trim(), paid),
     onSuccess: () => {
-      toast.success(`Order ${order.number} cancelled`)
+      toast.success(paid ? `Order ${order.number} cancelled; ${rupees(order.payment?.amount ?? order.total)} is being refunded` : `Order ${order.number} cancelled`)
       onDone()
       onClose()
     },
@@ -460,7 +472,7 @@ function CancelDialog({ order, onClose, onDone }: { order: Order; onClose: () =>
 
   return (
     <Dialog
-      title={`Cancel order ${order.number}?`}
+      title={paid ? `Cancel and refund order ${order.number}?` : `Cancel order ${order.number}?`}
       tone="danger"
       onClose={onClose}
       footer={
@@ -469,12 +481,18 @@ function CancelDialog({ order, onClose, onDone }: { order: Order; onClose: () =>
             Keep order
           </button>
           <button type="submit" form="cancel-form" className="btn btn-danger" disabled={!valid || cancel.isPending}>
-            {cancel.isPending ? 'Cancelling…' : 'Cancel order'}
+            {cancel.isPending ? 'Cancelling…' : paid ? 'Cancel and refund' : 'Cancel order'}
           </button>
         </>
       }
     >
       <form id="cancel-form" onSubmit={onSubmit}>
+        {paid && (
+          <p>
+            The customer paid <strong>{rupees(order.payment?.amount ?? order.total)}</strong>. It goes back to them in full, and they get a WhatsApp
+            message when it is sent. Use this only when we can't deliver the order; problems with delivered fruit get a replacement instead.
+          </p>
+        )}
         <p>{holdsStock ? 'Stock held for this order will be released.' : 'No stock is held for this order.'}</p>
         <div className="field">
           <label htmlFor="cancel-reason">Reason</label>

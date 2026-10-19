@@ -9,6 +9,12 @@ const store = new AsyncLocalStorage()
 /** Runs fn with a deadline `ms` from now. */
 export const withBudget = (ms, fn) => store.run({ deadline: Date.now() + ms }, fn)
 
+/**
+ * Runs fn with at most `ms` of what is left, so one slow step (a Razorpay
+ * outage, a WhatsApp backlog) can't use up the run and starve the steps after it.
+ */
+export const withSlice = (ms, fn) => store.run({ deadline: Math.min(Date.now() + timeLeft(), Date.now() + ms) }, fn)
+
 /** Milliseconds left in the current budget (Infinity outside one). */
 export function timeLeft() {
   const s = store.getStore()

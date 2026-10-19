@@ -5,6 +5,16 @@
 
 export const DEV_JWT = 'dev-only-change-me-0123456789abcdef0123456789'
 
+/** A Neon endpoint without its -pooler suffix, so the pooled and direct URLs compare equal. */
+export function dbHost(url) {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^([^.]+)-pooler\./, '$1.')
+  } catch {
+    return ''
+  }
+}
+const sameHost = (a, b) => Boolean(a && b) && dbHost(`postgres://${a.replace(/^[a-z]+:\/\//, '')}`) === dbHost(`postgres://${b.replace(/^[a-z]+:\/\//, '')}`)
+
 const origins = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean)
 
 export function checkProduction(env, { vercel = Boolean(process.env.VERCEL), target = process.env.VERCEL_ENV || 'production' } = {}) {
@@ -44,6 +54,16 @@ export function checkProduction(env, { vercel = Boolean(process.env.VERCEL), tar
     warnings.push('WHATSAPP_VERIFY_TOKEN or WHATSAPP_APP_SECRET is unset: ordering in the WhatsApp chat is off')
   }
   if (vercel) {
+    // Production and previews must each know which database is production, so a
+    // preview never touches it, even before the database is stamped.
+    const prodHost = env.PRODUCTION_DB_HOST
+    const urls = [env.DATABASE_URL, env.DATABASE_URL_UNPOOLED].filter(Boolean)
+    if (!prodHost) errors.push('PRODUCTION_DB_HOST is unset: set it to the Neon main host, for Production and Preview, so a preview can never use the production database')
+    else if (preview && urls.some((u) => sameHost(u, prodHost))) errors.push('DATABASE_URL points at the production database on a preview: use the Neon staging branch')
+    else if (!preview && !urls.every((u) => sameHost(u, prodHost))) errors.push(`DATABASE_URL is not the production database (${prodHost}): production must use Neon main`)
+    if (preview && (env.ADMIN_BOOTSTRAP_EMAIL || env.ADMIN_BOOTSTRAP_PASSWORD)) {
+      errors.push('ADMIN_BOOTSTRAP_* is set on previews: tick only Production for it, and give previews PREVIEW_ADMIN_EMAIL and PREVIEW_ADMIN_PASSWORD')
+    }
     if (env.CRON_SECRET.length < 16) errors.push('CRON_SECRET is unset or short: Vercel Cron could not run the maintenance job (holds, payments, messages)')
     if (/-pooler\./.test(env.DATABASE_URL) && !env.DATABASE_URL_UNPOOLED) {
       errors.push('DATABASE_URL_UNPOOLED is unset: migrations need Neon\'s direct connection')
@@ -54,6 +74,8 @@ export function checkProduction(env, { vercel = Boolean(process.env.VERCEL), tar
       else errors.push('BLOB_READ_WRITE_TOKEN is unset: delivery and claim photos would fill the database (connect Vercel Blob)')
     }
   }
+  if (Boolean(env.TURNSTILE_SECRET_KEY) !== Boolean(env.TURNSTILE_SITE_KEY)) errors.push('Set both TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY, or neither: with one alone nobody could get a login code')
+  if (!env.TURNSTILE_SECRET_KEY) warnings.push('TURNSTILE_SECRET_KEY is unset: bots can request login codes for any number (the daily budget still caps the cost)')
   if (!env.GOOGLE_CLIENT_ID) warnings.push('GOOGLE_CLIENT_ID is unset: "Sign in with Google" is off')
   if (!env.SENTRY_DSN) warnings.push('SENTRY_DSN is unset: errors are only in the logs')
   if (env.STAFF_TWO_STEP === 'optional') warnings.push('STAFF_TWO_STEP is optional: managers and operators can sign in with only a password')

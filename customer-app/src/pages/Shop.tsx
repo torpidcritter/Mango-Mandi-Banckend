@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
-import { useMutation, useQuery } from '@tanstack/react-query'
-import { ApiError, api, type CatalogueItem } from '../api'
+import { Link, useLocation, useSearchParams } from 'react-router-dom'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ApiError, api, errorMessage, type CatalogueItem } from '../api'
 import { STAGE_HINT, STAGE_LABEL, day, rupees } from '../format'
 import { useStore } from '../store'
 import { ErrorNote, Spinner } from '../ui'
@@ -259,12 +259,17 @@ function StageRow({ item, onDate }: { item: CatalogueItem; onDate: (d: string | 
           {item.qty === 0 ? (
             <span className="sold-out">
               Sold out for this day
-              {item.nextAvailableDate && (
+              {item.nextAvailableDate ? (
                 <>
                   {' · '}
                   <button type="button" className="link-btn" onClick={() => onDate(item.nextAvailableDate!)}>
                     Available {day(item.nextAvailableDate)}
                   </button>
+                </>
+              ) : (
+                <>
+                  {' · '}
+                  <NotifyMe item={item} label={label} />
                 </>
               )}
             </span>
@@ -293,6 +298,40 @@ function StageRow({ item, onDate }: { item: CatalogueItem; onDate: (d: string | 
           </div>
         ))}
     </li>
+  )
+}
+
+/** Sold out on every open day: a WhatsApp message when it is back. */
+function NotifyMe({ item, label }: { item: CatalogueItem; label: string }) {
+  const { profile, pincode } = useStore()
+  const location = useLocation()
+  const queryClient = useQueryClient()
+  const alerts = useQuery({ queryKey: ['stock-alerts'], queryFn: api.stockAlerts, enabled: !!profile })
+  const add = useMutation({
+    mutationFn: () => api.addStockAlert({ sku: item.sku, stage: item.stage, pincode: pincode! }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['stock-alerts'] }),
+  })
+  if (!profile) {
+    return (
+      <Link to={`/sign-in?next=${encodeURIComponent(location.pathname)}`} className="link-btn">
+        Sign in to hear when it's back
+      </Link>
+    )
+  }
+  const waiting = alerts.data?.some((a) => a.sku === item.sku && a.stage === item.stage && !a.notifiedAt)
+  if (waiting) return <span className="ok-text">We'll message you on WhatsApp when it's back</span>
+  return (
+    <>
+      <button type="button" className="link-btn" disabled={add.isPending || alerts.isPending} onClick={() => add.mutate()} aria-label={`Tell me when ${label} is back`}>
+        Tell me when it's back
+      </button>
+      {add.isError && (
+        <span className="field-error" role="alert">
+          {' '}
+          {errorMessage(add.error)}
+        </span>
+      )}
+    </>
   )
 }
 

@@ -321,3 +321,90 @@ export async function refundDuplicatePayments(at = now()) {
   }
   return n
 }
+
+async function listGatewayPayments(from, to) {
+  if (hasKeys()) {
+    const out = []
+    for (let skip = 0; ; skip += 100) {
+      const page = await razorpay('GET', `/payments?from=${Math.floor(from / 1000)}&to=${Math.floor(to / 1000)}&count=100&skip=${skip}`)
+      out.push(...(page.items ?? []))
+      if ((page.items ?? []).length < 100) return out
+    }
+  }
+  if (isProd) return []
+  return [...devGateway.entries()].map(([ref, p]) => ({ ...p, order_id: ref.startsWith('order_') ? ref : undefined }))
+}
+
+async function knownPayment(id) {
+  const { rows } = await query(
+    `SELECT 1 FROM orders WHERE payment_id = $1
+      UNION ALL SELECT 1 FROM preorders WHERE payment_id = $1
+      UNION ALL SELECT 1 FROM duplicate_payments WHERE payment_id = $1 LIMIT 1`,
+    [id],
+  )
+  return rows.length > 0
+}
+
+/**
+ * After the database is restored to an earlier point, Razorpay still holds the
+ * payments taken since then. This brings them back:
+ * 1. every order and preorder placed in the window that has a Razorpay order or
+ *    link is checked at Razorpay, and captured payments are applied as the
+ *    webhook would (paid, late payment, duplicate, or refund after a cancel);
+ * 2. any captured payment in the window that still matches nothing belongs to
+ *    an order the restore lost. It is listed in Needs attention, and with
+ *    refundMissing it is refunded in full (the customer is told by staff).
+ * Safe to run more than once: applying a payment twice is a no-op.
+ */
+export async function replayCapturedPayments({ from, to = now(), refundMissing = false }) {
+  const out = { checked: 0, applied: 0, lost: [], refunded: 0 }
+  const since = new Date(from.getTime() - 86_400_000) // late payments land up to a day after the order
+  const orders = await query(
+    `SELECT id, razorpay_order_id, payment_link_id, payment_id FROM orders
+      WHERE (razorpay_order_id IS NOT NULL OR payment_link_id IS NOT NULL) AND placed_at BETWEEN $1 AND $2`,
+    [since, to],
+  )
+  for (const o of orders.rows) {
+    out.checked++
+    const payments = o.razorpay_order_id ? await fetchPayments(o.razorpay_order_id) : await fetchLinkPayments(o.payment_link_id)
+    for (const p of payments.filter((x) => x.status === 'captured' && x.id !== o.payment_id)) {
+      if (await knownPayment(p.id)) continue
+      await tx((c) => processPayment(c, { orderId: o.id, outcome: 'captured', paymentId: p.id, amount: p.amount, method: p.method }))
+      out.applied++
+    }
+  }
+  const pre = await query(
+    `SELECT id, payment_link_id, payment_id FROM preorders WHERE payment_link_id IS NOT NULL AND created_at BETWEEN $1 AND $2`,
+    [since, to],
+  )
+  for (const p of pre.rows) {
+    out.checked++
+    for (const pay of (await fetchLinkPayments(p.payment_link_id)).filter((x) => x.status === 'captured' && x.id !== p.payment_id)) {
+      if (await knownPayment(pay.id)) continue
+      await tx((c) => processPreorderPayment(c, { preorderId: p.id, outcome: 'captured', paymentId: pay.id, amount: pay.amount, method: pay.method }))
+      out.applied++
+    }
+  }
+
+  for (const p of await listGatewayPayments(from, to)) {
+    if (p.status !== 'captured' || (await knownPayment(p.id))) continue
+    const orderId = await findOrderId({ query }, p)
+    const preorderId = orderId ? null : await findPreorderId({ query }, p, null)
+    if (orderId || preorderId) {
+      await tx((c) => orderId
+        ? processPayment(c, { orderId, outcome: 'captured', paymentId: p.id, amount: p.amount, method: p.method })
+        : processPreorderPayment(c, { preorderId, outcome: 'captured', paymentId: p.id, amount: p.amount, method: p.method }))
+      out.applied++
+      continue
+    }
+    out.lost.push({ paymentId: p.id, amount: p.amount, contact: p.contact ?? null })
+    await recordWebhookFailure('razorpay', `After a restore: captured payment ${p.id} (${p.amount} paise) matches no order`, `replay:${p.id}`)
+    if (refundMissing) {
+      await query('INSERT INTO duplicate_payments (payment_id, amount, found_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [p.id, p.amount ?? null, now()])
+    }
+  }
+  if (refundMissing && out.lost.length) out.refunded = await refundDuplicatePayments()
+  // Refunds owed by what was just applied (a payment after a cancel).
+  await processDueRefunds().catch((err) => logger.error({ err }, 'refunds after replay will be retried by maintenance'))
+  return out
+}
