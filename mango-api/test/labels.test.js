@@ -307,7 +307,9 @@ describe('box labels', () => {
     assert.equal(r.body.eatBy, addDays(a.date, 3))
     // Typed codes are guessable, so the public page never accepts them.
     assert.deepEqual((await api.get(`/v1/box/${label.code}`)).body, { found: false })
-    assert.deepEqual((await api.get(`/v1/box/${label.token.slice(0, -1)}A`)).body, { found: false })
+    // The tag's last character only carries 2 bits (A, Q, g or w), so swap it for another valid one.
+    const tampered = label.token.slice(0, -1) + (label.token.endsWith('A') ? 'Q' : 'A')
+    assert.deepEqual((await api.get(`/v1/box/${tampered}`)).body, { found: false })
     await setLabels({ enabled: false })
     assert.deepEqual((await api.get(`/v1/box/${label.token}`)).body, { found: false })
   })
