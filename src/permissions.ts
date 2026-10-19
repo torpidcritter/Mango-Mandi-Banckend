@@ -54,13 +54,14 @@ export type Screen =
   | 'staff'
   | 'promos'
   | 'products'
+  | 'scan'
 
 const SCREENS: Record<Role, ReadonlySet<Screen> | 'all'> = {
   MANAGER: 'all',
-  OPERATOR: new Set<Screen>(['today', 'batches', 'orders', 'orderDetail', 'packList', 'deliveries', 'claims', 'pincodes', 'planning', 'preorders', 'analytics']),
-  PACKER: new Set<Screen>(['packList', 'deliveries', 'orderDetail']),
+  OPERATOR: new Set<Screen>(['today', 'batches', 'orders', 'orderDetail', 'packList', 'deliveries', 'claims', 'pincodes', 'planning', 'preorders', 'analytics', 'scan']),
+  PACKER: new Set<Screen>(['packList', 'deliveries', 'orderDetail', 'scan']),
   QC: new Set<Screen>(['batches']),
-  RIDER: new Set<Screen>(['deliveries']),
+  RIDER: new Set<Screen>(['deliveries', 'scan']),
 }
 
 export function canSee(role: Role | null | undefined, screen: Screen): boolean {

@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
@@ -7,6 +7,7 @@ import type { PackListOrder } from '../types'
 import { canSee } from '../permissions'
 import { useSession } from '../session'
 import { Badge, EmptyState, OrderBadge, QueryError, Spinner, useToast, scrollRegion } from '../ui'
+import { printWindow } from '../labels/print'
 
 interface BatchGroup {
   batchId: string
@@ -67,6 +68,8 @@ export default function PackList() {
   const view = params.get('view') === 'batch' ? 'batch' : 'order'
 
   const q = useQuery({ queryKey: ['pack-list', day], queryFn: () => api.packList(day) })
+  const { me } = useSession()
+  const labelsOn = !!me?.features?.labels
 
   function set(key: string, value: string | null) {
     const p = new URLSearchParams(params)
@@ -99,6 +102,7 @@ export default function PackList() {
           </button>
         </div>
         <span className="spacer" />
+        {labelsOn && <PrintLabelsButton day={day} />}
         <button type="button" className="btn" onClick={() => window.print()}>
           Print
         </button>
@@ -111,7 +115,7 @@ export default function PackList() {
       ) : q.data.length === 0 ? (
         <EmptyState>No orders to pack for {date(day)}.</EmptyState>
       ) : view === 'order' ? (
-        <ByOrder orders={q.data} day={day} />
+        <ByOrder orders={q.data} day={day} labelsOn={labelsOn} />
       ) : (
         <ByBatch orders={q.data} />
       )}
@@ -119,7 +123,37 @@ export default function PackList() {
   )
 }
 
-function ByOrder({ orders, day }: { orders: PackListOrder[]; day: string }) {
+/** Box labels for every order on the day that still needs packing or is packed. */
+function PrintLabelsButton({ day }: { day: string }) {
+  const toast = useToast()
+  const [busy, setBusy] = useState(false)
+  async function run() {
+    const win = printWindow()
+    setBusy(true)
+    try {
+      const r = await api.printLabels({ date: day })
+      if (!r.labels.length) {
+        win.close()
+        toast.info(r.skipped.length ? `No labels: ${r.skipped.map((s) => `${s.number} (${s.reason.toLowerCase()})`).join(', ')}` : 'No orders to label')
+        return
+      }
+      win.fill(r.html)
+      if (r.skipped.length) toast.info(`Not printed: ${r.skipped.map((s) => `${s.number} (${s.reason.toLowerCase()})`).join(', ')}`)
+    } catch (err) {
+      win.close()
+      toast.error(err)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <button type="button" className="btn" disabled={busy} onClick={run}>
+      {busy ? 'Preparing labels…' : 'Print box labels'}
+    </button>
+  )
+}
+
+function ByOrder({ orders, day, labelsOn }: { orders: PackListOrder[]; day: string; labelsOn: boolean }) {
   const toast = useToast()
   const queryClient = useQueryClient()
   const allocate = useMutation({
@@ -148,6 +182,11 @@ function ByOrder({ orders, day }: { orders: PackListOrder[]; day: string }) {
               {o.gift && <Badge tone="info">Gift</Badge>}
               <OrderBadge status={o.status} />
               <span className="spacer" />
+              {labelsOn && needsPacking && (o.status === 'CONFIRMED' || o.status === 'PROCESSING') && (
+                <Link className="btn btn-small no-print" to={`/scan?order=${o.id}&date=${day}`}>
+                  Scan to pack<span className="sr-only"> {o.number}</span>
+                </Link>
+              )}
               {needsPacking && (o.status === 'CONFIRMED' || o.status === 'PROCESSING') && (
                 <button
                   type="button"

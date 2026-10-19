@@ -325,7 +325,13 @@ const qs = (params: Record<string, string | null | undefined>) => {
 }
 const id = encodeURIComponent
 
+/** The public page behind a box label's QR. */
+export type BoxInfo =
+  | { found: false }
+  | { found: true; productName: string; variety: string; description: string; pluckedOn: string; stage: Stage; readyFrom: string; eatBy: string }
+
 export const api = {
+  box: (token: string) => raw<BoxInfo>('GET', `/box/${id(token)}`),
   requestCode: (phone: string, channel?: 'sms' | 'whatsapp') =>
     raw<{ sent: boolean; channel: 'sms' | 'whatsapp'; devCode?: string }>('POST', '/auth/otp/request', channel ? { phone, channel } : { phone }),
   async verifyCode(phone: string, code: string) {

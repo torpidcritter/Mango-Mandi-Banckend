@@ -44,6 +44,12 @@ import type {
   Role,
   StaffMember,
   Summary,
+  DoorScanResult,
+  OrderLabels,
+  PackScanResult,
+  PrintedLabels,
+  RunCheck,
+  VanScanResult,
 } from './types'
 
 export const API_URL: string = (import.meta.env.VITE_API_URL ?? '').trim().replace(/\/+$/, '')
@@ -349,6 +355,19 @@ export const api = {
     request<DeliverySlot>('POST', '/slots', input),
   updateSlot: (slotId: string, patch: Partial<Omit<DeliverySlot, 'id'>>) =>
     request<DeliverySlot>('PATCH', `/slots/${id(slotId)}`, patch),
+  // Box labels and scanning. slotId null = orders without a slot; undefined = every slot.
+  printLabels: (body: { date?: string; slotId?: string | null; orderIds?: string[] }) => request<PrintedLabels>('POST', '/labels/print', body),
+  orderLabels: (orderId: string) => request<OrderLabels>('GET', `/orders/${id(orderId)}/labels`),
+  reprintLabel: (labelId: string, reason: string) =>
+    request<Omit<PrintedLabels, 'labels' | 'skipped'>>('POST', `/labels/${id(labelId)}/reprint`, { reason }),
+  packScan: (orderId: string, scan: string) => request<PackScanResult>('POST', '/scan/pack', { orderId, scan }),
+  runCheck: (date: string, slotId?: string | null) =>
+    request<RunCheck>('GET', `/scan/dispatch${qs({ date, slotId: slotId === null ? 'none' : slotId })}`),
+  vanScan: (date: string, slotId: string | null | undefined, scan: string) =>
+    request<VanScanResult>('POST', '/scan/dispatch', { date, slotId, scan }),
+  sendLoaded: (date: string, slotId?: string | null) =>
+    request<{ dispatched: string[]; skipped: { number: string; reason: string }[] }>('POST', '/scan/dispatch/send', { date, slotId }),
+  doorScan: (orderId: string, scan: string) => request<DoorScanResult>('POST', `/orders/${id(orderId)}/door-scan`, { scan }),
   rules: () => request<RulesVersion>('GET', '/config'),
   saveRules: (rules: Rules) => request<RulesVersion>('PUT', '/config', { rules }),
 }

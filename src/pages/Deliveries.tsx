@@ -64,6 +64,11 @@ export default function Deliveries() {
           <input id="dl-date" type="date" value={day} onChange={(e) => setDay(e.target.value)} />
         </div>
         <span className="spacer" />
+        {me?.features?.labels && (
+          <Link className="btn no-print" to={`/scan?mode=van&date=${day}`}>
+            Load the van
+          </Link>
+        )}
         <button type="button" className="btn" onClick={() => window.print()}>
           Print
         </button>
@@ -201,6 +206,11 @@ function RunSection({
                         <button type="button" className="btn" onClick={() => onMissed(o)}>
                           Couldn't deliver<span className="sr-only"> {o.number}</span>
                         </button>
+                        {me?.features?.labels && me.role === 'RIDER' && (
+                          <Link className="btn btn-small" to={`/scan?mode=door&order=${o.id}`}>
+                            Check box<span className="sr-only"> {o.number}</span>
+                          </Link>
+                        )}
                       </>
                     ) : (
                       <button type="button" className="btn btn-small" disabled={sendOne.isPending} onClick={() => sendOne.mutate(o.id)}>

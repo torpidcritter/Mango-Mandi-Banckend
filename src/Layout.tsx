@@ -10,6 +10,7 @@ const LINKS: [string, string, Screen][] = [
   ['/orders', 'Orders', 'orders'],
   ['/pack-list', 'Pack list', 'packList'],
   ['/deliveries', 'Deliveries', 'deliveries'],
+  ['/scan', 'Scan', 'scan'],
   ['/claims', 'Claims', 'claims'],
   ['/pincodes', 'Pincodes', 'pincodes'],
   ['/planning', 'Planning', 'planning'],
@@ -30,7 +31,7 @@ export default function Layout() {
           Mango Ops
         </NavLink>
         <ul>
-          {LINKS.filter(([, , screen]) => canSee(me?.role, screen)).map(([to, label]) => (
+          {LINKS.filter(([, , screen]) => canSee(me?.role, screen) && (screen !== 'scan' || me?.features?.labels)).map(([to, label]) => (
             <li key={to}>
               <NavLink to={to} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
                 {label}
