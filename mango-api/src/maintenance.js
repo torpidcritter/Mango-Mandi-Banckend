@@ -27,6 +27,7 @@ import { sendDueNotifications } from './notify.js'
 import { processDueRefunds, reconcilePendingPayments, refundDuplicatePayments } from './payments.js'
 import { cronCheckIn } from './sentry.js'
 import { now } from './clock.js'
+import { evaluateDueCampaigns, runTemplates } from './unlock.js'
 
 /** The run's time budget, under Vercel's 60-second limit. */
 export const RUN_BUDGET_MS = 45_000
@@ -221,6 +222,8 @@ async function steps(forceAll) {
   out.duplicates = await step('duplicate-payments', refundDuplicatePayments)
   out.notified = await step('notifications', () => sendDueNotifications())
   out.preorders = await step('preorders', runPreorderJobs)
+  out.unlock = await step('unlock-evaluate', () => evaluateDueCampaigns())
+  out.unlockTemplates = await step('unlock-templates', () => runTemplates())
   await step('cleanup', () => cleanupExpired())
   out.retired = await step('retire', retireBatches)
   const t = now().getTime()
