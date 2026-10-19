@@ -20,6 +20,19 @@ const profile = z
     'stages must run RAW → SEMI_RIPE → RIPE',
   )
 
+const labelRules = z
+  .object({
+    // The feature flag: off until a manager turns it on.
+    enabled: z.boolean().default(false),
+    widthMm: z.number().int().min(25).max(150).default(50),
+    heightMm: z.number().int().min(25).max(200).default(75),
+    // An extra printed line at the bottom of every label.
+    footer: z.string().trim().max(80).default(''),
+    // When on, "Start run" leaves out orders whose boxes were not all scanned onto the van.
+    requireDispatchScan: z.boolean().default(false),
+  })
+  .strict()
+
 export const rulesSchema = z
   .object({
     maxSellableAge: z.number().int().min(1).max(30),
@@ -35,6 +48,9 @@ export const rulesSchema = z
     lowStockThreshold: z.number().int().min(0),
     claimWindowHours: z.number().int().min(1),
     stageProfiles: z.record(profile).refine((p) => 'default' in p, 'a "default" profile is required'),
+    // Box labels and scanning (labels.js). Defaults let rule versions saved
+    // before labels existed still load.
+    labels: labelRules.default({}),
   })
   .strict()
   .refine((r) => r.retireAge > r.maxSellableAge, { message: 'retireAge must be greater than maxSellableAge' })
@@ -60,6 +76,7 @@ export const DEFAULT_RULES = {
       { stage: 'RIPE', minAge: 6, maxAge: 7 },
     ],
   },
+  labels: { enabled: false, widthMm: 50, heightMm: 75, footer: '', requireDispatchScan: false },
 }
 
 let live = { version: 0, rules: DEFAULT_RULES }

@@ -24,6 +24,7 @@ import { reportProblem } from './sentry.js'
 import { sendOtp } from './sms.js'
 import { googleOn, verifyGoogleCredential } from './google.js'
 import { STAGES } from './stage.js'
+import { publicBox } from './labels.js'
 import { applyPromo, recordRedemption } from './promos.js'
 import { checkPhoto, dropPhoto, MAX_PHOTO_BYTES, sendPhoto, storePhoto } from './photos.js'
 
@@ -155,6 +156,14 @@ router.post(
     await sendTokens(req, res, customer)
   }),
 )
+
+// The public page behind a box label's QR (labels.js): no sign-in, no personal
+// data, and the same answer for anything unknown, tampered or switched off.
+const boxLimiter = sharedLimiter('box-page', { windowMs: 60_000, limit: 30, message: 'Too many lookups. Try again in a minute.' })
+router.get('/box/:token', boxLimiter, asyncHandler(async (req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.json(await publicBox({ query }, req.params.token))
+}))
 
 /** What the sign-in page offers. The Google client ID is public by design. */
 router.get('/auth/config', (_req, res) => res.json({ googleClientId: googleOn() ? env.GOOGLE_CLIENT_ID.split(',')[0].trim() : null }))

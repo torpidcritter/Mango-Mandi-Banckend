@@ -11,6 +11,7 @@ import { allocate, commitHeld, ledger, lineInfo, pack, release, restock, sellabl
 import { logger } from './logger.js'
 import { metrics } from './metrics.js'
 import { enqueue, enqueueForEvent } from './notify.js'
+import { eatingWindow } from './stage.js'
 
 /** Orders that still own stock and can be rebalanced. */
 export const OPEN_STATUSES = ['PAYMENT_PENDING', 'CONFIRMED', 'PROCESSING', 'PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERY_FAILED']
@@ -563,4 +564,4 @@ export async function sweepExpiredHolds(c, at = now()) {
   return n
 }
 
-export const eatByFor = (stage, date) => addDays(date, ({ RAW: 5, SEMI_RIPE: 2, RIPE: 0 }[stage] ?? 0) + 3)
+export const eatByFor = (stage, date) => eatingWindow(stage, date).eatBy
