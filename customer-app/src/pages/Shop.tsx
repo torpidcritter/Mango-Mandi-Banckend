@@ -7,6 +7,7 @@ import { useStore } from '../store'
 import { ErrorNote, Spinner } from '../ui'
 import { BookAheadCard } from './Preorder'
 import { MangoArt } from '../mango'
+import { UnlockCard } from '../unlock'
 import type { Stage } from '../api'
 
 export default function Shop() {
@@ -14,7 +15,32 @@ export default function Shop() {
   const [editing, setEditing] = useState(!pincode)
   const boxes = cart.reduce((n, l) => n + l.qty, 0)
   const pickDate = useCallback((d: string | null) => setWhere(pincode, d), [setWhere, pincode])
-  const [params] = useSearchParams()
+  const [params, setParams] = useSearchParams()
+
+  // A shared Neighborhood Unlock link: /?pin=560038&date=2026-10-25 opens the
+  // shop for that pincode and day (when it is still open for orders).
+  const sharedPin = params.get('pin')
+  const sharedDate = params.get('date')
+  useEffect(() => {
+    if (!sharedPin) return
+    let live = true
+    const drop = () => setParams((p) => { p.delete('pin'); p.delete('date'); return p }, { replace: true })
+    if (!/^\d{6}$/.test(sharedPin)) return drop()
+    api
+      .checkPincode(sharedPin)
+      .then((r) => {
+        if (!live) return
+        if (r.serviceable && r.deliveryDates.length) {
+          setWhere(sharedPin, sharedDate && r.deliveryDates.includes(sharedDate) ? sharedDate : r.earliestDeliveryDate)
+          setEditing(false)
+        }
+        drop()
+      })
+      .catch(drop)
+    return () => {
+      live = false
+    }
+  }, [sharedPin, sharedDate, setWhere, setParams])
 
   return (
     <>
@@ -186,6 +212,8 @@ function Catalogue({ pincode, date, onDate }: { pincode: string; date: string | 
         </div>
         <p className="muted small">Orders for the next day close at {q.data.cutoffTime!.replace(' IST', '')} (India time).</p>
       </section>
+
+      <UnlockCard pincode={pincode} date={chosen} />
 
       <section aria-labelledby="pick">
         <h2 id="pick" className="section-title">

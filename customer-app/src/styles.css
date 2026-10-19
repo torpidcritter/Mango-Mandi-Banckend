@@ -1048,3 +1048,28 @@ textarea:focus {
   flex-direction: column;
   min-width: 0;
 }
+
+/* Neighborhood Unlock */
+.unlock-card {
+  border-color: var(--mango);
+}
+.unlock-count {
+  margin: 0 0 0.5rem;
+}
+.unlock-bar {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--mango-soft);
+  overflow: hidden;
+  margin: 0 0 0.5rem;
+}
+.unlock-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--mango-strong);
+  border-radius: inherit;
+}
+.unlock-line a {
+  color: inherit;
+  font-weight: 600;
+}

@@ -7,6 +7,7 @@ import { openRazorpay, rememberPayment } from '../payment'
 import { useStore, type CartLine } from '../store'
 import { ErrorNote, Spinner } from '../ui'
 import { AddPhoneCard } from '../auth-ui'
+import { UnlockCard } from '../unlock'
 
 function loadAddress() {
   try {
@@ -205,147 +206,150 @@ function CheckoutForm() {
   }
 
   return (
-    <section className="card">
-      <h1>Delivery details</h1>
-      <form onSubmit={submit} noValidate>
-        {slots.isPending ? (
-          <Spinner label="Loading delivery times" />
-        ) : slots.isError ? (
-          <ErrorNote error={slots.error} onRetry={() => slots.refetch()} />
-        ) : (
-          <>
-            <p>
-              Arrives <strong>{day(slots.data.deliveryDate)}</strong>
-            </p>
-            {slots.data.slots.length > 0 && (
-              <fieldset className="field">
-                <legend>Delivery time</legend>
-                <div className="options">
-                  {slots.data.slots.map((s) => (
-                    <label key={s.id} className={`option${s.available ? '' : ' option-off'}`}>
-                      <input type="radio" name="slot" value={s.id} checked={slotId === s.id} disabled={!s.available} onChange={() => setSlotId(s.id)} />
-                      <span>
-                        {slotText(s)}
-                        {!s.available && <span className="muted small"> · Full</span>}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-            )}
-          </>
-        )}
-        <label className="option gift-toggle">
-          <input
-            type="checkbox"
-            checked={isGift}
-            onChange={(e) => {
-              setIsGift(e.target.checked)
-              // A gift goes to their address, not one of ours.
-              if (e.target.checked && picked !== null) {
-                typedOwn.current = true
-                setPicked(null)
-                setAddress('')
-              }
-            }}
-          />
-          <span>This is a gift for someone else</span>
-        </label>
-        {isGift && (
-          <fieldset className="field gift-fields">
-            <legend>Who is it for?</legend>
-            <div className="field">
-              <label htmlFor="gift-name">Their name</label>
-              <input id="gift-name" maxLength={80} value={gift.recipientName} onChange={(e) => setGift({ ...gift, recipientName: e.target.value })} />
-            </div>
-            <div className="field">
-              <label htmlFor="gift-phone">Their mobile number</label>
-              <div className="prefixed">
-                <span aria-hidden="true">+91</span>
-                <input
-                  id="gift-phone"
-                  type="tel"
-                  inputMode="numeric"
-                  maxLength={14}
-                  value={gift.recipientPhone}
-                  onChange={(e) => setGift({ ...gift, recipientPhone: e.target.value })}
-                  aria-describedby="gift-phone-hint"
-                />
-              </div>
-              <p id="gift-phone-hint" className="muted small">
-                The rider calls them. Your order updates and the delivery code still come to you, so pass the code on.
+    <>
+      <UnlockCard pincode={pincode} date={slots.data?.deliveryDate ?? date} />
+      <section className="card">
+        <h1>Delivery details</h1>
+        <form onSubmit={submit} noValidate>
+          {slots.isPending ? (
+            <Spinner label="Loading delivery times" />
+          ) : slots.isError ? (
+            <ErrorNote error={slots.error} onRetry={() => slots.refetch()} />
+          ) : (
+            <>
+              <p>
+                Arrives <strong>{day(slots.data.deliveryDate)}</strong>
               </p>
-            </div>
-            <div className="field">
-              <label htmlFor="gift-note">A note in the box (optional)</label>
-              <textarea id="gift-note" rows={2} maxLength={200} value={gift.message} onChange={(e) => setGift({ ...gift, message: e.target.value })} />
-            </div>
-          </fieldset>
-        )}
-        <div className="field">
-          <label htmlFor="name">Your name</label>
-          <input id="name" autoComplete="name" maxLength={80} value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        {!isGift && savedHere.length > 0 && (
-          <fieldset className="field">
-            <legend>Deliver to</legend>
-            <div className="options">
-              {savedHere.map((a) => (
-                <label key={a.id} className="option">
-                  <input type="radio" name="saved-address" checked={picked === a.id} onChange={() => choose(a.id)} />
-                  <span className="option-text">
-                    {a.name && <strong>{a.name}</strong>}
-                    <span>{a.address}</span>
-                  </span>
+              {slots.data.slots.length > 0 && (
+                <fieldset className="field">
+                  <legend>Delivery time</legend>
+                  <div className="options">
+                    {slots.data.slots.map((s) => (
+                      <label key={s.id} className={`option${s.available ? '' : ' option-off'}`}>
+                        <input type="radio" name="slot" value={s.id} checked={slotId === s.id} disabled={!s.available} onChange={() => setSlotId(s.id)} />
+                        <span>
+                          {slotText(s)}
+                          {!s.available && <span className="muted small"> · Full</span>}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              )}
+            </>
+          )}
+          <label className="option gift-toggle">
+            <input
+              type="checkbox"
+              checked={isGift}
+              onChange={(e) => {
+                setIsGift(e.target.checked)
+                // A gift goes to their address, not one of ours.
+                if (e.target.checked && picked !== null) {
+                  typedOwn.current = true
+                  setPicked(null)
+                  setAddress('')
+                }
+              }}
+            />
+            <span>This is a gift for someone else</span>
+          </label>
+          {isGift && (
+            <fieldset className="field gift-fields">
+              <legend>Who is it for?</legend>
+              <div className="field">
+                <label htmlFor="gift-name">Their name</label>
+                <input id="gift-name" maxLength={80} value={gift.recipientName} onChange={(e) => setGift({ ...gift, recipientName: e.target.value })} />
+              </div>
+              <div className="field">
+                <label htmlFor="gift-phone">Their mobile number</label>
+                <div className="prefixed">
+                  <span aria-hidden="true">+91</span>
+                  <input
+                    id="gift-phone"
+                    type="tel"
+                    inputMode="numeric"
+                    maxLength={14}
+                    value={gift.recipientPhone}
+                    onChange={(e) => setGift({ ...gift, recipientPhone: e.target.value })}
+                    aria-describedby="gift-phone-hint"
+                  />
+                </div>
+                <p id="gift-phone-hint" className="muted small">
+                  The rider calls them. Your order updates and the delivery code still come to you, so pass the code on.
+                </p>
+              </div>
+              <div className="field">
+                <label htmlFor="gift-note">A note in the box (optional)</label>
+                <textarea id="gift-note" rows={2} maxLength={200} value={gift.message} onChange={(e) => setGift({ ...gift, message: e.target.value })} />
+              </div>
+            </fieldset>
+          )}
+          <div className="field">
+            <label htmlFor="name">Your name</label>
+            <input id="name" autoComplete="name" maxLength={80} value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          {!isGift && savedHere.length > 0 && (
+            <fieldset className="field">
+              <legend>Deliver to</legend>
+              <div className="options">
+                {savedHere.map((a) => (
+                  <label key={a.id} className="option">
+                    <input type="radio" name="saved-address" checked={picked === a.id} onChange={() => choose(a.id)} />
+                    <span className="option-text">
+                      {a.name && <strong>{a.name}</strong>}
+                      <span>{a.address}</span>
+                    </span>
+                  </label>
+                ))}
+                <label className="option">
+                  <input type="radio" name="saved-address" checked={picked === null} onChange={() => choose(null)} />
+                  <span>A new address</span>
                 </label>
-              ))}
-              <label className="option">
-                <input type="radio" name="saved-address" checked={picked === null} onChange={() => choose(null)} />
-                <span>A new address</span>
-              </label>
-            </div>
-          </fieldset>
-        )}
-        <div className="field" hidden={!isGift && picked !== null}>
-          <label htmlFor="address">Delivery address</label>
-          <textarea
-            id="address"
-            autoComplete="street-address"
-            rows={3}
-            maxLength={500}
-            value={address}
-            onChange={(e) => {
-              typedOwn.current = true
-              setAddress(e.target.value)
-            }}
-            aria-describedby="address-hint"
-          />
-          <p id="address-hint" className="muted small">
-            {isGift ? 'Their address: house' : 'House'} or flat number, street, area and a landmark. Pincode {pincode}.
-          </p>
-        </div>
-        <div className="field">
-          <label htmlFor="promo">Promo code (optional)</label>
-          <input
-            id="promo"
-            autoComplete="off"
-            autoCapitalize="characters"
-            maxLength={20}
-            value={promoCode}
-            onChange={(e) => setPromoCode(e.target.value.toUpperCase())}
-          />
-        </div>
-        {formError && (
-          <p className="field-error" role="alert">
-            {formError}
-          </p>
-        )}
-        <ErrorNote error={review.error ? quoteProblem(review.error, cart) : null} />
-        <button type="submit" className="btn btn-primary btn-block" disabled={review.isPending || slots.isPending}>
-          {review.isPending ? 'Checking stock…' : 'Review order'}
-        </button>
-      </form>
-    </section>
+              </div>
+            </fieldset>
+          )}
+          <div className="field" hidden={!isGift && picked !== null}>
+            <label htmlFor="address">Delivery address</label>
+            <textarea
+              id="address"
+              autoComplete="street-address"
+              rows={3}
+              maxLength={500}
+              value={address}
+              onChange={(e) => {
+                typedOwn.current = true
+                setAddress(e.target.value)
+              }}
+              aria-describedby="address-hint"
+            />
+            <p id="address-hint" className="muted small">
+              {isGift ? 'Their address: house' : 'House'} or flat number, street, area and a landmark. Pincode {pincode}.
+            </p>
+          </div>
+          <div className="field">
+            <label htmlFor="promo">Promo code (optional)</label>
+            <input
+              id="promo"
+              autoComplete="off"
+              autoCapitalize="characters"
+              maxLength={20}
+              value={promoCode}
+              onChange={(e) => setPromoCode(e.target.value.toUpperCase())}
+            />
+          </div>
+          {formError && (
+            <p className="field-error" role="alert">
+              {formError}
+            </p>
+          )}
+          <ErrorNote error={review.error ? quoteProblem(review.error, cart) : null} />
+          <button type="submit" className="btn btn-primary btn-block" disabled={review.isPending || slots.isPending}>
+            {review.isPending ? 'Checking stock…' : 'Review order'}
+          </button>
+        </form>
+      </section>
+    </>
   )
 }
 

@@ -6,6 +6,7 @@ import { CANCELLABLE, STAGE_LABEL, STATUS_LABEL, day, rupees, slotText, when } f
 import { openRazorpay, rememberedPayment } from '../payment'
 import { Dialog, ErrorNote, Spinner } from '../ui'
 import { CARE, MangoArt } from '../mango'
+import { UnlockLine } from '../unlock'
 import { useStore } from '../store'
 
 const TONE: Partial<Record<OrderStatus, string>> = {
@@ -125,6 +126,7 @@ function OrderView({ order }: { order: Order }) {
         </section>
       )}
 
+      {order.status !== 'CANCELLED' && order.status !== 'PAYMENT_PENDING' && order.status !== 'RTO' && <UnlockLine pincode={order.pincode} date={order.deliveryDate} />}
       {order.status === 'CANCELLED' && (
         <section className="card note-card">
           <p>

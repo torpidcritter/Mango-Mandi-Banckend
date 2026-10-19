@@ -190,6 +190,23 @@ export interface PreorderInput {
   waitlist?: boolean
 }
 
+/** A Neighborhood Unlock campaign as anyone may see it: counts only, never who. */
+export interface UnlockCampaign {
+  zoneLabel: string
+  slotLabel: string | null
+  deliveryDate: string
+  current: number
+  threshold: number
+  remaining: number
+  closesAt: string
+  status: 'OPEN' | 'UNLOCKED' | 'MISSED'
+}
+export interface UnlockProgress {
+  enabled: boolean
+  deliveryDate: string | null
+  campaigns: UnlockCampaign[]
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -351,6 +368,7 @@ export const api = {
     signedOut()
   },
 
+  unlockProgress: (pincode: string, date: string | null) => raw<UnlockProgress>('GET', `/unlock/progress${qs({ pincode, date })}`),
   checkPincode: (pincode: string) => request<DeliveryCheck>('GET', `/delivery/check${qs({ pincode })}`),
   catalogue: (pincode: string, date: string | null) => request<Catalogue>('GET', `/catalogue${qs({ pincode, delivery_date: date })}`),
   slots: (pincode: string, date: string) =>
