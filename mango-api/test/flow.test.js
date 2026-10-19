@@ -66,7 +66,7 @@ describe('staff auth', () => {
     assert.equal((await api.get('/admin/v1/summary')).status, 401)
 
     const ops = await adminToken(api, 'ops@mandimangoes.test', 'operator123')
-    assert.deepEqual((await api.get('/admin/v1/auth/me', { token: ops })).body, { email: 'ops@mandimangoes.test', role: 'OPERATOR', twoStep: { enabled: false, required: false } })
+    assert.deepEqual((await api.get('/admin/v1/auth/me', { token: ops })).body, { email: 'ops@mandimangoes.test', role: 'OPERATOR', twoStep: { enabled: false, required: false }, features: { labels: false } })
     const b = await makeBatch({ age: 4, rating: 'SEMI_RIPE', lines: { 'ALP-3': 5 } })
     assert.equal((await api.patch(`/admin/v1/batches/${b}/status`, { status: 'CONDEMNED' }, { token: ops })).status, 403)
     assert.equal((await api.del('/admin/v1/pincodes/560034', { token: ops })).status, 403)
