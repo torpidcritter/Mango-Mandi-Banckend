@@ -2,7 +2,7 @@
 // it is derived from the batch's age on the DELIVERY date, shifted by the
 // latest QC reading, so the same box can sell as raw on one date and ripe on
 // another. See the playbook, section 2.
-import { addDays, diffDays, istParts } from './clock.js'
+import { diffDays, istParts } from './clock.js'
 
 export const STAGES = ['RAW', 'SEMI_RIPE', 'RIPE']
 
@@ -46,19 +46,4 @@ export function stageFor(config, { variety, pluckedOn }, deliveryDate, qc) {
   if (idx < 0) return null
   // Still inside the cap but past the last window (a fast ripener): ripe.
   return STAGES[Math.min(idx, STAGES.length - 1)]
-}
-
-/** Days after delivery until a box sold at a stage is ready to eat, at room temperature. */
-const DAYS_TO_READY = { RAW: 5, SEMI_RIPE: 2, RIPE: 0 }
-/** Days a ripe mango stays good to eat once ready. */
-export const READY_DAYS = 3
-
-/**
- * When a box delivered on `deliveryDate` at `stage` is ready to eat, and the
- * last day to eat it. The one rule behind every "eat by" the shop, WhatsApp,
- * the panel and the box labels show.
- */
-export function eatingWindow(stage, deliveryDate) {
-  const readyFrom = addDays(deliveryDate, DAYS_TO_READY[stage] ?? 0)
-  return { readyFrom, eatBy: addDays(readyFrom, READY_DAYS) }
 }

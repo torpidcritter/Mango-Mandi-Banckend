@@ -16,7 +16,7 @@ import { dropPhoto } from './photos.js'
 import { addDays, todayIST } from './clock.js'
 import { getConfig, loadConfig } from './config.js'
 import { randomUUID } from 'node:crypto'
-import { outOfTime, withBudget } from './budget.js'
+import { outOfTime, withBudget, withSlice } from './budget.js'
 import { query, tx } from './db.js'
 import { auditLedger } from './inventory.js'
 import { logger } from './logger.js'
@@ -24,6 +24,7 @@ import { metrics } from './metrics.js'
 import { allocatePreorders, expirePreorderHolds, promoteWaitlist, reconcilePreorderPayments, retryMissingLinks } from './preorders.js'
 import { OPEN_STATUSES, rebalanceOrder, SYSTEM, sweepExpiredHolds, takeBatchOutOfService } from './orders.js'
 import { sendDueNotifications } from './notify.js'
+import { sendReorderReminders, sendStockAlerts } from './engagement.js'
 import { processDueRefunds, reconcilePendingPayments, refundDuplicatePayments } from './payments.js'
 import { cronCheckIn } from './sentry.js'
 import { now } from './clock.js'
@@ -52,6 +53,9 @@ async function lastRuns() {
   return Object.fromEntries(rows.map((r) => [r.step, r.last_ok_at ? r.last_ok_at.getTime() : 0]))
 }
 
+/** The most of the run each outside-calling step may use, in ms. */
+export const SLICE = { reconcile: 8_000, refunds: 8_000, duplicates: 4_000, alerts: 3_000, notifications: 10_000, preorders: 8_000 }
+
 /** Steps that need this much time left are put off to the next run. */
 const STEP_MIN_MS = 3_000
 
@@ -60,14 +64,14 @@ const STEP_MIN_MS = 3_000
  * Needs attention view. With too little time left it is skipped (not an
  * error): the next run does it.
  */
-async function step(name, fn, { minMs = STEP_MIN_MS } = {}) {
+async function step(name, fn, { minMs = STEP_MIN_MS, sliceMs = null } = {}) {
   if (outOfTime(minMs)) {
     logger.warn({ step: name }, 'maintenance step put off to the next run: out of time')
     metrics.maintenanceSkips.inc({ step: name })
     return null
   }
   try {
-    const out = await fn()
+    const out = await (sliceMs ? withSlice(sliceMs, fn) : fn())
     // A step that stopped early (out of time) isn't marked done, so it runs again next time.
     if (out?.partial) return out
     await query(
@@ -214,25 +218,30 @@ export async function runMaintenance({ forceAll = false, budgetMs = RUN_BUDGET_M
 
 async function steps(forceAll) {
   const out = {}
-  out.reconciled = await step('reconcile', () => reconcilePendingPayments())
+  // Each step that calls out (Razorpay, WhatsApp) gets a slice of the run, so
+  // a slow outside service can't starve the rest. The cheap database steps
+  // (sweep, retire, audit) run early, so they always get their turn.
+  out.reconciled = await step('reconcile', () => reconcilePendingPayments(), { sliceMs: SLICE.reconcile })
   out.expired = await step('sweep', () => tx((c) => sweepExpiredHolds(c)))
   if (out.expired) metrics.holdsExpired.inc(out.expired)
-  out.refunded = await step('refunds', processDueRefunds)
-  out.duplicates = await step('duplicate-payments', refundDuplicatePayments)
-  out.notified = await step('notifications', () => sendDueNotifications())
-  out.preorders = await step('preorders', runPreorderJobs)
-  await step('cleanup', () => cleanupExpired())
   out.retired = await step('retire', retireBatches)
   const t = now().getTime()
   const last = await lastRuns()
+  if (forceAll || t - (last.audit ?? 0) > HOURLY_MS) {
+    out.drift = (await step('audit', runAudit))?.length ?? null
+  }
+  out.refunded = await step('refunds', processDueRefunds, { sliceMs: SLICE.refunds })
+  out.duplicates = await step('duplicate-payments', refundDuplicatePayments, { sliceMs: SLICE.duplicates })
+  out.alerts = await step('stock-alerts', () => sendStockAlerts(), { sliceMs: SLICE.alerts })
+  out.reminders = await step('reminders', () => sendReorderReminders(), { sliceMs: SLICE.alerts })
+  out.notified = await step('notifications', () => sendDueNotifications(), { sliceMs: SLICE.notifications })
+  out.preorders = await step('preorders', runPreorderJobs, { sliceMs: SLICE.preorders })
+  await step('cleanup', () => cleanupExpired())
   const lastFull = last['rebalance-all'] ?? 0
   if (forceAll || (last['rebalance-requested'] ?? 0) > lastFull || t - lastFull > DAILY_MS) {
     out.rebalanced = await step('rebalance-all', () => rebalanceAllOpen())
   } else if (t - Math.max(lastFull, last['rebalance-at-risk'] ?? 0) > HOURLY_MS) {
     out.rebalanced = await step('rebalance-at-risk', () => rebalanceAllOpen({ atRiskOnly: true }))
-  }
-  if (forceAll || t - (last.audit ?? 0) > HOURLY_MS) {
-    out.drift = (await step('audit', runAudit))?.length ?? null
   }
   const risk = await query(`SELECT COUNT(*)::int AS n FROM orders WHERE at_risk AND status = ANY($1)`, [OPEN_STATUSES])
   out.atRisk = risk.rows[0].n

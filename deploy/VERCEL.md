@@ -98,7 +98,9 @@ secrets with `openssl rand -hex 32`. Never commit them.
 | `ADMIN_ORIGIN` | `https://ops.mandimangoes.in` | the panel preview URL | |
 | `COOKIE_SAMESITE` | `lax` | `none` | previews are on different `*.vercel.app` names |
 | `SEED_DEMO_DATA` | `false` | `true` | demo batches only on previews; demo staff logins are never made on Vercel |
-| `ADMIN_BOOTSTRAP_EMAIL` / `ADMIN_BOOTSTRAP_PASSWORD` | first manager's login | same | used once, on an empty staff table; remove after |
+| `ADMIN_BOOTSTRAP_EMAIL` / `ADMIN_BOOTSTRAP_PASSWORD` | first manager's login | **not set** | tick only Production; used once, on an empty staff table; remove after |
+| `PREVIEW_ADMIN_EMAIL` / `PREVIEW_ADMIN_PASSWORD` | | a different login | the first manager on the staging branch, so the production password never reaches a preview |
+| `PRODUCTION_DB_HOST` | the Neon `main` host, e.g. `ep-cool-sun-123456.ap-southeast-1.aws.neon.tech` | the same value | required: production refuses any other database, and a preview refuses this one, even on its first deploy |
 | `STAFF_TWO_STEP` | `managers` (or `all`) | `optional` | managers and operators must use an authenticator app |
 | `GOOGLE_CLIENT_ID` | from step 4 | same | |
 | `BLOB_READ_WRITE_TOKEN` | added by Vercel Blob (step 5) | same store or a second one | required in production |
@@ -108,6 +110,9 @@ secrets with `openssl rand -hex 32`. Never commit them.
 | `SMS_PROVIDER` and `JIO_SMS_*` | `jio` and Jio's values | `log` (codes in the Vercel logs) | see [mango-api/README.md](../mango-api/README.md#login-codes-by-sms-jio) |
 | `WHATSAPP_*` | Meta's values | `log` | see [mango-api/README.md](../mango-api/README.md#whatsapp-order-updates) |
 | `OTP_DAILY_LIMIT` | `3000` | `200` | login codes per day before sending pauses; Sentry warns at 80% |
+| `OTP_NEW_NUMBER_SHARE` | `0.6` | | the part of that budget numbers with no account may use; the rest is kept for existing customers |
+| `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | from Cloudflare Turnstile | Cloudflare's test keys | a check, usually invisible, before a login code is sent; set both or neither |
+| `API_RATE_LIMIT` | `3000` | | requests per 15 minutes from one address before 429. Mobile carriers put many customers behind one address, so keep it high; it only stops floods |
 | `METRICS_TOKEN` | random | | protects `/metrics` |
 
 `TRUST_PROXY` and the database pool size are set for Vercel automatically.
@@ -175,8 +180,15 @@ Then point the webhooks at the API:
   to 20 requests per minute per IP, action **Deny**. The API has its own limits too;
   this stops floods before they cost function time.
 - **Turn on Vercel's bot protection** in the shop project's Firewall settings.
-- **Deployment protection.** On all three projects, **Settings → Deployment
+- **Deployment protection (required).** On all three projects, **Settings → Deployment
   Protection → Vercel Authentication** for previews, so only your team can open them.
+  Previews hold real staff logins and test payments; an open preview URL is an open
+  admin panel.
+- **Turnstile.** In Cloudflare → **Turnstile → Add widget**, add the shop's domains
+  (`mandimangoes.in`, `www.mandimangoes.in`), mode **Managed**. Put the site key and
+  secret key in `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` on `mandi-api`. The
+  shop shows the check above "Send code" by itself. For previews use Cloudflare's
+  always-pass test keys.
 - **Two-step sign-in** on every account that can change production: GitHub, Vercel,
   Neon, Razorpay, Google Cloud and Meta.
 - **Branch protection on GitHub** for `main`: require the CI check to pass and one
@@ -201,17 +213,31 @@ Then point the webhooks at the API:
 
 ## Backups and restore drill
 
-- **What you can lose (RPO): under a minute.** Neon keeps every change for the
-  history window (7 days on Launch, longer on Scale), so `main` can be restored to
-  any second inside it.
+- **What you can lose (RPO).** Neon keeps every change for its history window (7 days
+  on Launch, longer on Scale), so `main` can go back to any second inside it. The
+  nightly off-Neon copy (below) covers older mistakes and Neon itself being down, but
+  anything after the last copy is lost in that case: up to a day.
 - **How long it takes (RTO): aim for an hour**, from deciding to restore to the shop
-  taking orders again.
+  taking orders again. Time the drill and write the real number down.
 - **Drill** before launch and monthly in season: make a branch of `main` at a time a
   few minutes ago, then run `DRILL_URL=<its connection string> ./mango-api/ops/restore-drill.sh`.
   It checks the schema, row counts and that the stock books balance. Delete the
   branch afterwards; it holds customer data.
-- **Off-Neon copy** weekly: `mango-api/ops/backup.sh` writes a `pg_dump` you keep
-  somewhere else, and `ops/restore-check.sh` proves it loads.
+- **Nightly encrypted copy off Neon.** The GitHub Actions workflow
+  [`backup.yml`](../.github/workflows/backup.yml) runs `ops/backup.sh` at 03:00 IST,
+  encrypts the dump with your GPG public key and keeps it 30 days. Set it up once:
+  1. Make a read-only Neon role (`GRANT SELECT ON ALL TABLES ...` like `mango_app`, without
+     insert/update/delete) and copy its **direct** connection string.
+  2. `gpg --quick-generate-key "MandiMangoes backups"` on your own computer, then
+     `gpg --armor --export "MandiMangoes backups"`. Keep the private key offline (a
+     password manager or a USB stick in a safe), never in GitHub.
+  3. In GitHub → **Settings → Secrets and variables → Actions**, add
+     `BACKUP_DATABASE_URL` and `BACKUP_GPG_PUBLIC_KEY`. Run the workflow once by hand.
+  Prove a copy loads with `ops/restore-check.sh` after `gpg --decrypt`.
+- **Personal data in backups.** Dumps hold names, phones and addresses, which is why they
+  are encrypted and kept only 30 days. A deleted account can still be inside an older
+  copy; after any restore, run `ops/reapply-deletions.js` (see Rolling back) so it is
+  deleted again.
 
 ## Load test
 
@@ -222,10 +248,14 @@ the pass marks.
 
 ## Go-live checks
 
-- [ ] `npm run preflight -- --online` shows no errors.
-- [ ] Razorpay test webhooks sent to the staging API confirm orders.
-- [ ] The Sentry cron monitor and the uptime monitor are set up and alert someone.
-- [ ] One restore drill done.
+- [ ] `npm run preflight -- --online` shows no errors, on production and on a preview.
+- [ ] Razorpay test webhooks sent to the staging API confirm orders: pay a test order in
+      the staging shop, then in Razorpay → **Webhooks** check the delivery shows 200.
+- [ ] The k6 browse scenario passes against staging (`ops/load/shop.js`).
+- [ ] The Sentry cron monitor and the uptime monitor on `/ready` are set up and alert someone.
+- [ ] One restore drill done on a Neon branch, with the time it took written down.
+- [ ] The nightly backup workflow ran once and its artifact decrypts.
+- [ ] Turnstile keys set; deployment protection on for previews.
 - [ ] `https://api.mandimangoes.in/ready` returns `{"ready":true,...}`.
 - [ ] Sign in to the panel as the bootstrap manager, set up two-step, then remove
       `ADMIN_BOOTSTRAP_*`.
@@ -237,7 +267,21 @@ the pass marks.
 ## Rolling back
 
 - **Code:** Vercel → the project → **Deployments**, pick the last good one,
-  **Promote to Production**. It takes seconds.
-- **Data:** Neon → **Branches → main → Restore**, to a time before the problem.
-  If the bad deploy included a migration, restore the database to just before
-  that deploy as well, so the older code and the schema match.
+  **Promote to Production**. It takes seconds, and the data stays as it is. Migrations
+  only add, so older code runs fine on the newer schema.
+- **Data: roll forward first.** A bad change to some rows (a wrong price, a bulk
+  reschedule on the wrong day) is fixed with a new change: correct the rows, or deploy
+  a fix. This loses nothing.
+- **Restoring the database is the last resort.** It throws away every order, payment
+  and deletion since the restore point, while Razorpay keeps the money. Only restore
+  when the data can't be repaired, and then always do all of this:
+  1. Neon → **Branches → main → Restore** to a time before the problem. Neon keeps the
+     state just before the restore as a backup branch; don't delete it yet.
+  2. Bring back the payments taken since the restore point (applied as the webhook
+     would; lost orders are listed in Needs attention):
+     `node --env-file=.env ops/replay-payments.js --from <restore point>`.
+     Rebuild lost orders by hand where you can, or re-run with `--refund-missing` to
+     refund them in full, and tell those customers.
+  3. Delete again the accounts deleted since then:
+     `node --env-file=.env ops/reapply-deletions.js --old-url <backup branch URL> --since <restore point>`.
+  4. Check the panel's Needs attention card, then delete the backup branch.

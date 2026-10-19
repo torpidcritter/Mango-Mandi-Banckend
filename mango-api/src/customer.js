@@ -27,12 +27,19 @@ import { STAGES } from './stage.js'
 import { publicBox } from './labels.js'
 import { applyPromo, recordRedemption } from './promos.js'
 import { checkPhoto, dropPhoto, MAX_PHOTO_BYTES, sendPhoto, storePhoto } from './photos.js'
+import { eraseCustomer } from './privacy.js'
+import { requireHuman } from './turnstile.js'
+import { cancelAlert, createAlert, listAlerts } from './engagement.js'
+import { readyOnFor } from './ripeness.js'
 
 export const router = express.Router()
 
 // Per address, counted in Postgres so every serverless instance shares it.
 // Outside production it is loose, so test runs don't trip it.
 const otpLimiter = sharedLimiter('otp-ip', { windowMs: 15 * 60_000, limit: isProd ? 30 : 300 })
+
+/** Claims a customer can raise in 30 days from the app. */
+const MAX_CLAIMS_PER_MONTH = 3
 
 const OTP_TTL_MS = 5 * 60_000
 const OTP_MAX_ATTEMPTS = 5
@@ -43,13 +50,24 @@ const DAY_MS = 86_400_000
 /**
  * Stops SMS pumping: every code costs money, and bots request codes for
  * numbers they don't own. Each number gets 10 codes a day, and the whole shop
- * a daily budget (OTP_DAILY_LIMIT). Past 80% of the budget Sentry is told;
- * past 100% no more codes go out until midnight IST (Google sign-in still works).
+ * a daily budget (OTP_DAILY_LIMIT). Numbers with no account may use only part
+ * of it (OTP_NEW_NUMBER_SHARE), so a flood of new numbers can't lock existing
+ * customers out. Past 80% of the budget Sentry is told; past 100% no more
+ * codes go out until midnight IST (Google sign-in still works).
  */
 async function checkOtpBudget(phone) {
   const day = todayIST()
   const mine = await hit(`otp-phone-day:${phone}:${day}`, DAY_MS)
   if (mine.hits > OTP_MAX_SENDS_PER_DAY) throw new HttpError(429, 'OTP_LIMIT', 'Too many codes for this number today. Try again tomorrow.')
+  const known = (await query('SELECT 1 FROM customers WHERE phone = $1 AND deleted_at IS NULL', [phone])).rowCount > 0
+  if (!known) {
+    const share = Math.ceil(env.OTP_DAILY_LIMIT * env.OTP_NEW_NUMBER_SHARE)
+    const fresh = await hit(`otp-day-new:${day}`, DAY_MS)
+    if (fresh.hits > share) {
+      if (fresh.hits === share + 1) reportProblem('Login codes for new numbers paused: their share of the daily budget is used up', { share })
+      throw new HttpError(503, 'OTP_PAUSED', "We can't send login codes to new numbers right now. Sign in with Google, or try again later.")
+    }
+  }
   const all = await hit(`otp-day:${day}`, DAY_MS)
   metrics.otpBudgetUsed.set(all.hits)
   if (all.hits === Math.ceil(env.OTP_DAILY_LIMIT * 0.8)) reportProblem('Login codes: 80% of the daily SMS budget used', { used: all.hits, limit: env.OTP_DAILY_LIMIT })
@@ -65,6 +83,8 @@ const phoneSchema = z
   .transform((s) => s.replace(/[\s-]/g, '').replace(/^(\+91|91|0)(?=\d{10}$)/, ''))
   .refine((s) => /^[6-9]\d{9}$/.test(s), 'Enter a 10-digit Indian mobile number')
   .transform((s) => `+91${s}`)
+
+const otpRequest = z.object({ phone: phoneSchema, channel: z.enum(['sms', 'whatsapp']).optional(), captchaToken: z.string().max(2048).optional() })
 
 const hashOtp = (phone, code) => createHash('sha256').update(`${env.JWT_SECRET}:${phone}:${code}`).digest()
 
@@ -112,7 +132,8 @@ router.post(
   '/auth/otp/request',
   otpLimiter,
   asyncHandler(async (req, res) => {
-    const { phone, channel } = parse(z.object({ phone: phoneSchema, channel: z.enum(['sms', 'whatsapp']).optional() }), req.body)
+    const { phone, channel, captchaToken } = parse(otpRequest, req.body)
+    await requireHuman(captchaToken, req.ip)
     res.json(await issueCode(phone, channel))
   }),
 )
@@ -166,7 +187,9 @@ router.get('/box/:token', boxLimiter, asyncHandler(async (req, res) => {
 }))
 
 /** What the sign-in page offers. The Google client ID is public by design. */
-router.get('/auth/config', (_req, res) => res.json({ googleClientId: googleOn() ? env.GOOGLE_CLIENT_ID.split(',')[0].trim() : null }))
+router.get('/auth/config', (_req, res) =>
+  res.json({ googleClientId: googleOn() ? env.GOOGLE_CLIENT_ID.split(',')[0].trim() : null, turnstileSiteKey: env.TURNSTILE_SECRET_KEY ? env.TURNSTILE_SITE_KEY || null : null }),
+)
 
 router.post(
   '/auth/google',
@@ -310,13 +333,49 @@ router.get(
   }),
 )
 
-router.use(['/cart', '/checkout', '/orders', '/claims', '/me', '/preorders'], requireCustomer)
+/** What a box's QR code opens: where the mangoes came from and when they'll be ripe. Public. */
+
+router.use(['/cart', '/checkout', '/orders', '/claims', '/me', '/preorders', '/stock-alerts'], requireCustomer)
+
+const meView = (cu) => ({ ...profile(cu), remindersOptIn: Boolean(cu.reminders_opt_in) })
 
 router.get('/me', asyncHandler(async (req, res) => {
-  const { rows } = await query('SELECT id, phone, name, email FROM customers WHERE id = $1 AND deleted_at IS NULL', [req.customer.id])
+  const { rows } = await query('SELECT id, phone, name, email, reminders_opt_in FROM customers WHERE id = $1 AND deleted_at IS NULL', [req.customer.id])
   if (!rows.length) throw notFound('Customer not found')
-  res.json(profile(rows[0]))
+  res.json(meView(rows[0]))
 }))
+
+/** Settings the customer controls: for now, the WhatsApp reminder a week after delivery. */
+router.patch('/me', asyncHandler(async (req, res) => {
+  const b = parse(z.object({ remindersOptIn: z.boolean() }).strict(), req.body ?? {})
+  const { rows } = await query(
+    'UPDATE customers SET reminders_opt_in = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING id, phone, name, email, reminders_opt_in',
+    [req.customer.id, b.remindersOptIn],
+  )
+  if (!rows.length) throw notFound('Customer not found')
+  res.json(meView(rows[0]))
+}))
+
+// ---------------------------------------------------------------- back-in-stock alerts
+
+router.get('/stock-alerts', asyncHandler(async (req, res) => res.json(await listAlerts({ query }, req.customer.id))))
+
+router.post(
+  '/stock-alerts',
+  asyncHandler(async (req, res) => {
+    const b = parse(z.object({ sku: z.string().min(1).max(20), stage: z.enum(STAGES), pincode: PIN }), req.body)
+    if (!(await serviceable({ query }, b.pincode))) throw badRequest('We do not deliver to this pincode yet', 'NOT_SERVICEABLE')
+    res.status(201).json(await tx((c) => createAlert(c, req.customer.id, b)))
+  }),
+)
+
+router.delete(
+  '/stock-alerts/:id',
+  asyncHandler(async (req, res) => {
+    await tx((c) => cancelAlert(c, req.customer.id, req.params.id))
+    res.status(204).end()
+  }),
+)
 
 // ---------------------------------------------------------------- saved addresses
 
@@ -365,67 +424,13 @@ router.delete(
 )
 
 /**
- * Deletes the account (DPDP Act): name, phone, email and addresses are
- * removed from the account, its orders, bookings and claims. Orders keep
- * their amounts for the books. Not while an order or booking is still open.
+ * Deletes the account (DPDP Act, privacy.js). Not while an order or booking
+ * is still open or money is still owed back to the customer.
  */
 router.delete(
   '/me',
   asyncHandler(async (req, res) => {
-    const photos = await tx(async (c) => {
-      const { rows } = await c.query('SELECT id, phone FROM customers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [req.customer.id])
-      if (!rows.length) throw notFound('Customer not found')
-      const me = rows[0]
-      const open = await c.query(
-        `SELECT 1 FROM orders WHERE customer_id = $1
-            AND (status NOT IN ('DELIVERED', 'CANCELLED', 'RTO') OR (refund_requested_at IS NOT NULL AND refunded_at IS NULL))
-         UNION ALL
-         SELECT 1 FROM preorders WHERE customer_id = $1 AND status IN ('PAYMENT_PENDING', 'BOOKED', 'WAITLISTED')
-         LIMIT 1`,
-        [me.id],
-      )
-      if (open.rowCount) throw conflict('You have an order or booking that is not finished yet. Cancel it, or wait until it is delivered, then delete your account.', 'OPEN_ORDERS')
-      await c.query(
-        `UPDATE orders SET customer_name = NULL, phone = NULL, delivery_address = NULL,
-                gift_recipient_name = NULL, gift_recipient_phone = NULL, gift_message = NULL WHERE customer_id = $1`,
-        [me.id],
-      )
-      await c.query(
-        `UPDATE delivery_attempts SET received_by = NULL, note = NULL, lat = NULL, lng = NULL
-          WHERE order_id IN (SELECT id FROM orders WHERE customer_id = $1)`,
-        [me.id],
-      )
-      const deliveryPics = await c.query(
-        `SELECT blob_path FROM delivery_photos WHERE order_id IN (SELECT id FROM orders WHERE customer_id = $1) AND removed_at IS NULL FOR UPDATE`,
-        [me.id],
-      )
-      await c.query(
-        `UPDATE delivery_photos SET removed_at = $2, bytes = NULL, blob_path = NULL
-          WHERE order_id IN (SELECT id FROM orders WHERE customer_id = $1) AND removed_at IS NULL`,
-        [me.id, now()],
-      )
-      await c.query(`UPDATE preorders SET customer_name = NULL, phone = '', delivery_address = '' WHERE customer_id = $1`, [me.id])
-      await c.query(`UPDATE claims SET description = '(removed when the account was deleted)', photo_url = NULL WHERE customer_id = $1`, [me.id])
-      await c.query(
-        `UPDATE notifications SET phone = '', status = CASE WHEN status = 'PENDING' THEN 'SKIPPED' ELSE status END
-          WHERE order_id IN (SELECT id FROM orders WHERE customer_id = $1)`,
-        [me.id],
-      )
-      const pics = await c.query('DELETE FROM claim_photos WHERE customer_id = $1 RETURNING blob_path', [me.id])
-      await c.query('DELETE FROM customer_addresses WHERE customer_id = $1', [me.id])
-      await c.query('UPDATE order_ratings SET comment = NULL WHERE customer_id = $1', [me.id])
-      await c.query('DELETE FROM carts WHERE customer_id = $1', [me.id])
-      await c.query('DELETE FROM quotes WHERE customer_id = $1', [me.id])
-      await c.query('DELETE FROM wa_sessions WHERE customer_id = $1', [me.id])
-      if (me.phone) {
-        await c.query('DELETE FROM otps WHERE phone = $1', [me.phone])
-        await c.query('DELETE FROM wa_inbound WHERE phone = $1', [me.phone])
-        await c.query(`DELETE FROM rate_limits WHERE key LIKE $1`, [`otp-phone-day:${me.phone}:%`])
-      }
-      await c.query("UPDATE refresh_sessions SET revoked_at = $2 WHERE user_id = $1 AND user_type = 'customer' AND revoked_at IS NULL", [me.id, now()])
-      await c.query('UPDATE customers SET phone = NULL, name = NULL, email = NULL, google_sub = NULL, deleted_at = $2 WHERE id = $1', [me.id, now()])
-      return [...pics.rows, ...deliveryPics.rows]
-    })
+    const photos = await tx((c) => eraseCustomer(c, req.customer.id))
     for (const p of photos) await dropPhoto(p)
     logger.info({ customerId: req.customer.id }, 'customer deleted their account')
     res.clearCookie(RT_COOKIE, rtCookie())
@@ -445,7 +450,8 @@ router.post(
   '/me/phone/request',
   otpLimiter,
   asyncHandler(async (req, res) => {
-    const { phone, channel } = parse(z.object({ phone: phoneSchema, channel: z.enum(['sms', 'whatsapp']).optional() }), req.body)
+    const { phone, channel, captchaToken } = parse(otpRequest, req.body)
+    await requireHuman(captchaToken, req.ip)
     res.json(await issueCode(phone, channel))
   }),
 )
@@ -598,6 +604,23 @@ async function quoteSlot(c, date, wanted, boxes) {
   return { id: s.id, label: s.label, startsAt: s.startsAt, endsAt: s.endsAt }
 }
 
+/** The same request, whatever the key order: a retry must send what the first try sent. */
+const stable = (v) => (Array.isArray(v) ? v.map(stable) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, stable(v[k])])) : v)
+const requestHash = (body) => createHash('sha256').update(JSON.stringify(stable(body))).digest('hex')
+
+/**
+ * What an earlier request with this key made, or null. The same key with a
+ * different body is a client bug (or a reused key): refused, not replayed.
+ */
+async function replayFor(key, hash, table) {
+  const { rows } = await query(`SELECT k.request_hash AS idem_hash, t.* FROM idempotency_keys k JOIN ${table} t ON t.id = k.order_id WHERE k.key = $1`, [key])
+  const r = rows[0]
+  if (r?.idem_hash && r.idem_hash !== hash) {
+    throw new HttpError(422, 'IDEMPOTENCY_KEY_REUSED', 'This request does not match the one first sent with this Idempotency-Key. Use a new key for a new order.')
+  }
+  return r ?? null
+}
+
 const confirmResponse = (o) => ({
   orderId: o.id, number: o.number, status: o.status, total: o.total, deliveryDate: o.delivery_date, slotId: o.slot_id ?? null,
   razorpayOrderId: o.razorpay_order_id, razorpayKeyId: env.RAZORPAY_KEY_ID || null, holdExpiresAt: o.hold_expires_at,
@@ -625,16 +648,14 @@ router.post(
       req.body,
     )
     const key = `${req.customer.id}:${rawKey}`
-    const existing = async () => {
-      const { rows } = await query('SELECT o.* FROM idempotency_keys k JOIN orders o ON o.id = k.order_id WHERE k.key = $1', [key])
-      return rows[0] ?? null
-    }
+    const hash = requestHash(b)
+    const existing = () => replayFor(key, hash, 'orders')
     const replay = await existing()
     if (replay) return res.status(200).json(confirmResponse(replay))
 
     const order = await tx(async (c) => {
       // Claimed first: a concurrent retry with the same key waits here, then replays.
-      const ins = await c.query('INSERT INTO idempotency_keys (key, order_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [key, 'pending', now()])
+      const ins = await c.query('INSERT INTO idempotency_keys (key, order_id, created_at, request_hash) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING', [key, 'pending', now(), hash])
       if (!ins.rowCount) return null
       const { rows } = await c.query('SELECT * FROM quotes WHERE id = $1 AND customer_id = $2 FOR UPDATE', [b.quoteId, req.customer.id])
       const q = rows[0]
@@ -720,7 +741,7 @@ router.get(
       gift: o.gift_recipient_name ? { recipientName: o.gift_recipient_name, recipientPhone: o.gift_recipient_phone, message: o.gift_message } : null,
       refundStatus: o.refunded_at ? 'REFUNDED' : o.refund_requested_at ? 'PENDING' : null, razorpayOrderId: o.razorpay_order_id,
       holdExpiresAt: o.hold_expires_at,
-      items: items.rows.map((i) => ({ sku: i.sku, name: findProduct(i.sku)?.name ?? i.sku, stage: i.stage, quantity: i.quantity, unitPrice: i.unit_price, linePrice: i.line_price, eatBy: i.stage ? eatByFor(i.stage, o.delivery_date) : null })),
+      items: items.rows.map((i) => ({ sku: i.sku, name: findProduct(i.sku)?.name ?? i.sku, stage: i.stage, quantity: i.quantity, unitPrice: i.unit_price, linePrice: i.line_price, eatBy: i.stage ? eatByFor(i.stage, o.delivery_date) : null, readyOn: i.stage ? readyOnFor(i.stage, o.delivery_date) : null })),
       timeline: events.rows.map((e) => ({ status: e.status, at: e.created_at })),
       ...proof,
     })
@@ -805,11 +826,12 @@ router.post(
       req.body,
     )
     const key = `${req.customer.id}:pre:${rawKey}`
-    const existing = async () => (await query('SELECT p.* FROM idempotency_keys k JOIN preorders p ON p.id = k.order_id WHERE k.key = $1', [key])).rows[0] ?? null
+    const hash = requestHash(b)
+    const existing = () => replayFor(key, hash, 'preorders')
     const replay = await existing()
     if (replay) return res.status(200).json(preorderView(replay))
     const pre = await tx(async (c) => {
-      const ins = await c.query('INSERT INTO idempotency_keys (key, order_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [key, 'pending', now()])
+      const ins = await c.query('INSERT INTO idempotency_keys (key, order_id, created_at, request_hash) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING', [key, 'pending', now(), hash])
       if (!ins.rowCount) return null
       if (b.name) await c.query('UPDATE customers SET name = $2 WHERE id = $1', [req.customer.id, b.name])
       const cust = await requirePhone(c, req.customer.id)
@@ -906,6 +928,15 @@ router.post(
       if (bad) throw badRequest(`${bad} is not in this order`, 'INVALID_SKU')
       const open = await c.query(`SELECT 1 FROM claims WHERE order_id = $1 AND status <> 'RESOLVED'`, [b.orderId])
       if (open.rowCount) throw conflict('A claim for this order is already open')
+      const replaced = await c.query(`SELECT 1 FROM claims WHERE order_id = $1 AND resolution = 'REPLACEMENT_APPROVED'`, [b.orderId])
+      if (replaced.rowCount) throw conflict('This order was already replaced. For a problem with the replacement, raise a claim on that order.', 'ALREADY_REPLACED')
+      // More than a few claims a month is unusual: those go to a person, not the form.
+      const recent = await c.query('SELECT COUNT(*)::int AS n FROM claims WHERE customer_id = $1 AND created_at >= $2', [
+        req.customer.id, new Date(now().getTime() - 30 * 86_400_000),
+      ])
+      if (recent.rows[0].n >= MAX_CLAIMS_PER_MONTH) {
+        throw new HttpError(429, 'CLAIM_LIMIT', `You have raised ${recent.rows[0].n} claims this month. Please message us on WhatsApp and we'll sort it out with you.`)
+      }
       const id = newId('clm')
       await c.query(
         `INSERT INTO claims (id, order_id, customer_id, issue_type, description, affected_items, photo_url, created_at)

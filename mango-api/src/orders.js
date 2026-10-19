@@ -1,17 +1,19 @@
 // Order lifecycle: placing, paying, rebalancing, packing, delivering and
-// cancelling. MandiMangoes never refunds: when stock goes bad the engine swaps it,
-// moves the order to the next date with stock, or flags it at-risk for ops.
+// cancelling. When stock goes bad the engine swaps it, moves the order to the
+// next date with stock, or flags it at-risk for ops. Problems with delivered
+// fruit end in a replacement, never a refund. Money goes back in two cases
+// only: the customer cancels a paid order before packing, or a manager cancels
+// a paid order we can't deliver.
 import { randomInt } from 'node:crypto'
 import { configVersion, getConfig } from './config.js'
 import { addDays, diffDays, now } from './clock.js'
 import { checkCapacity, chooseSlot, earliestDeliveryDate, nextDeliveryDay, orderableDates } from './delivery.js'
-import { badRequest, conflict, HttpError, notFound, StockError } from './errors.js'
+import { badRequest, conflict, forbidden, HttpError, notFound, StockError } from './errors.js'
 import { newId } from './ids.js'
 import { allocate, commitHeld, ledger, lineInfo, pack, release, restock, sellableAs } from './inventory.js'
 import { logger } from './logger.js'
 import { metrics } from './metrics.js'
 import { enqueue, enqueueForEvent } from './notify.js'
-import { eatingWindow } from './stage.js'
 
 /** Orders that still own stock and can be rebalanced. */
 export const OPEN_STATUSES = ['PAYMENT_PENDING', 'CONFIRMED', 'PROCESSING', 'PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERY_FAILED']
@@ -31,6 +33,8 @@ const ADMIN_CANCELLABLE = ['PAYMENT_PENDING', 'CONFIRMED', 'PROCESSING', 'PACKED
 /** Boxes not yet handed to the courier go back on the shelf when cancelled. */
 const RESTOCKABLE = ['PROCESSING', 'PACKED']
 const CUSTOMER_CANCELLABLE = ['PAYMENT_PENDING', 'CONFIRMED', 'PROCESSING']
+/** A paid order a manager may cancel with a full refund: anything not yet delivered, including failed and returned deliveries. */
+export const MANAGER_REFUNDABLE = [...ADMIN_CANCELLABLE, 'DELIVERY_FAILED', 'RTO']
 
 export const SYSTEM = { type: 'system', id: 'system' }
 /** Missed deliveries before an order stops being rescheduled automatically. */
@@ -299,14 +303,14 @@ export async function processPayment(c, { orderId, outcome, paymentId = null, am
     return { order: o, result: 'attempt_failed' }
   }
 
-  if (o.status === 'CANCELLED' && o.customer_cancelled_at) {
-    // Paid after the customer cancelled: keep it cancelled and refund the payment.
+  if (o.status === 'CANCELLED' && (o.customer_cancelled_at || o.staff_cancelled_at)) {
+    // Paid after the customer or staff cancelled: keep it cancelled and refund the payment.
     await c.query(
       `UPDATE orders SET payment_status = 'SUCCEEDED', payment_id = COALESCE($2, payment_id), payment_method = COALESCE($3, payment_method),
               payment_amount = COALESCE($4, payment_amount), refund_requested_at = $5 WHERE id = $1`,
       [o.id, paymentId, method, amount, now()],
     )
-    await addEvent(c, o.id, 'CANCELLED', 'CANCELLED', actor, 'Payment arrived after the customer cancelled; full refund requested')
+    await addEvent(c, o.id, 'CANCELLED', 'CANCELLED', actor, `Payment arrived after the ${o.customer_cancelled_at ? 'customer' : 'shop'} cancelled; full refund requested`)
     return { order: o, result: 'refund_due' }
   }
 
@@ -368,12 +372,31 @@ async function cancelInTx(c, o, actor, reason, paymentStatus = null) {
   await addEvent(c, o.id, o.status, 'CANCELLED', actor, reason)
 }
 
-/** Admin cancel. Payment is left as it is: MandiMangoes does not refund. */
-export async function cancelOrder(c, orderId, actor, reason) {
+/**
+ * Staff cancel. An unpaid order is simply cancelled (any staff who can open
+ * orders). A paid order can only be cancelled by a manager, and only with a
+ * full refund (`refund: true` confirms it): a customer who paid for fruit we
+ * can't deliver (at-risk, a short truck, three missed deliveries, returned)
+ * gets their money back. The refund is requested here and sent after commit
+ * (payments.js refundOrder). Returns true when a refund is due.
+ */
+export async function cancelOrder(c, orderId, actor, reason, { manager = false, refund = false } = {}) {
   const o = await lockOrder(c, orderId)
   if (o.status === 'CANCELLED') throw conflict('This order is already cancelled')
-  if (!ADMIN_CANCELLABLE.includes(o.status)) throw badRequest(`A ${o.status} order cannot be cancelled`, 'INVALID_TRANSITION')
-  await cancelInTx(c, o, actor, reason)
+  const paid = o.payment_status === 'SUCCEEDED'
+  if (paid) {
+    if (!manager) throw forbidden('Only a manager can cancel a paid order, because it is refunded in full')
+    if (!MANAGER_REFUNDABLE.includes(o.status)) throw badRequest(`A ${o.status} order cannot be cancelled`, 'INVALID_TRANSITION')
+    if (!refund) throw conflict('This order is paid: cancelling it refunds the customer in full. Confirm the refund to go ahead.', 'REFUND_REQUIRED')
+  } else if (!ADMIN_CANCELLABLE.includes(o.status)) {
+    throw badRequest(`A ${o.status} order cannot be cancelled`, 'INVALID_TRANSITION')
+  }
+  await cancelInTx(c, o, actor, paid ? `Cancelled by a manager with a full refund: ${reason}` : reason)
+  await c.query(
+    `UPDATE orders SET staff_cancelled_at = $2, refund_requested_at = CASE WHEN $3 THEN $2 ELSE refund_requested_at END WHERE id = $1`,
+    [o.id, now(), paid],
+  )
+  return paid
 }
 
 /**
@@ -564,4 +587,4 @@ export async function sweepExpiredHolds(c, at = now()) {
   return n
 }
 
-export const eatByFor = (stage, date) => eatingWindow(stage, date).eatBy
+export { eatByFor } from './ripeness.js'

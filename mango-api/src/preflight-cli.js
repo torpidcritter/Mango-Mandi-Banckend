@@ -4,7 +4,7 @@
 // keys and the WhatsApp number against their APIs (read-only calls).
 process.env.PREFLIGHT = '1'
 
-const { env, isProd } = await import('./env.js')
+const { deployEnv, env, isProd } = await import('./env.js')
 const { checkProduction } = await import('./preflight.js')
 const { query, closePool } = await import('./db.js')
 const { checkDatabaseEnvironment } = await import('./migrate.js')
@@ -18,7 +18,7 @@ try {
   await query('SELECT 1')
   ok.push('Database reachable')
   const tables = (await query("SELECT to_regclass('public.schema_migrations') AS t")).rows[0].t
-  const bootstrap = Boolean(env.ADMIN_BOOTSTRAP_EMAIL && env.ADMIN_BOOTSTRAP_PASSWORD)
+  const bootstrap = deployEnv === 'preview' ? Boolean(env.PREVIEW_ADMIN_EMAIL && env.PREVIEW_ADMIN_PASSWORD) : Boolean(env.ADMIN_BOOTSTRAP_EMAIL && env.ADMIN_BOOTSTRAP_PASSWORD)
   if (!tables) {
     if (bootstrap) ok.push('Empty database: the first start creates the tables and the first manager')
     else errors.push('Empty database and no ADMIN_BOOTSTRAP_EMAIL/ADMIN_BOOTSTRAP_PASSWORD: nobody could sign in to the panel')

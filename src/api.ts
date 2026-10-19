@@ -235,6 +235,8 @@ export const api = {
   summary: () => request<Summary>('GET', '/summary'),
   attention: () => request<Attention>('GET', '/attention'),
   retryMessage: (notificationId: string) => request<void>('POST', `/notifications/${id(notificationId)}/retry`),
+  /** Signs off a photo delivery, or flags it as doubtful (with a note) for a call to the customer. */
+  reviewDelivery: (attemptId: string, ok: boolean, note?: string) => request<void>('POST', `/delivery-reviews/${id(attemptId)}`, { ok, note }),
   products: () => request<Product[]>('GET', '/products'),
   addProduct: (p: ProductInput & { sku: string }) => request<Product>('POST', '/products', p),
   updateProduct: (sku: string, patch: Partial<ProductInput> & { active?: boolean }) => request<Product>('PATCH', `/products/${id(sku)}`, patch),
@@ -275,8 +277,9 @@ export const api = {
   setOrderStatus: (orderId: string, status: OrderStatus) =>
     request<void>('PATCH', `/orders/${id(orderId)}/status`, { status }),
   allocate: (orderId: string) => request<void>('POST', `/orders/${id(orderId)}/allocate`),
-  cancelOrder: (orderId: string, reason: string) =>
-    request<void>('POST', `/orders/${id(orderId)}/cancel`, { reason }),
+  /** A paid order can only be cancelled by a manager, with a full refund (refund: true). */
+  cancelOrder: (orderId: string, reason: string, refund = false) =>
+    request<void>('POST', `/orders/${id(orderId)}/cancel`, { reason, refund }),
   /** Moves a confirmed order to another bookable date that has stock (409 if it doesn't), optionally into a slot. */
   rescheduleOrder: (orderId: string, deliveryDate: string, slotId?: string | null) =>
     request<void>('POST', `/orders/${id(orderId)}/reschedule`, slotId ? { deliveryDate, slotId } : { deliveryDate }),
@@ -348,6 +351,9 @@ export const api = {
   clearCalendarDay: (date: string) => request<void>('DELETE', `/calendar/${id(date)}`),
   preorders: (status?: PreorderStatus | null) => request<Preorder[]>('GET', `/preorders${qs({ status })}`),
   preorderCapacity: () => request<PreorderCapacity[]>('GET', '/preorder-capacity'),
+  /** Manager only: cancels a booking we can't fill; a paid one is refunded in full. */
+  cancelPreorder: (preorderId: string, reason: string) =>
+    request<{ refunded: boolean }>('POST', `/preorders/${id(preorderId)}/cancel`, { reason }),
   setPreorderCapacity: (weekStart: string, sku: string, capacity: number) =>
     request<unknown>('PUT', `/preorder-capacity/${id(weekStart)}/${id(sku)}`, { capacity }),
   slots: () => request<DeliverySlot[]>('GET', '/slots'),

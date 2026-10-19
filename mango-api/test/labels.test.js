@@ -173,7 +173,7 @@ describe('box labels', () => {
     const aId = (await query('SELECT id FROM orders WHERE number = $1', [la.orderNumber])).rows[0].id
     const bId = aId === a.id ? b.id : a.id
 
-    assert.equal((await api.post(`/admin/v1/orders/${bId}/cancel`, { reason: 'Customer called' }, { token: admin })).status, 204)
+    assert.equal((await api.post(`/admin/v1/orders/${bId}/cancel`, { reason: 'Customer called', refund: true }, { token: admin })).status, 204)
     const cancelled = await pack(bId, lb.token)
     assert.deepEqual([cancelled.status, cancelled.body.error.code], [409, 'ORDER_CANCELLED'])
 

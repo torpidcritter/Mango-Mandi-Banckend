@@ -23,7 +23,7 @@ import { HttpError, notFound } from './errors.js'
 import { newId } from './ids.js'
 import { allocateOrder, setOrderStatus } from './orders.js'
 import { findProduct, productName } from './products.js'
-import { eatingWindow } from './stage.js'
+import { eatByFor, readyOnFor } from './ripeness.js'
 
 const KEY_BYTES = 16
 const TAG_BYTES = 10
@@ -200,7 +200,8 @@ const shortDate = (d) => new Date(`${d}T00:00:00Z`).toLocaleDateString('en-IN', 
 /** Everything printed on one label. No name, phone or address. */
 export function labelContent(l, { number, slotLabel, pluckedOn }) {
   const p = findProduct(l.sku)
-  const { readyFrom, eatBy } = eatingWindow(l.stage, l.delivery_date)
+  const readyFrom = readyOnFor(l.stage, l.delivery_date)
+  const eatBy = eatByFor(l.stage, l.delivery_date)
   return {
     id: l.id,
     code: `${number}-${l.box_no}`,
@@ -580,7 +581,8 @@ export async function publicBox(c, token) {
   const l = rows[0]
   if (!l || l.voided_at) return none
   const p = findProduct(l.sku)
-  const { readyFrom, eatBy } = eatingWindow(l.stage, l.delivery_date)
+  const readyFrom = readyOnFor(l.stage, l.delivery_date)
+  const eatBy = eatByFor(l.stage, l.delivery_date)
   return {
     found: true,
     productName: productName(l.sku),

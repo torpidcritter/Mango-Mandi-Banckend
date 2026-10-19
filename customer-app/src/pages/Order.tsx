@@ -238,6 +238,7 @@ function OrderView({ order }: { order: Order }) {
                 {i.stage && (
                   <span className="muted small">
                     {STAGE_LABEL[i.stage]}
+                    {i.readyOn && i.readyOn !== order.deliveryDate && ` · ready to eat around ${day(i.readyOn)}`}
                     {i.eatBy && ` · eat by ${day(i.eatBy)}`}
                   </span>
                 )}

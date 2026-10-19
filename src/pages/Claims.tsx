@@ -94,9 +94,32 @@ function ClaimCard({ claim, onResolve }: { claim: Claim; onResolve: () => void }
           </button>
         )}
       </div>
+      {!!claim.managerNeeded?.length && (
+        <p className="notice notice-warn" role="note">
+          A manager has to approve a replacement: {claim.managerNeeded.join(', and ')}.
+        </p>
+      )}
       <dl className="kv">
         <dt>Phone</dt>
         <dd>{claim.customerPhone ?? '—'}</dd>
+        {claim.history && (
+          <>
+            <dt>Last 90 days</dt>
+            <dd>
+              {claim.history.claims90d} other claim{claim.history.claims90d === 1 ? '' : 's'}, {claim.history.replacements90d} replaced
+            </dd>
+          </>
+        )}
+        {claim.delivery !== undefined && (
+          <>
+            <dt>Delivered</dt>
+            <dd>
+              {claim.delivery
+                ? `${{ code: "with the customer's code", photo: 'with a photo', staff: 'marked by staff, no proof' }[claim.delivery.method]}, ${dateTime(claim.delivery.at)}`
+                : 'No delivery record'}
+            </dd>
+          </>
+        )}
         <dt>Order total</dt>
         <dd>{rupees(claim.orderTotal)}</dd>
         <dt>Affected items</dt>

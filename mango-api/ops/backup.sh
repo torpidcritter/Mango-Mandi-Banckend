@@ -10,6 +10,14 @@ RETAIN_DAYS="${RETAIN_DAYS:-14}"
 mkdir -p "$BACKUP_DIR"
 file="$BACKUP_DIR/mango-$(date -u +%Y%m%dT%H%M%SZ).dump"
 pg_dump --format=custom --no-owner --no-privileges --file="$file.part" "$DATABASE_URL"
-mv "$file.part" "$file"
-find "$BACKUP_DIR" -name 'mango-*.dump' -mtime +"$RETAIN_DAYS" -delete
+# The dump holds customers' names, phones and addresses. With a GPG public key
+# imported, it is encrypted so only the holder of the private key can read it.
+if [ -n "${BACKUP_GPG_RECIPIENT:-}" ]; then
+  gpg --batch --yes --trust-model always --recipient "$BACKUP_GPG_RECIPIENT" --output "$file.gpg" --encrypt "$file.part"
+  rm -f "$file.part"
+  file="$file.gpg"
+else
+  mv "$file.part" "$file"
+fi
+find "$BACKUP_DIR" -name 'mango-*.dump*' -mtime +"$RETAIN_DAYS" -delete
 echo "backup written: $file ($(du -h "$file" | cut -f1))"

@@ -119,7 +119,8 @@ The `Deploy` GitHub Action deploys `main` after CI passes on it, and can be run 
 | Restart the API | `docker compose restart api` |
 | Database shell | `docker compose exec db psql -U mango mango` |
 
-**Backups.** The `backup` service writes `deploy/backups/mango-*.dump` daily. A backup on
+**Backups.** The `backup` service writes `deploy/backups/mango-*.dump` daily (set
+`BACKUP_GPG_RECIPIENT` to encrypt them; they hold customers' personal details). A backup on
 the same server is lost with the server, so copy them off it every night. For example,
 use `rclone` to object storage in a cron job:
 `0 3 * * * rclone copy ~/mandimangoes/deploy/backups remote:mandimangoes-backups`.
@@ -132,5 +133,8 @@ Prove the backups work once a month with
 `api:3000/metrics` from inside the server; Caddy keeps `/metrics` off the internet.
 
 **Rolling back a migration.** Migrations only move forward. Going back to an older commit
-keeps the newer tables, which older code ignores. If a migration itself is wrong, restore
-the last backup (see `restore-check.sh`) instead.
+keeps the newer tables, which older code ignores. If a migration itself is wrong, prefer a
+new migration that repairs it. Restoring a backup loses every order, payment and account
+deletion since the backup while Razorpay keeps the money, so after any restore run
+`ops/replay-payments.js` and `ops/reapply-deletions.js` (see
+[VERCEL.md, Rolling back](VERCEL.md#rolling-back)).

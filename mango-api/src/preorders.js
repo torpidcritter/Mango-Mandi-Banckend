@@ -15,7 +15,7 @@ import { badRequest, conflict, HttpError, notFound } from './errors.js'
 import { newId } from './ids.js'
 import { logger } from './logger.js'
 import { enqueuePreorder } from './notify.js'
-import { createOrder, customerCancel, recordDuplicatePayment, SYSTEM } from './orders.js'
+import { cancelOrder, createOrder, customerCancel, recordDuplicatePayment, SYSTEM } from './orders.js'
 import { claimRefund, createPaymentLink, fetchLinkPayments, gatewayRefund, refundOrder } from './payments.js'
 import { findProduct, sellable } from './products.js'
 
@@ -156,12 +156,12 @@ export async function processPreorderPayment(c, { preorderId, outcome, paymentId
   }
   if (outcome !== 'captured') return 'ignored' // a link can be paid again after a failed attempt
   const paid = [paymentId, method, amount ?? p.total, now()]
-  if (p.status === 'CANCELLED' && p.customer_cancelled_at) {
+  if (p.status === 'CANCELLED' && (p.customer_cancelled_at || p.staff_cancelled_at)) {
     await c.query(
       `UPDATE preorders SET payment_status = 'SUCCEEDED', payment_id = $2, payment_method = $3, paid_amount = $4, refund_requested_at = $5 WHERE id = $1`,
       [p.id, ...paid],
     )
-    await event(c, p.id, 'CANCELLED', actor, 'Paid after the customer cancelled; full refund requested')
+    await event(c, p.id, 'CANCELLED', actor, `Paid after the ${p.customer_cancelled_at ? 'customer' : 'shop'} cancelled; full refund requested`)
     return 'refund_due'
   }
   if (p.status !== 'PAYMENT_PENDING' && p.status !== 'CANCELLED') return 'ignored'
@@ -198,6 +198,32 @@ export async function cancelPreorder(c, id, customerId, actor) {
     [p.id, now(), paid],
   )
   await event(c, p.id, 'CANCELLED', actor, paid ? 'Cancelled by customer; full refund requested' : 'Cancelled by customer')
+  return { refund: paid ? 'preorder' : null, id: p.id }
+}
+
+/**
+ * Manager cancel, for a booking we can't fill (crop failure, season end, a
+ * week we close). The capacity is freed and a paid booking is refunded in
+ * full; a booking already turned into an order is cancelled as a paid order
+ * (also refunded). Returns { refund: 'preorder' | 'order' | null, id }.
+ */
+export async function staffCancelPreorder(c, id, actor, reason) {
+  const p = await lock(c, id)
+  if (p.status === 'CANCELLED') throw conflict('This preorder is already cancelled')
+  if (p.status === 'CONVERTED') {
+    const refund = await cancelOrder(c, p.order_id, actor, reason, { manager: true, refund: true })
+    await event(c, p.id, 'CONVERTED', actor, `Its order was cancelled by a manager: ${reason}`)
+    return { refund: refund ? 'order' : null, id: p.order_id }
+  }
+  if (p.status !== 'WAITLISTED') await release(c, p)
+  const paid = p.payment_status === 'SUCCEEDED'
+  await c.query(
+    `UPDATE preorders SET status = 'CANCELLED', hold_expires_at = NULL, staff_cancelled_at = $2,
+            payment_status = CASE WHEN payment_status = 'INITIATED' THEN 'CANCELLED' ELSE payment_status END,
+            refund_requested_at = CASE WHEN $3 THEN $2 ELSE refund_requested_at END WHERE id = $1`,
+    [p.id, now(), paid],
+  )
+  await event(c, p.id, 'CANCELLED', actor, paid ? `Cancelled by a manager with a full refund: ${reason}` : `Cancelled by a manager: ${reason}`)
   return { refund: paid ? 'preorder' : null, id: p.id }
 }
 

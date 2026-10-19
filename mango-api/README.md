@@ -70,6 +70,9 @@ named `WHATSAPP_TEMPLATE_PREFIX` + kind (default prefix `mandi_`), in `WHATSAPP_
 | `mandi_preorder_booked` | a preorder is paid | name, preorder number, boxes ("2 × Alphonso 3kg Box"), week ("the week of Mon, 1 Mar") |
 | `mandi_preorder_spot_open` | a waitlist spot opens | name, boxes, week, payment link |
 | `mandi_preorder_moved` | a week passed without stock, so the preorder moved a week | name, preorder number, boxes, new week |
+| `mandi_ripeness_guide` | a minute after `order_confirmed` or `replacement_confirmed`, only when a box arrives raw or semi-ripe (utility) | name, order number, when each box is ready ("Alphonso 3kg Box (raw): ready around Mon, 19 Oct"), storage tip |
+| `mandi_back_in_stock` | a box the customer asked about is in stock again (they tapped "Tell me when it's back") | name, box ("Alphonso 3kg Box (ripe)"), first day ("Fri, 16 Oct"), shop link |
+| `mandi_reorder_reminder` | a week after a delivery, only for customers who turned reminders on, between 10 AM and 7 PM, not if they ordered since (marketing) | name, box they had, shop link |
 
 An order without a slot says "during the day" in place of the slot.
 
@@ -108,6 +111,23 @@ deduplicated by id, so Meta's retries are safe.
 and address, then pay by Razorpay link. A full week offers the waitlist instead (no
 payment until a spot opens). Bookings show in My orders and can be cancelled there for a
 full refund until packing.
+
+## After the order: ripeness guide, alerts, reminders
+
+- **Ripeness guide.** A minute after the confirmation, an order with a raw or semi-ripe box gets
+  `mandi_ripeness_guide`: the day each box will be ready to eat (raw +5 days, semi-ripe +2 from
+  the delivery date, the same days the eat-by date assumes) and how to keep them. Ripe-only orders skip it. The shop's order page shows
+  the same "ready to eat around" date.
+- **Back in stock.** A box sold out on every open day shows "Tell me when it's back" in the shop
+  (signed in). The alert lasts 14 days, at most 10 open per customer, one per box and ripeness.
+  The background loop checks open alerts every run and sends `mandi_back_in_stock` once, with
+  the first day it can be delivered. Customers see and stop alerts on the Account page
+  (`GET/POST/DELETE /v1/stock-alerts`).
+- **Reorder reminder.** Off by default. A customer turns it on under Account > WhatsApp messages
+  (`PATCH /v1/me {remindersOptIn}`). Seven days after a delivery, between 10 AM and 7 PM IST,
+  they get `mandi_reorder_reminder`, unless they ordered again since. One per order.
+
+Deleting an account cancels its alerts and turns reminders off.
 
 ## Promo codes and gifts
 
@@ -175,10 +195,18 @@ else. A packer, operator or manager can do the same steps.
 - **Delivery code.** Going out for delivery gives the order a 4-digit code. The customer sees it
   in the app and in the `mandi_out_for_delivery` WhatsApp message, and reads it to the rider. A
   retry keeps the same code. Five wrong codes lock it (`CODE_LOCKED`); then the rider uses a photo.
+  For a gift, the recipient gets the same message with the code (kind `GIFT_OUT_FOR_DELIVERY`,
+  sent with the `mandi_out_for_delivery` template and the recipient's name), since they are the
+  one at the door.
 - **Delivered.** `POST /orders/:id/delivery` `{outcome: 'DELIVERED', code}`, or with
   `photoId` and `receivedBy` ("Security at the gate") when nobody can give the code. Photos are
   uploaded first as the raw body of `POST /orders/:id/delivery-photos` (JPEG, PNG or WebP, 2 MB
   at most; the panel shrinks them to about 150 KB) and kept in `delivery_photos`.
+- **Photo deliveries are checked.** A delivery proven only by a photo waits in Needs attention
+  (`GET /admin/v1/delivery-reviews`) until someone other than the rider marks it right, or
+  doubtful with a note (`POST /admin/v1/delivery-reviews/:id {ok, note}`), which goes on the
+  order history so someone calls the customer. A photo after wrong codes, or with no location,
+  is flagged.
 - **Missed.** `{outcome: 'FAILED', reason}` with `NOT_HOME`, `UNREACHABLE`, `WRONG_ADDRESS`,
   `REFUSED` or `OTHER` (plus a `note`), optionally a photo. The order moves to the next delivery
   day as before, with the reason on the order.
@@ -190,7 +218,7 @@ else. A packer, operator or manager can do the same steps.
 ## Box labels and scanning
 
 Off until a manager ticks "Print box labels" under Planning, Selling rules (`rules.labels`).
-Code: `src/labels.js`; tables `box_labels` and `label_scans` (migration 019).
+Code: `src/labels.js`; tables `box_labels` and `label_scans` (migration 021).
 
 - **One label per box.** `POST /admin/v1/labels/print` `{date, slotId}` or `{orderIds}`
   returns a printable page sized by `labels.widthMm` x `labels.heightMm` (default 50 x 75 mm
@@ -241,10 +269,16 @@ The two specs split the work: the technical plan fixes the API contract, and the
 *Backend Architecture and Edge-Case Playbook* fixes the engine. The business rules
 below override both.
 
-- **No refunds, only replacements, with one exception.** A claim resolves as
-  `REPLACEMENT_APPROVED` (a free replacement order on the earliest date with stock) or
-  `REJECTED`, and staff have no refund action. The exception (user decision): a customer
-  who cancels a paid order gets a full refund through Razorpay.
+- **No refunds for problems with delivered fruit, only replacements.** A claim resolves
+  as `REPLACEMENT_APPROVED` (a free replacement order on the earliest date with stock) or
+  `REJECTED`. Money goes back in full in two cases only: a customer cancels a paid order
+  before packing, or a **manager** cancels a paid order or booking that we can't deliver
+  (a short truck, a third missed delivery, an at-risk order, a crop failure for a
+  booking). The panel asks the manager to confirm the refund; operators can't do it.
+- **Claim limits.** A customer can raise 3 claims in 30 days from the app (then they are
+  asked to message us), and an order already replaced can't be claimed again. A
+  replacement needs a manager when the customer had 2 or more in 90 days, or when they
+  say "not delivered" on an order their own delivery code confirmed.
 - **Ripeness comes from age on the delivery date.** Day of pluck is age 0. By default
   a batch sells as raw at age 3, semi-ripe at 4–5 and ripe at 6–7. The latest QC reading
   shifts a batch by up to a day (QC'd ripe while the profile expected semi-ripe = a fast
@@ -279,8 +313,9 @@ below override both.
   after, and retried by the maintenance loop until it lands (it checks for an existing
   refund first, so retries never pay twice). A payment that arrives after the customer
   cancelled is refunded too, and a replayed payment can't revive the order. Staff can
-  cancel up to out-for-delivery without a refund; boxes not yet shipped go back on the
-  shelf.
+  cancel an unpaid order up to out-for-delivery; a paid one needs a manager and is
+  refunded in full. A payment that lands after a staff cancel is refunded, not
+  revived. Boxes not yet shipped go back on the shelf.
 
 - **Customers can move their own order** to another open day (and slot) while it is
   confirmed and not yet being packed, if that day has stock at the ripeness they chose.
@@ -339,10 +374,14 @@ WhatsApp updates, prune expired OTPs, quotes, idempotency keys, webhooks, sessio
 rate-limit counters, and retire batches at age 8. A run has a 45-second budget (Vercel
 stops functions at 60): each loop checks the time before a slow call and leaves the
 rest for the next minute, and the full order re-check saves where it stopped. Each run
-checks in with Sentry's cron monitor, which alerts when a minute is missed. Hourly it rebalances only the open orders that are at risk; once a day (or right
-after a rules change) it rebalances every open order and runs the ledger audit, which
-checks `on_hand` against the ledger and `held`/`committed` against the order allocations.
-Drift is logged and exported as `mango_ledger_drift_lines`.
+checks in with Sentry's cron monitor, which alerts when a minute is missed. Steps that
+call Razorpay or WhatsApp each get a slice of the run (8–10 seconds), so a slow outside
+service can't starve the rest, and the cheap database steps (hold sweep, batch
+retirement, audit) run first. Hourly it rebalances only the open orders that are at
+risk and runs the ledger audit, which checks `on_hand` against the ledger and
+`held`/`committed` against the order allocations; once a day (or right after a rules
+change) it rebalances every open order. Drift is logged and exported as
+`mango_ledger_drift_lines`.
 
 Transactions that hit a deadlock or serialization failure are retried twice with
 jitter (`tx` in `src/db.js`), and slot capacity is locked per delivery date, so
@@ -352,7 +391,15 @@ a database connection within 5 seconds answers `503 BUSY` with `Retry-After`.
 Sign-in rate limits (login codes, staff passwords) are counted in Postgres so every
 instance shares them. Each phone gets 5 codes an hour and 10 a day, and the shop a
 daily budget (`OTP_DAILY_LIMIT`, Sentry warns at 80%) after which codes pause until
-midnight IST. Session refresh and logout refuse requests from other sites' origins.
+midnight IST. Numbers with no account may use only `OTP_NEW_NUMBER_SHARE` of it (60%),
+so a bot flooding new numbers can't lock existing customers out. With
+`TURNSTILE_SITE_KEY`/`TURNSTILE_SECRET_KEY` set, the shop must also pass a Cloudflare
+Turnstile check before a code is sent. Session refresh and logout refuse requests from
+other sites' origins.
+
+Checkout and booking need an `Idempotency-Key`, scoped to the customer. A retry with the
+same key and the same body gets the first answer back; the same key with a different
+body is refused with `422 IDEMPOTENCY_KEY_REUSED`.
 
 Every job is also safe if two instances ever run the loop at once. Each WhatsApp message is
 claimed with `FOR UPDATE SKIP LOCKED` before it is sent, each refund is claimed with a
@@ -366,15 +413,17 @@ Five roles: `MANAGER`, `OPERATOR`, `PACKER`, `QC` and `RIDER`. Riders only reach
 orders on yesterday's, today's or tomorrow's run that are packed or on the road; any
 other order id answers 404. With `STAFF_TWO_STEP=managers` (the production default)
 managers and operators must use two-step sign-in. Managers and operators reach every
-route except the manager-only ones. Packers and QC get an allowlist in
-[`src/access.js`](src/access.js) and are refused everything else, so a new route stays
-closed to them until it is added there. Packers may only move orders through
+route except the manager-only ones. Every role but managers, operators included, gets an
+allowlist in [`src/access.js`](src/access.js) and is refused everything else, so a new
+route stays closed to them until it is added there; a test fails until each route is
+either on the operator list or manager-only. Packers may only move orders through
 `PROCESSING`, `PACKED`, `SHIPPED`, `OUT_FOR_DELIVERY`, `DELIVERED` and `DELIVERY_FAILED`.
 
 Managers add, change and remove staff through `/staff`. A role change, password change or
 removal ends that person's sessions; an access token already issued lapses within 15
 minutes. In production the first manager comes from `ADMIN_BOOTSTRAP_EMAIL` /
-`ADMIN_BOOTSTRAP_PASSWORD`.
+`ADMIN_BOOTSTRAP_PASSWORD`; on Vercel previews from `PREVIEW_ADMIN_EMAIL` /
+`PREVIEW_ADMIN_PASSWORD` instead, so the production login never reaches a preview.
 
 Every successful staff change (any non-GET admin request) and every sign-in is written to
 `staff_audit`: who, their role, the route, what it was done to, and the request body with
@@ -397,7 +446,16 @@ screen.
   [`ops/restore-check.sh`](ops/restore-check.sh) restores a dump into a scratch database,
   prints the migrations and row counts, checks the stock ledger balances, then drops it.
   Run it weekly and after each schema change; a backup nobody has restored is a guess.
-  Managed Postgres with point-in-time recovery is still worth turning on as well.
+  Set `BACKUP_GPG_RECIPIENT` to encrypt the dump (it holds customers' details); the
+  nightly GitHub workflow [`backup.yml`](../.github/workflows/backup.yml) does this for Neon.
+- **After a restore.** A restored database has lost the orders, payments and account
+  deletions made since the restore point, while Razorpay still holds the money.
+  [`ops/replay-payments.js`](ops/replay-payments.js) `--from <restore point>` applies the
+  captured payments as the webhook would and lists payments whose order is gone
+  (`--refund-missing` refunds those). [`ops/reapply-deletions.js`](ops/reapply-deletions.js)
+  deletes again the accounts deleted since then, from the pre-restore branch (`--old-url`,
+  `--since`) or a list of ids (`--ids`). Prefer fixing data forward; restore only when it
+  can't be repaired.
 
 ## Tests
 

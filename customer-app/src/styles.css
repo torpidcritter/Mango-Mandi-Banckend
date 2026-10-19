@@ -1076,3 +1076,19 @@ textarea:focus {
     flex-direction: column;
   }
 }
+
+/* Cloudflare security check under the sign-in form */
+.turnstile {
+  margin-top: 12px;
+  min-height: 0;
+}
+
+/* Back-in-stock alerts and account messages */
+.ok-text {
+  color: var(--leaf);
+  font-weight: 600;
+}
+.sub-title {
+  margin: 1.25rem 0 0.5rem;
+  font-size: 1rem;
+}
