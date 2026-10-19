@@ -4,6 +4,7 @@ import { checkProduction, DEV_JWT } from '../src/preflight.js'
 
 const good = {
   JWT_SECRET: 'a'.repeat(64),
+  LABEL_TOKEN_SECRET: 'l'.repeat(64),
   COOKIE_SECURE: true,
   RAZORPAY_KEY_ID: 'rzp_live_abc',
   RAZORPAY_KEY_SECRET: 's3cret',

@@ -52,10 +52,11 @@ export class PgStore {
  * database can't be reached the request goes through (it would fail on the
  * database anyway) rather than locking everyone out.
  */
-export function sharedLimiter(prefix, { windowMs, limit, message = 'Too many attempts. Try again later.' }) {
+export function sharedLimiter(prefix, { windowMs, limit, message = 'Too many attempts. Try again later.', keyGenerator }) {
   return rateLimit({
     windowMs,
     limit,
+    ...(keyGenerator ? { keyGenerator } : {}),
     store: new PgStore(prefix),
     passOnStoreError: true,
     standardHeaders: 'draft-7',

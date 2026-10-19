@@ -39,6 +39,13 @@ const DELIVERY = [
   route('POST', '/orders/:id/delivery'),
 ]
 
+// Box labels (labels.js): checking a run's van load and sending it out.
+const VAN_SCAN = [
+  route('GET', '/scan/dispatch'),
+  route('POST', '/scan/dispatch'),
+  route('POST', '/scan/dispatch/send'),
+]
+
 /** The day-to-day running of the shop: everything except the manager-only routes (requireManager in admin.js). */
 export const OPERATOR_ROUTES = [
   ...COMMON,
@@ -78,12 +85,20 @@ export const OPERATOR_ROUTES = [
   route('GET', '/preorders'),
   route('GET', '/preorder-capacity'),
   route('GET', '/coverage'),
+  // Box labels (labels.js)
+  ...VAN_SCAN,
+  route('POST', '/labels/print'),
+  route('GET', '/orders/:id/labels'),
+  route('POST', '/labels/:id/reprint'),
+  route('POST', '/scan/pack'),
+  route('POST', '/orders/:id/door-scan'),
+  route('GET', '/scan/lookup'),
 ]
 
 const LIMITED = {
   OPERATOR: OPERATOR_ROUTES,
   // Riders only see the day's run and record deliveries, with proof.
-  RIDER: [...COMMON, ...DELIVERY],
+  RIDER: [...COMMON, ...DELIVERY, ...VAN_SCAN, route('POST', '/orders/:id/door-scan')],
   PACKER: [
     ...DELIVERY,
     ...COMMON,
@@ -92,6 +107,12 @@ const LIMITED = {
     route('GET', '/slots'),
     route('POST', '/orders/:id/allocate'),
     route('PATCH', '/orders/:id/status'),
+    ...VAN_SCAN,
+    route('POST', '/labels/print'),
+    route('GET', '/orders/:id/labels'),
+    route('POST', '/labels/:id/reprint'),
+    route('POST', '/scan/pack'),
+    route('GET', '/scan/lookup'),
   ],
   QC: [
     ...COMMON,
@@ -102,6 +123,10 @@ const LIMITED = {
     route('PATCH', '/batches/:id/status'),
     route('POST', '/batches/:id/qc'),
     route('PATCH', '/batches/:id/lines/:lineId'),
+    // Box labels, read only.
+    route('GET', '/orders/:id/labels'),
+    route('GET', '/scan/dispatch'),
+    route('GET', '/scan/lookup'),
   ],
 }
 
@@ -139,7 +164,7 @@ export async function riderScope(req, _res, next) {
   try {
     const dates = riderDates()
     const date = req.method === 'GET' ? req.query.date : req.body?.date
-    if (req.path.startsWith('/manifest') && date !== undefined && !dates.includes(String(date))) {
+    if ((req.path.startsWith('/manifest') || req.path.startsWith('/scan/dispatch')) && date !== undefined && !dates.includes(String(date))) {
       return next(forbidden('Riders can only open the run for today or tomorrow'))
     }
     const m = ORDER_PATH.exec(req.path)
@@ -154,8 +179,8 @@ export async function riderScope(req, _res, next) {
   }
 }
 
-// The customer's delivery code is a secret too.
-const SECRET_KEYS = /password|token|secret|^code$/i
+// The customer's delivery code is a secret too, and so is a scanned label (it holds the QR token).
+const SECRET_KEYS = /password|token|secret|^code$|^scan$/i
 
 function clean(body) {
   if (Buffer.isBuffer(body)) return body.length ? { bytes: body.length } : null

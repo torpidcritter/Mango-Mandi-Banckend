@@ -15,6 +15,8 @@ export interface MockOptions {
   role?: Role
   /** Two-step sign-in: on for this person (login asks for code 123456), or required but not set up. */
   twoStep?: 'on' | 'required'
+  /** Box labels and scanning switched on (rules.labels.enabled). */
+  labels?: boolean
 }
 
 const json = (route: Route, status: number, body?: unknown) =>
@@ -164,6 +166,12 @@ export function seed() {
         },
       ],
     },
+    boxLabels: [1, 2].map((n) => ({
+      id: `lbl${n}`, code: `ORD-1042-${n}`, orderNumber: 'ORD-1042', boxNo: n, boxCount: 2, deliveryDate: '2026-10-16', slot: 'Morning',
+      sku: n === 1 ? 'ALP-3' : 'ALP-5', productName: n === 1 ? 'Alphonso 3kg Box' : 'Alphonso 5kg Box', variety: 'Alphonso', stage: 'RIPE' as const,
+      ripeness: 'Ripe', readyFrom: '2026-10-16', eatBy: '2026-10-19', batchId: 'b1', pluckedOn: '2026-10-08', packedOn: '2026-10-15', footer: null,
+      packedAt: null as string | null, dispatchedOn: null as string | null, doorScannedAt: null as string | null, reprints: 0,
+    })),
     packList: [
       {
         id: 'o1',
@@ -248,7 +256,59 @@ export type MockState = ReturnType<typeof seed> & {
   signedIn: boolean
   role: Role
   twoStep: { enabled: boolean; required: boolean }
+  labelsOn: boolean
   calls: { method: string; path: string; body: unknown }[]
+}
+
+const err = (route: Route, status: number, code: string, message: string) => json(route, status, { error: { code, message, requestId: 'req_l' } })
+
+/** Box labels and scanning (mango-api labels.js), for order o1 (ORD-1042, two boxes). */
+function labelRoutes(route: Route, state: MockState, method: string, path: string, body: unknown) {
+  if (!state.labelsOn) return err(route, 404, 'FEATURE_OFF', 'Box labels are turned off.')
+  const scanned = (body as { scan?: string })?.scan?.trim().toUpperCase() ?? ''
+  const label = state.boxLabels.find((l) => l.code === scanned || scanned.endsWith(`/B/TOKEN-${l.boxNo}`))
+  if (path === '/labels/print') {
+    return json(route, 200, { html: '<!doctype html><title>MandiMangoes box labels</title><p>ORD-1042 Box 1 of 2</p>', labels: state.boxLabels, skipped: [] })
+  }
+  if (path === '/orders/o1/labels') return json(route, 200, { current: true, labels: state.boxLabels })
+  if (/^\/labels\/[^/]+\/reprint$/.test(path)) {
+    const id = path.split('/')[2]
+    state.boxLabels = state.boxLabels.map((l) => (l.id === id ? { ...l, reprints: l.reprints + 1 } : l))
+    return json(route, 200, { html: '<!doctype html><title>Reprint</title>', label: state.boxLabels.find((l) => l.id === id) })
+  }
+  if (path === '/scan/pack') {
+    if (scanned === 'ORD-1043-1') return err(route, 409, 'WRONG_BOX', 'Wrong box: this is box 1 of ORD-1043, not ORD-1042. Put it aside.')
+    if (!label) return err(route, 404, 'UNKNOWN_LABEL', "This label isn't one of ours, or the code is wrong.")
+    const repeat = !!label.packedAt
+    label.packedAt = '2026-10-15T05:00:00Z'
+    const packedBoxes = state.boxLabels.filter((l) => l.packedAt).length
+    return json(route, 200, { outcome: repeat ? 'REPEAT' : 'OK', orderNumber: 'ORD-1042', boxNo: label.boxNo, packedBoxes, totalBoxes: 2, orderPacked: packedBoxes === 2 })
+  }
+  const runCheck = () => {
+    const loaded = state.boxLabels.filter((l) => l.dispatchedOn).length
+    const missing = state.boxLabels.filter((l) => !l.dispatchedOn).map((l) => l.boxNo)
+    return {
+      date: '2026-10-16', ready: missing.length ? 0 : 1, missing: missing.length ? 1 : 0, notPacked: 0, noLabels: 0, out: 0,
+      orders: [{ id: 'o1', number: 'ORD-1042', status: 'PACKED', slot: { id: 'slt1', label: 'Morning' }, boxes: 2, loaded, missing, state: missing.length ? 'missing' : 'ready' }],
+    }
+  }
+  if (path === '/scan/dispatch' && method === 'GET') return json(route, 200, runCheck())
+  if (path === '/scan/dispatch' && method === 'POST') {
+    if (!label) return err(route, 404, 'UNKNOWN_LABEL', "This label isn't one of ours, or the code is wrong.")
+    const repeat = !!label.dispatchedOn
+    label.dispatchedOn = '2026-10-16'
+    return json(route, 200, { outcome: repeat ? 'REPEAT' : 'OK', orderNumber: 'ORD-1042', boxNo: label.boxNo, loadedBoxes: state.boxLabels.filter((l) => l.dispatchedOn).length, totalBoxes: 2 })
+  }
+  if (path === '/scan/dispatch/send') {
+    const ready = state.boxLabels.every((l) => l.dispatchedOn)
+    return json(route, 200, ready ? { dispatched: ['ORD-1042'], skipped: [] } : { dispatched: [], skipped: [{ number: 'ORD-1042', reason: 'Boxes not scanned: 2' }] })
+  }
+  if (/^\/orders\/[^/]+\/door-scan$/.test(path)) {
+    if (!label) return err(route, 409, 'WRONG_BOX', 'Wrong box: this is for ORD-1043, not ORD-1042. Don\'t hand it over.')
+    label.doorScannedAt = '2026-10-16T05:00:00Z'
+    return json(route, 200, { outcome: 'OK', orderNumber: 'ORD-1042', boxNo: label.boxNo, checkedBoxes: 1, totalBoxes: 2 })
+  }
+  return err(route, 404, 'NOT_FOUND', 'Not found')
 }
 
 /** Routes every /admin/v1 call to the mock. Returns the mutable state and call log. */
@@ -258,6 +318,7 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
     signedIn: opts.signedIn ?? false,
     role: opts.role ?? 'MANAGER',
     twoStep: { enabled: opts.twoStep === 'on', required: opts.twoStep === 'required' },
+    labelsOn: opts.labels ?? false,
     calls: [],
   }
 
@@ -298,7 +359,8 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
       return route.fulfill({ status: 204 })
     }
     if (!state.signedIn) return json(route, 401, { error: { code: 'UNAUTHORIZED', message: 'Unauthorized', requestId: 'req_z' } })
-    if (path === '/auth/me') return json(route, 200, { email: EMAIL[state.role], role: state.role, twoStep: state.twoStep })
+    if (path === '/auth/me') return json(route, 200, { email: EMAIL[state.role], role: state.role, twoStep: state.twoStep, features: { labels: state.labelsOn } })
+    if (/^\/(labels|scan)\b|^\/orders\/[^/]+\/(labels|door-scan)$/.test(path)) return labelRoutes(route, state, method, path, body)
     if (path === '/me/two-step/setup') return json(route, 200, { secret: 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP', otpauthUrl: 'otpauth://totp/MandiMangoes%20Ops%3Amanager%40mandimangoes.test?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=MandiMangoes%20Ops' })
     if (path === '/me/two-step/enable') {
       if ((body as { code: string }).code !== '123456') return json(route, 422, { error: { code: 'WRONG_CODE', message: 'That code is not right.', requestId: 'req_e' } })

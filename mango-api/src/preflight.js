@@ -4,6 +4,7 @@
 // whole list (and checks the database) without starting the server.
 
 export const DEV_JWT = 'dev-only-change-me-0123456789abcdef0123456789'
+export const DEV_LABEL_SECRET = 'dev-only-label-secret-0123456789abcdef01234567'
 
 /** A Neon endpoint without its -pooler suffix, so the pooled and direct URLs compare equal. */
 export function dbHost(url) {
@@ -24,6 +25,10 @@ export function checkProduction(env, { vercel = Boolean(process.env.VERCEL), tar
 
   if (env.JWT_SECRET.length < 32 || env.JWT_SECRET === DEV_JWT || env.JWT_SECRET.startsWith('dev-only-change-me')) {
     errors.push('JWT_SECRET too weak: set a random string of 32+ characters (openssl rand -hex 32)')
+  }
+  // Box labels can be switched on from the Rules page at any time, so the secret is needed up front.
+  if (!env.LABEL_TOKEN_SECRET || env.LABEL_TOKEN_SECRET.length < 32 || env.LABEL_TOKEN_SECRET.startsWith('dev-only')) {
+    errors.push('LABEL_TOKEN_SECRET too weak: set a random string of 32+ characters (openssl rand -hex 32); it signs the QR codes on box labels')
   }
   if (!env.COOKIE_SECURE) errors.push('COOKIE_SECURE must be true in production')
 

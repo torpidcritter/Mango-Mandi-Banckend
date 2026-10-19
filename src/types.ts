@@ -9,6 +9,8 @@ export interface Me {
   role: Role
   /** Two-step sign-in: whether it is on, and whether this role must use it. */
   twoStep?: { enabled: boolean; required: boolean }
+  /** Optional features that are switched on (Planning, Selling rules). */
+  features?: { labels?: boolean }
 }
 
 /** A sign-in either lands, or asks for the code from the authenticator app first. */
@@ -370,6 +372,101 @@ export interface Rules {
   lowStockThreshold: number
   claimWindowHours: number
   stageProfiles: Record<string, StageWindow[]>
+  labels?: LabelRules
+}
+
+/** Box labels and scanning. */
+export interface LabelRules {
+  enabled: boolean
+  widthMm: number
+  heightMm: number
+  footer: string
+  requireDispatchScan: boolean
+}
+
+/** One box's printed label (no personal data). */
+export interface BoxLabel {
+  id: string
+  /** Typed when a QR won't scan, e.g. ORD-1042-2. */
+  code: string
+  orderNumber: string
+  boxNo: number
+  boxCount: number
+  deliveryDate: string
+  slot: string | null
+  sku: string
+  productName: string
+  variety: string
+  stage: Ripeness
+  ripeness: string
+  readyFrom: string
+  eatBy: string
+  batchId: string
+  pluckedOn: string
+  packedOn: string
+  footer: string | null
+  packedAt?: string | null
+  dispatchedOn?: string | null
+  doorScannedAt?: string | null
+  reprints?: number
+}
+
+export interface PrintedLabels {
+  html: string
+  labels: BoxLabel[]
+  skipped: { id: string; number: string; reason: string }[]
+}
+
+export interface OrderLabels {
+  /** False when the order changed after printing (stock, date or slot): print again. */
+  current: boolean
+  labels: BoxLabel[]
+}
+
+export interface PackScanResult {
+  outcome: 'OK' | 'REPEAT'
+  orderNumber: string
+  boxNo: number
+  packedBoxes: number
+  totalBoxes: number
+  orderPacked: boolean
+}
+
+export interface VanScanResult {
+  outcome: 'OK' | 'REPEAT'
+  orderNumber: string
+  boxNo: number
+  loadedBoxes: number
+  totalBoxes: number
+}
+
+export interface DoorScanResult {
+  outcome: 'OK' | 'REPEAT'
+  orderNumber: string
+  boxNo: number
+  checkedBoxes: number
+  totalBoxes: number
+}
+
+export type VanState = 'ready' | 'missing' | 'not_packed' | 'no_labels' | 'out'
+
+export interface RunCheck {
+  date: string
+  orders: {
+    id: string
+    number: string
+    status: OrderStatus
+    slot: { id: string; label: string } | null
+    boxes: number
+    loaded: number
+    missing: number[]
+    state: VanState
+  }[]
+  ready: number
+  missing: number
+  notPacked: number
+  noLabels: number
+  out: number
 }
 
 export interface RulesVersion {

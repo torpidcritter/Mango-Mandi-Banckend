@@ -41,6 +41,10 @@ import { refundOrder } from './payments.js'
 import { logger } from './logger.js'
 import { allProducts, findProduct, loadProducts, productName, sellable, shopProducts } from './products.js'
 import { STAGES } from './stage.js'
+import {
+  describeLabels, doorScan, dispatchScan, ensureLabels, fullyLoaded, labelsHtml, labelsOn, lookup, orderLabels, packScan, reprintLabel,
+  requireLabels, runCheck, sendLoaded,
+} from './labels.js'
 
 export const router = express.Router()
 
@@ -216,6 +220,8 @@ router.get(
     res.json({
       email: req.admin.email, role: req.admin.role,
       twoStep: { enabled: Boolean(rows[0].totp_enabled_at), required: twoStepRequired(req.admin.role) },
+      // Optional features the panel shows only when they are on.
+      features: { labels: labelsOn() },
     })
   }),
 )
@@ -930,6 +936,146 @@ router.get(
   }),
 )
 
+// ---------------------------------------------------------------- box labels and scanning
+
+// Per staff member, not per address: a packing room shares one connection.
+const scanLimiter = sharedLimiter('label-scan', {
+  windowMs: 60_000, limit: 120, message: 'Too many scans in a minute. Wait a moment.', keyGenerator: (req) => req.admin.id,
+})
+const scanBody = z.string().trim().min(1, 'Scan a label or type its code').max(300)
+const slotParam = z.string().max(64).nullable().optional()
+
+/** Runs a scan in a transaction; a refused scan is logged there, then answered as an error. */
+async function runScan(fn) {
+  const r = await tx(fn)
+  if (!r.ok) throw new HttpError(r.status, r.code, r.message)
+  const { ok: _ok, ...rest } = r
+  return rest
+}
+
+/** Labels for a run (a date, one slot or all) or for chosen orders, as a printable page. */
+router.post(
+  '/labels/print',
+  requireLabels,
+  asyncHandler(async (req, res) => {
+    const b = parse(
+      z
+        .object({
+          date: z.string().refine(isDate, 'date must be YYYY-MM-DD').optional(),
+          slotId: slotParam,
+          orderIds: z.array(z.string().max(64)).min(1).max(BULK_LIMIT).optional(),
+        })
+        .refine((x) => x.date || x.orderIds, 'Give a date or a list of orders'),
+      req.body,
+    )
+    let ids = b.orderIds ?? []
+    if (!b.orderIds) {
+      const params = [b.date]
+      let slotFilter = ''
+      if (b.slotId === null) slotFilter = 'AND o.slot_id IS NULL'
+      else if (b.slotId) {
+        params.push(b.slotId)
+        slotFilter = 'AND o.slot_id = $2'
+      }
+      const { rows } = await query(
+        `SELECT o.id FROM orders o LEFT JOIN delivery_slots s ON s.id = o.slot_id
+          WHERE o.delivery_date = $1 ${slotFilter} AND o.status IN ('CONFIRMED', 'PROCESSING', 'PACKED')
+          ORDER BY s.sort NULLS LAST, s.starts_at NULLS LAST, o.number LIMIT ${BULK_LIMIT + 1}`,
+        params,
+      )
+      if (rows.length > BULK_LIMIT) throw badRequest(`More than ${BULK_LIMIT} orders on this run; print one slot at a time`, 'TOO_MANY')
+      ids = rows.map((r) => r.id)
+    }
+    const labels = []
+    const skipped = []
+    for (const id of ids) {
+      const r = await tx((c) => ensureLabels(c, id, req.actor))
+      if (r.skipped) skipped.push({ id, number: r.order.number, reason: r.skipped })
+      else labels.push(...r.labels)
+    }
+    const contents = await describeLabels({ query }, labels)
+    const html = labelsHtml(contents, { notes: skipped.map((s) => `${s.number}: ${s.reason}`) })
+    res.json({ html, labels: contents.map(({ qrUrl: _q, ...l }) => l), skipped })
+  }),
+)
+
+router.get(
+  '/orders/:id/labels',
+  requireLabels,
+  asyncHandler(async (req, res) => res.json(await orderLabels({ query }, req.params.id))),
+)
+
+/** One damaged or lost label: a new QR (the old one stops working). The reason goes to the staff audit. */
+router.post(
+  '/labels/:id/reprint',
+  requireLabels,
+  asyncHandler(async (req, res) => {
+    parse(z.object({ reason: z.string().trim().min(3, 'Say why the label is reprinted').max(200) }), req.body ?? {})
+    const { label } = await tx((c) => reprintLabel(c, req.params.id, req.actor))
+    const contents = await describeLabels({ query }, [label])
+    res.json({ html: labelsHtml(contents), label: (({ qrUrl: _q, ...l }) => l)(contents[0]) })
+  }),
+)
+
+router.post(
+  '/scan/pack',
+  requireLabels,
+  scanLimiter,
+  asyncHandler(async (req, res) => {
+    const b = parse(z.object({ orderId: z.string().min(1).max(64), scan: scanBody }), req.body)
+    res.json(await runScan((c) => packScan(c, b, req.actor)))
+  }),
+)
+
+const runQuery = z.object({ date: z.string().refine(isDate, 'date must be YYYY-MM-DD'), slotId: slotParam })
+/** "none" in the query string means orders without a slot. */
+const slotFromQuery = (v) => (v === 'none' ? null : v || undefined)
+
+router.get(
+  '/scan/dispatch',
+  requireLabels,
+  asyncHandler(async (req, res) => {
+    const q = parse(runQuery, { date: req.query.date, slotId: slotFromQuery(req.query.slotId) })
+    res.json(await runCheck({ query }, q))
+  }),
+)
+
+router.post(
+  '/scan/dispatch',
+  requireLabels,
+  scanLimiter,
+  asyncHandler(async (req, res) => {
+    const b = parse(runQuery.extend({ scan: scanBody }), req.body)
+    res.json(await runScan((c) => dispatchScan(c, b, req.actor)))
+  }),
+)
+
+/** Sends out every order on the run whose boxes are all on the van. */
+router.post(
+  '/scan/dispatch/send',
+  requireLabels,
+  asyncHandler(async (req, res) => {
+    const b = parse(runQuery, req.body)
+    res.json(await sendLoaded(b, req.actor))
+  }),
+)
+
+router.post(
+  '/orders/:id/door-scan',
+  requireLabels,
+  scanLimiter,
+  asyncHandler(async (req, res) => {
+    const b = parse(z.object({ scan: scanBody }), req.body)
+    res.json(await runScan((c) => doorScan(c, { orderId: req.params.id, scan: b.scan }, req.actor)))
+  }),
+)
+
+router.get(
+  '/scan/lookup',
+  requireLabels,
+  asyncHandler(async (req, res) => res.json(await lookup({ query }, parse(scanBody, req.query.scan)))),
+)
+
 // ---------------------------------------------------------------- rider manifest
 
 const MANIFEST_STATUSES = ['CONFIRMED', 'PROCESSING', 'PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERY_FAILED', 'DELIVERED']
@@ -1020,9 +1166,15 @@ router.post(
     )
     const dispatched = []
     const skipped = []
+    const scanRequired = labelsOn() && currentConfig().rules.labels.requireDispatchScan
     for (const o of rows) {
       if (['CONFIRMED', 'PROCESSING'].includes(o.status)) {
         skipped.push({ number: o.number, reason: 'Not packed yet' })
+        continue
+      }
+      // Box labels on and van scanning required: only orders whose every box was scanned go out.
+      if (scanRequired && !(await fullyLoaded({ query }, o.id, b.date))) {
+        skipped.push({ number: o.number, reason: 'Not every box was scanned onto the van' })
         continue
       }
       try {

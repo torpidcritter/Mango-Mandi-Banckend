@@ -650,6 +650,10 @@ function RulesCard() {
               </div>
             ))}
           </dl>
+          <p className="small">
+            Box labels and scanning: <strong>{q.data.rules.labels?.enabled ? 'on' : 'off'}</strong>
+            {q.data.rules.labels?.enabled && ` · ${q.data.rules.labels.widthMm} × ${q.data.rules.labels.heightMm} mm`}
+          </p>
           <h3 style={{ marginTop: '1.25rem' }}>Ripeness by age on the delivery date</h3>
           <p className="muted small">
             The latest QC reading can move a batch up to {q.data.rules.maxQcShift} day either way.
@@ -696,6 +700,13 @@ function RulesDialog({ rules, onClose }: { rules: Rules; onClose: () => void }) 
   const [windows, setWindows] = useState(() =>
     rules.stageProfiles.default.map((w) => ({ stage: w.stage, minAge: String(w.minAge), maxAge: String(w.maxAge) })),
   )
+  const [labels, setLabels] = useState(() => ({
+    enabled: rules.labels?.enabled ?? false,
+    widthMm: String(rules.labels?.widthMm ?? 50),
+    heightMm: String(rules.labels?.heightMm ?? 75),
+    footer: rules.labels?.footer ?? '',
+    requireDispatchScan: rules.labels?.requireDispatchScan ?? false,
+  }))
   const [formError, setFormError] = useState<string | null>(null)
 
   const save = useMutation({
@@ -711,7 +722,7 @@ function RulesDialog({ rules, onClose }: { rules: Rules; onClose: () => void }) 
   function onSubmit(e: FormEvent) {
     e.preventDefault()
     setFormError(null)
-    const all = [...Object.values(values), ...windows.flatMap((w) => [w.minAge, w.maxAge])]
+    const all = [...Object.values(values), ...windows.flatMap((w) => [w.minAge, w.maxAge]), labels.widthMm, labels.heightMm]
     if (all.some((v) => !/^\d+$/.test(v))) return setFormError('Every value must be a whole number.')
     const next: Rules = {
       ...rules,
@@ -719,6 +730,13 @@ function RulesDialog({ rules, onClose }: { rules: Rules; onClose: () => void }) 
       stageProfiles: {
         ...rules.stageProfiles,
         default: windows.map((w) => ({ stage: w.stage, minAge: Number(w.minAge), maxAge: Number(w.maxAge) })),
+      },
+      labels: {
+        enabled: labels.enabled,
+        widthMm: Number(labels.widthMm),
+        heightMm: Number(labels.heightMm),
+        footer: labels.footer.trim(),
+        requireDispatchScan: labels.requireDispatchScan,
       },
     }
     save.mutate(next)
@@ -778,6 +796,40 @@ function RulesDialog({ rules, onClose }: { rules: Rules; onClose: () => void }) 
               </div>
             </div>
           ))}
+        </fieldset>
+        <fieldset>
+          <legend>Box labels and scanning</legend>
+          <div className="field">
+            <label>
+              <input type="checkbox" checked={labels.enabled} onChange={(e) => setLabels({ ...labels, enabled: e.target.checked })} /> Print box
+              labels and scan boxes when packing and loading the van
+            </label>
+            <p className="hint">Staff see the change the next time they sign in.</p>
+          </div>
+          <div className="btn-row" style={{ alignItems: 'flex-end' }}>
+            <div className="field">
+              <label htmlFor="label-w">Label width (mm)</label>
+              <input id="label-w" inputMode="numeric" size={4} value={labels.widthMm} onChange={(e) => setLabels({ ...labels, widthMm: e.target.value.trim() })} />
+            </div>
+            <div className="field">
+              <label htmlFor="label-h">Label height (mm)</label>
+              <input id="label-h" inputMode="numeric" size={4} value={labels.heightMm} onChange={(e) => setLabels({ ...labels, heightMm: e.target.value.trim() })} />
+            </div>
+          </div>
+          <div className="field">
+            <label htmlFor="label-footer">Extra line at the bottom of each label (optional)</label>
+            <input id="label-footer" maxLength={80} value={labels.footer} onChange={(e) => setLabels({ ...labels, footer: e.target.value })} />
+          </div>
+          <div className="field">
+            <label>
+              <input
+                type="checkbox"
+                checked={labels.requireDispatchScan}
+                onChange={(e) => setLabels({ ...labels, requireDispatchScan: e.target.checked })}
+              />{' '}
+              “Start run” only sends orders whose boxes were all scanned onto the van
+            </label>
+          </div>
         </fieldset>
         <p className="hint">Saving re-checks every open order against the new rules. Orders that no longer fit are flagged at risk.</p>
         <FormError error={formError ?? save.error} />

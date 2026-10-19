@@ -921,3 +921,41 @@ dl.kv dd {
 td.actions {
   white-space: nowrap;
 }
+
+/* ---------- Box label scanning ---------- */
+
+.scan-camera video {
+  width: 100%;
+  max-width: 28rem;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-top: 0.75rem;
+  background: #000;
+}
+.scan-result {
+  margin: 0.75rem 0;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius);
+  font-weight: 600;
+  font-size: 1.05rem;
+  border: 2px solid currentColor;
+}
+.scan-ok {
+  color: var(--green-700);
+}
+.scan-bad {
+  color: var(--red-600);
+}
+.scan-results ul {
+  margin: 0 0 0.75rem;
+  padding-left: 1rem;
+}
+.box-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.75rem 0 0;
+  display: grid;
+  gap: 0.35rem;
+}

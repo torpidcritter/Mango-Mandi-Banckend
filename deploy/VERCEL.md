@@ -92,6 +92,7 @@ secrets with `openssl rand -hex 32`. Never commit them.
 | `DATABASE_URL` | Neon `main`, pooled, `mango_app` | Neon `staging`, pooled | |
 | `DATABASE_URL_UNPOOLED` | Neon `main`, direct, owner | Neon `staging`, direct | migrations only |
 | `JWT_SECRET` | random, 64 hex | a different random | |
+| `LABEL_TOKEN_SECRET` | random, 64 hex | a different random | signs box label QR codes; changing it makes printed labels unreadable |
 | `CRON_SECRET` | random, 32+ chars | random | Vercel sends it to the maintenance job |
 | `CUSTOMER_ORIGIN` | `https://mandimangoes.in,https://www.mandimangoes.in` | the shop preview URL | comma-separated |
 | `ADMIN_ORIGIN` | `https://ops.mandimangoes.in` | the panel preview URL | |

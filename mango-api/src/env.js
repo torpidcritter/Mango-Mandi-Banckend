@@ -1,7 +1,7 @@
 // Validated configuration. In production the app refuses to start with
 // placeholder secrets.
 import { z } from 'zod'
-import { checkProduction, DEV_JWT } from './preflight.js'
+import { checkProduction, DEV_JWT, DEV_LABEL_SECRET } from './preflight.js'
 
 /** Running as a Vercel Function (Vercel sets VERCEL=1). */
 export const onVercel = Boolean(process.env.VERCEL)
@@ -52,6 +52,8 @@ const schema = z.object({
   RAZORPAY_KEY_ID: z.string().default(''),
   RAZORPAY_KEY_SECRET: z.string().default(''),
   METRICS_TOKEN: z.string().default(''),
+  // Signs the QR tokens on box labels (labels.js). Changing it makes every printed label unreadable.
+  LABEL_TOKEN_SECRET: z.string().default(DEV_LABEL_SECRET),
   ADMIN_BOOTSTRAP_EMAIL: z.string().email().optional(),
   ADMIN_BOOTSTRAP_PASSWORD: z.string().min(12).optional(),
   // Previews get their own first manager, so the production password is never in a preview.

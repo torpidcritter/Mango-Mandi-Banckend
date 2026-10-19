@@ -1049,6 +1049,34 @@ textarea:focus {
   min-width: 0;
 }
 
+/* The page behind a box label's QR code */
+.box-hero {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+.box-hero h1 {
+  margin-top: 0;
+}
+.box-hero .kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0.75rem 0;
+}
+.box-hero .kv dt {
+  color: var(--muted, #6b6b6b);
+}
+.box-hero .kv dd {
+  margin: 0;
+  font-weight: 600;
+}
+@media (max-width: 480px) {
+  .box-hero {
+    flex-direction: column;
+  }
+}
+
 /* Cloudflare security check under the sign-in form */
 .turnstile {
   margin-top: 12px;

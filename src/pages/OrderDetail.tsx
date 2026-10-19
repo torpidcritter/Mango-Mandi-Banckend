@@ -7,6 +7,7 @@ import type { DeliveryAttempt, NotificationKind, OrderDetail as Order, OrderNoti
 import { PACKER_STATUSES, can, canSee } from '../permissions'
 import { useSession } from '../session'
 import { Badge, Dialog, FormError, GatedButton, OrderBadge, QueryError, Spinner, useToast, scrollRegion } from '../ui'
+import OrderLabelsCard from '../labels/OrderLabelsCard'
 
 const CONFLICT_MESSAGE = 'This order was just updated by someone else.'
 
@@ -293,6 +294,9 @@ function OrderView({ order }: { order: Order }) {
               </div>
             )}
           </section>
+          {me?.features?.labels && order.status !== 'PAYMENT_PENDING' && (
+            <OrderLabelsCard orderId={order.id} status={order.status} canPrint={me.role !== 'QC' && me.role !== 'RIDER'} />
+          )}
         </div>
 
         <div>
