@@ -44,6 +44,13 @@ import type {
   Role,
   StaffMember,
   Summary,
+  Campaign,
+  CampaignDetail,
+  CampaignStatus,
+  NewCampaign,
+  UnlockSettings,
+  UnlockTemplate,
+  Zone,
 } from './types'
 
 export const API_URL: string = (import.meta.env.VITE_API_URL ?? '').trim().replace(/\/+$/, '')
@@ -349,6 +356,23 @@ export const api = {
     request<DeliverySlot>('POST', '/slots', input),
   updateSlot: (slotId: string, patch: Partial<Omit<DeliverySlot, 'id'>>) =>
     request<DeliverySlot>('PATCH', `/slots/${id(slotId)}`, patch),
+  zones: () => request<Zone[]>('GET', '/zones'),
+  addZone: (input: { label: string; pincodes: string[] }) => request<Zone>('POST', '/zones', input),
+  updateZone: (zoneId: string, patch: { label?: string; active?: boolean }) => request<Zone>('PATCH', `/zones/${id(zoneId)}`, patch),
+  setZonePincodes: (zoneId: string, pincodes: string[]) => request<Zone>('PUT', `/zones/${id(zoneId)}/pincodes`, { pincodes }),
+  campaigns: (f: { from?: string | null; status?: CampaignStatus | null } = {}) =>
+    request<{ enabled: boolean; campaigns: Campaign[] }>('GET', `/unlock/campaigns${qs(f)}`),
+  campaign: (campaignId: string) => request<CampaignDetail>('GET', `/unlock/campaigns/${id(campaignId)}`),
+  addCampaign: (input: NewCampaign) => request<Campaign>('POST', '/unlock/campaigns', input),
+  openCampaign: (campaignId: string) => request<Campaign>('POST', `/unlock/campaigns/${id(campaignId)}/open`, {}),
+  cancelCampaign: (campaignId: string, note?: string) => request<Campaign>('POST', `/unlock/campaigns/${id(campaignId)}/cancel`, note ? { note } : {}),
+  unlockTemplates: () => request<UnlockTemplate[]>('GET', '/unlock/templates'),
+  addUnlockTemplate: (input: { zoneIds: string[]; weekday: number; slotId?: string | null; threshold: number; minOrderValue: number; autoOpen: boolean }) =>
+    request<UnlockTemplate>('POST', '/unlock/templates', input),
+  updateUnlockTemplate: (templateId: string, patch: Partial<Pick<UnlockTemplate, 'active' | 'threshold' | 'minOrderValue' | 'autoOpen'>>) =>
+    request<UnlockTemplate>('PATCH', `/unlock/templates/${id(templateId)}`, patch),
+  unlockSettings: () => request<UnlockSettings>('GET', '/unlock/settings'),
+  saveUnlockSettings: (patch: Partial<UnlockSettings>) => request<UnlockSettings>('PUT', '/unlock/settings', patch),
   rules: () => request<RulesVersion>('GET', '/config'),
   saveRules: (rules: Rules) => request<RulesVersion>('PUT', '/config', { rules }),
 }

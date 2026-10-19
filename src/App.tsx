@@ -23,6 +23,8 @@ import NotFound from './pages/NotFound'
 import Staff from './pages/Staff'
 import Products from './pages/Products'
 import Promos from './pages/Promos'
+import Zones from './pages/Zones'
+import Campaigns from './pages/Campaigns'
 import TwoStepPage, { TwoStepGate } from './pages/TwoStep'
 import { canSee, homeFor, type Screen } from './permissions'
 import { useSession } from './session'
@@ -116,6 +118,8 @@ export default function App() {
             <Route path="/staff" element={<Only screen="staff"><Staff /></Only>} />
             <Route path="/products" element={<Only screen="products"><Products /></Only>} />
             <Route path="/promos" element={<Only screen="promos"><Promos /></Only>} />
+            <Route path="/zones" element={<Only screen="zones"><Zones /></Only>} />
+            <Route path="/campaigns" element={<Only screen="campaigns"><Campaigns /></Only>} />
             <Route path="/two-step" element={<TwoStepPage />} />
             <Route path="*" element={<NotFound />} />
           </Route>

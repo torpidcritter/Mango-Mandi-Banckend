@@ -586,3 +586,98 @@ export interface Gift {
   recipientPhone: string
   message: string | null
 }
+
+// ---------------------------------------------------------------- Neighborhood Unlock
+
+export interface Zone {
+  id: string
+  label: string
+  active: boolean
+  pincodes: string[]
+  /** DRAFT or OPEN campaigns: editing the zone changes their live count. */
+  liveCampaigns: number
+  createdBy: string | null
+  createdAt: string
+}
+
+export type CampaignStatus = 'DRAFT' | 'OPEN' | 'UNLOCKED' | 'MISSED' | 'CANCELLED'
+export type RewardType = 'PROMO_FLAT' | 'PROMO_PERCENT' | 'POINTS' | 'FEE_WAIVER'
+
+export interface Campaign {
+  id: string
+  zoneId: string | null
+  pincode: string | null
+  zoneLabel: string
+  deliveryDate: string
+  slotId: string | null
+  slotLabel: string | null
+  threshold: number
+  /** Paise, compared with what the customer paid. */
+  minOrderValue: number
+  rewardType: RewardType | null
+  rewardValue: number | null
+  rewardBudget: number | null
+  orderBy: string
+  status: CampaignStatus
+  /** Live count while DRAFT or OPEN; the recorded count once judged. */
+  current: number | null
+  remaining: number | null
+  counted: number | null
+  openedAt: string | null
+  evaluatedAt: string | null
+  note: string | null
+  templateId: string | null
+  createdBy: string | null
+  createdAt: string
+}
+
+export interface CampaignCluster {
+  kind: 'SAME_ADDRESS' | 'SAME_PHONE'
+  customers: number
+  orders: number
+  orderNumbers: string[]
+  firstAt: string
+  lastAt: string
+  withinMinutes: number
+}
+
+export interface CampaignDetail extends Campaign {
+  forecast: { projected: number | null; recentSameWeekday: { date: string; customers: number }[]; recentAverage: number }
+  clusters: CampaignCluster[]
+  snapshotCount: number
+  events: { from: CampaignStatus | null; to: CampaignStatus; actor: string; counted: number | null; note: string | null; at: string }[]
+}
+
+export interface NewCampaign {
+  zoneId?: string
+  pincode?: string
+  deliveryDate: string
+  slotId?: string | null
+  threshold: number
+  minOrderValue: number
+  orderBy?: string | null
+}
+
+export interface UnlockTemplate {
+  id: string
+  zoneIds: string[]
+  weekday: number
+  slotId: string | null
+  threshold: number
+  minOrderValue: number
+  rewardType: RewardType | null
+  rewardValue: number | null
+  rewardBudget: number | null
+  autoOpen: boolean
+  active: boolean
+  createdBy: string | null
+  createdAt: string
+}
+
+export interface UnlockSettings {
+  enabled: boolean
+  evaluationGraceMinutes: number
+  publicCacheSeconds: number
+  clusterWindowMinutes: number
+  clusterMinCustomers: number
+}

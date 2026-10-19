@@ -439,7 +439,7 @@ test('Operators cannot edit selling rules', async ({ page }) => {
   await expect(page.getByRole('button', { name: /Switch off Morning/ })).toBeDisabled()
 })
 
-for (const path of ['/today', '/batches', '/batches/b1', '/orders', '/orders/o1', '/pack-list', '/deliveries', '/claims', '/pincodes', '/planning', '/preorders', '/analytics', '/promos', '/products']) {
+for (const path of ['/today', '/batches', '/batches/b1', '/orders', '/orders/o1', '/pack-list', '/deliveries', '/claims', '/pincodes', '/planning', '/preorders', '/analytics', '/promos', '/products', '/zones', '/campaigns']) {
   test(`${path} has no horizontal page scroll`, async ({ page }) => {
     await mockApi(page, { signedIn: true })
     await page.goto(path)
