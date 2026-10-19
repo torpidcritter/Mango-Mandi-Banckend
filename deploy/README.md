@@ -77,7 +77,7 @@ cd deploy && docker compose run --rm api npm run preflight -- --online
 ```
 
 They stop the launch (`FAIL`) for:
-- a weak `JWT_SECRET`
+- a weak `JWT_SECRET` or `LABEL_TOKEN_SECRET`
 - missing Razorpay keys or the dev webhook secret
 - SMS not going through Jio
 - origins that aren't https

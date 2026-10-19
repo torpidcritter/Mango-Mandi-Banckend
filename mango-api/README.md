@@ -187,6 +187,43 @@ else. A packer, operator or manager can do the same steps.
   `staff`, with no proof. The staff order page shows every attempt and photo; the customer
   sees how it was handed over and the photo (`GET /v1/orders/:id/delivery-photo`).
 
+## Box labels and scanning
+
+Off until a manager ticks "Print box labels" under Planning, Selling rules (`rules.labels`).
+Code: `src/labels.js`; tables `box_labels` and `label_scans` (migration 019).
+
+- **One label per box.** `POST /admin/v1/labels/print` `{date, slotId}` or `{orderIds}`
+  returns a printable page sized by `labels.widthMm` x `labels.heightMm` (default 50 x 75 mm
+  thermal) plus the labels as JSON. Each committed or packed stock row becomes that many boxes,
+  so every box shows its own batch. Printing again returns the same labels while they still
+  describe the order; once the order changed (stock swapped, date or slot moved) the old ones
+  are voided and a fresh set is made. Orders not fully allocated are listed, not printed.
+- **On the label:** order code, box n of m, delivery date and slot, product, ripeness as
+  delivered, ready-from and eat-by dates (the same rule as the shop, `stage.js eatingWindow`),
+  batch, pluck and pack dates, the QR, a typed code (`ORD-1042-2`) and `labels.footer`.
+  No name, phone or address.
+- **The QR** is the shop link `/b/<token>`. The token is a random 16-byte key plus a 10-byte
+  HMAC-SHA256 tag keyed by `LABEL_TOKEN_SECRET` (required in production; changing it makes every
+  printed label unreadable). The tag is checked before any lookup. Typed codes are guessable,
+  so only the signed-in staff routes accept them; the public page never does.
+- **Pack.** `POST /scan/pack` `{orderId, scan}`: the first box moves the order to PROCESSING,
+  the last runs the usual allocate step and PACKED. Refusals: `WRONG_BOX`, `ORDER_CANCELLED`,
+  `LABELS_OUT_OF_DATE`, `LABEL_REPLACED`, `UNKNOWN_LABEL`. A repeat scan answers `REPEAT` and
+  changes nothing.
+- **Van.** `GET /scan/dispatch?date&slotId` lists each order's loaded and missing boxes;
+  `POST /scan/dispatch` loads a box (`WRONG_RUN` for another run); `POST /scan/dispatch/send`
+  sends out only fully loaded orders with the usual dispatch step. With
+  `labels.requireDispatchScan` on, the old Start run button skips unloaded orders too.
+- **Door.** `POST /orders/:id/door-scan` (riders, their run only) checks the box belongs to the
+  order. It never marks it delivered; the code or photo still does.
+- **Reprint.** `POST /labels/:id/reprint` `{reason}` gives one box a new QR (the old one stops
+  working); the reason is in the staff audit.
+- **Public page.** `GET /v1/box/:token` (30 a minute per address): product, variety, pluck
+  date, ripeness and eat-by. Unknown, tampered, replaced or switched-off answers `{found:false}`.
+- Every scan is a `label_scans` row (no token). Scans are limited to 120 a minute per staff
+  member. Roles: packers print, pack and load; riders load and check at the door on their run;
+  QC can only look.
+
 ## Delivery slots
 
 Managers set up delivery windows (Planning page, or `/admin/v1/slots`), each with an

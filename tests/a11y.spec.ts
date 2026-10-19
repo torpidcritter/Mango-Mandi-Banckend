@@ -46,3 +46,13 @@ for (const path of ['/today', '/batches', '/batches/b1', '/orders', '/orders/o1'
     await scan(page)
   })
 }
+
+for (const path of ['/scan?order=o1', '/scan?mode=van&date=2026-10-16', '/orders/o1']) {
+  test(`${path} with box labels on has no WCAG A/AA violations`, async ({ page }) => {
+    await mockApi(page, { signedIn: true, labels: true })
+    await page.goto(path)
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible()
+    await page.waitForLoadState('networkidle')
+    await scan(page)
+  })
+}
