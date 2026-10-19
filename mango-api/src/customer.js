@@ -303,7 +303,10 @@ router.get(
   asyncHandler(async (req, res) => {
     const pincode = parse(PIN, req.query.pincode)
     const settings = unlockSettings()
-    res.set('Cache-Control', `public, max-age=${settings.publicCacheSeconds}`)
+    // Shared caches (the CDN) may keep it a few seconds, which absorbs a burst
+    // from a shared link; browsers always ask again, so a customer who just
+    // ordered sees their own order counted.
+    res.set('Cache-Control', `public, max-age=0, s-maxage=${settings.publicCacheSeconds}`)
     if (!settings.enabled) return res.json({ enabled: false, deliveryDate: null, campaigns: [] })
     let date = req.query.date ?? req.query.delivery_date ?? null
     if (date != null && !isDate(String(date))) throw badRequest('date must be YYYY-MM-DD')

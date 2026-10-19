@@ -98,9 +98,7 @@ export default function Campaigns() {
                       {date(c.deliveryDate)}
                       {c.slotLabel && <div className="small muted">{c.slotLabel}</div>}
                     </td>
-                    <td>
-                      {c.current ?? '—'} of {c.threshold}
-                    </td>
+                    <td>{c.current == null ? '—' : `${c.current} of ${c.threshold}`}</td>
                     <td className="small">{dateTime(c.orderBy)}</td>
                     <td>
                       <Badge tone={STATUS_TONE[c.status]}>{STATUS_LABEL[c.status]}</Badge>
@@ -290,7 +288,7 @@ function CampaignDetails({ campaign, onClose }: { campaign: Campaign; onClose: (
               {d.clusters.map((c, i) => (
                 <li key={i}>
                   {c.kind === 'SAME_ADDRESS' ? `${c.customers} customers at one address` : `${c.customers} accounts with one phone`}, {c.orders} orders within {c.withinMinutes}{' '}
-                  minutes: {c.orderNumbers.join(', ')}
+                  {c.withinMinutes === 1 ? 'minute' : 'minutes'}: {c.orderNumbers.join(', ')}
                 </li>
               ))}
             </ul>

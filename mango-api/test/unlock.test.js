@@ -350,7 +350,7 @@ describe('public progress', () => {
     const a = await customerToken(api)
     await order(a.accessToken, { address: '7, Secret Lane, Indiranagar', gift: { recipientName: 'Meera Iyer', recipientPhone: '9845012345', message: 'hi' } })
     const r = await api.get(`/v1/unlock/progress?pincode=560038&date=${DATE}`)
-    assert.match(r.headers.get('cache-control'), /public, max-age=15/)
+    assert.equal(r.headers.get('cache-control'), 'public, max-age=0, s-maxage=10')
     assert.deepEqual(Object.keys(r.body).sort(), ['campaigns', 'deliveryDate', 'enabled'])
     assert.deepEqual(Object.keys(r.body.campaigns[0]).sort(), ['closesAt', 'current', 'deliveryDate', 'remaining', 'slotLabel', 'status', 'threshold', 'zoneLabel'])
     assert.deepEqual(

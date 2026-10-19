@@ -38,7 +38,7 @@ export const unlockSettingsSchema = z
 export const DEFAULT_UNLOCK = {
   enabled: false,
   evaluationGraceMinutes: 10,
-  publicCacheSeconds: 15,
+  publicCacheSeconds: 10,
   clusterWindowMinutes: 30,
   clusterMinCustomers: 3,
 }

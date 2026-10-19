@@ -493,7 +493,7 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
           if (state.role !== 'MANAGER') return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Requires manager role', requestId: 'req_f' } })
           state.unlockEnabled = (body as { enabled: boolean }).enabled
         }
-        return json(route, 200, { enabled: state.unlockEnabled, evaluationGraceMinutes: 10, publicCacheSeconds: 15, clusterWindowMinutes: 30, clusterMinCustomers: 3 })
+        return json(route, 200, { enabled: state.unlockEnabled, evaluationGraceMinutes: 10, publicCacheSeconds: 10, clusterWindowMinutes: 30, clusterMinCustomers: 3 })
       }
     }
     if (path === '/pincodes' && method === 'GET') return json(route, 200, state.pincodes)
