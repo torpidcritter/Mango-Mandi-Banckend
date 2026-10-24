@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { expect, test } from './fixtures'
-import { header, policy, type App } from '../scripts/csp'
+import { cspPlugin, header, policy, preconnectTags, type App } from '../scripts/csp'
 
 // SEC-10: both apps send a Content-Security-Policy. The policy is written once
 // in scripts/csp.ts; vercel.json carries a copy, which must not drift. Every
@@ -37,6 +37,25 @@ test('the policies allow what each app loads, and nothing inline', () => {
     expect(p.match(/script-src [^;]*/)![0]).not.toContain('unsafe')
     expect(p).toContain("object-src 'none'")
   }
+})
+
+test('the built index.html of both apps preconnects to the API', () => {
+  for (const app of ['panel', 'shop'] as App[]) {
+    const hook = cspPlugin(app, 'https://api.mandimangoes.in/').transformIndexHtml as { handler: (html: string, ctx: object) => unknown }
+    const tags = hook.handler('', {}) as { tag: string; attrs: Record<string, string | boolean> }[]
+    const links = tags.filter((t) => t.tag === 'link').map((t) => t.attrs)
+    expect(links).toEqual([
+      { rel: 'preconnect', href: 'https://api.mandimangoes.in' },
+      { rel: 'preconnect', href: 'https://api.mandimangoes.in', crossorigin: true },
+      { rel: 'dns-prefetch', href: 'https://api.mandimangoes.in' },
+    ])
+    expect(tags[0].attrs['http-equiv']).toBe('Content-Security-Policy')
+    // The dev server sends the header and adds nothing to the page.
+    expect(hook.handler('', { server: {} })).toEqual([])
+  }
+  // No API configured: no hint to a guessed address.
+  expect(preconnectTags(undefined)).toEqual([])
+  expect(preconnectTags('not a url')).toEqual([])
 })
 
 test('the dev server sends the policy', async ({ page }) => {

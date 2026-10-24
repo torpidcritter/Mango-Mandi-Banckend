@@ -2,6 +2,7 @@
 // replaying payments after a restore, login-code protection, payment and
 // idempotency keys, delivery proof, gift codes, claim limits, the operator
 // allowlist, maintenance time slices and account deletion with money owed.
+import sharp from 'sharp'
 import { adminToken, checkout, client, closeAll, customerToken, makeBatch, resetDb, startServer } from './helpers.js'
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
@@ -187,7 +188,9 @@ describe('login codes', () => {
     globalThis.fetch = async (url, init) => {
       if (String(url).includes('challenges.cloudflare.com')) {
         const token = new URLSearchParams(String(init.body)).get('response')
-        return new Response(JSON.stringify({ success: token === 'good' }), { headers: { 'Content-Type': 'application/json' } })
+        // SEC-04: a token solved on another site, or for another action, passes Cloudflare but not us.
+        const answer = { success: token !== 'bad', hostname: token === 'other-site' ? 'evil.example' : 'localhost', action: token === 'other-action' ? 'login' : 'otp' }
+        return new Response(JSON.stringify(answer), { headers: { 'Content-Type': 'application/json' } })
       }
       return realFetch(url, init)
     }
@@ -195,7 +198,20 @@ describe('login codes', () => {
       assert.equal((await api.get('/v1/auth/config')).body.turnstileSiteKey, 'site')
       assert.equal((await api.post('/v1/auth/otp/request', { phone: '9876500011' })).body.error.code, 'CAPTCHA_REQUIRED')
       assert.equal((await api.post('/v1/auth/otp/request', { phone: '9876500011', captchaToken: 'bad' })).body.error.code, 'CAPTCHA_FAILED')
+      assert.equal((await api.post('/v1/auth/otp/request', { phone: '9876500011', captchaToken: 'other-site' })).body.error.code, 'CAPTCHA_FAILED')
+      assert.equal((await api.post('/v1/auth/otp/request', { phone: '9876500011', captchaToken: 'other-action' })).body.error.code, 'CAPTCHA_FAILED')
       assert.equal((await api.post('/v1/auth/otp/request', { phone: '9876500011', captchaToken: 'good' })).status, 200)
+
+      // Cloudflare unreachable: fail safe. A new number is refused, an account holder still gets in.
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('challenges.cloudflare.com')) throw new TypeError('fetch failed')
+        return realFetch(url, init)
+      }
+      const fresh = await api.post('/v1/auth/otp/request', { phone: '9876500012', captchaToken: 'good' })
+      assert.equal(fresh.status, 503)
+      assert.equal(fresh.body.error.code, 'CAPTCHA_UNAVAILABLE')
+      await query(`INSERT INTO customers (id, phone, name, created_at) VALUES ('cus_known', '+919876500013', 'Known', now())`)
+      assert.equal((await api.post('/v1/auth/otp/request', { phone: '9876500013', captchaToken: 'good' })).status, 200)
     } finally {
       globalThis.fetch = realFetch
       env.TURNSTILE_SECRET_KEY = ''
@@ -257,7 +273,7 @@ describe('delivery proof', () => {
     const cust = await customerToken(api)
     const id = await outForDelivery(cust)
     for (let i = 0; i < 5; i++) await api.post(`/admin/v1/orders/${id}/delivery`, { outcome: 'DELIVERED', code: '0000' === (await order(id)).delivery_code ? '1111' : '0000' }, { token: ops })
-    const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 7)])
+    const JPEG = await sharp({ create: { width: 16, height: 12, channels: 3, background: '#fa0' } }).jpeg().toBuffer()
     const ph = await api.raw('POST', `/admin/v1/orders/${id}/delivery-photos`, { token: ops, headers: { 'Content-Type': 'image/jpeg' }, raw: JPEG })
     const done = await api.post(`/admin/v1/orders/${id}/delivery`, { outcome: 'DELIVERED', photoId: ph.body.id, receivedBy: 'Security guard' }, { token: ops })
     assert.equal(done.status, 200, JSON.stringify(done.body))
@@ -322,19 +338,27 @@ describe('staff access', () => {
   test('every staff route is either open to operators or manager-only', () => {
     const unclassified = []
     let authed = false
-    for (const layer of adminRouter.stack) {
-      if (!layer.route) {
-        if (layer.name === 'requireAdmin') authed = true
-        continue
-      }
-      if (!authed) continue
-      const managerOnly = layer.route.stack.some((s) => s.name === 'requireManager')
-      for (const method of Object.keys(layer.route.methods)) {
-        const m = method.toUpperCase()
-        const listed = OPERATOR_ROUTES.some((r) => r.method === m && r.re.test(layer.route.path.replace(/:\w+/g, 'x')))
-        if (listed === managerOnly) unclassified.push(`${m} ${layer.route.path} (${managerOnly ? 'manager-only but listed for operators' : 'not listed'})`)
+    let seen = 0
+    // admin.js mounts each area's router (src/admin/*.js), so walk into nested routers.
+    const walk = (stack) => {
+      for (const layer of stack) {
+        if (!layer.route) {
+          if (layer.name === 'requireAdmin') authed = true
+          else if (layer.name === 'router') walk(layer.handle.stack)
+          continue
+        }
+        if (!authed) continue
+        const managerOnly = layer.route.stack.some((s) => s.name === 'requireManager')
+        for (const method of Object.keys(layer.route.methods)) {
+          seen++
+          const m = method.toUpperCase()
+          const listed = OPERATOR_ROUTES.some((r) => r.method === m && r.re.test(layer.route.path.replace(/:\w+/g, 'x')))
+          if (listed === managerOnly) unclassified.push(`${m} ${layer.route.path} (${managerOnly ? 'manager-only but listed for operators' : 'not listed'})`)
+        }
       }
     }
+    walk(adminRouter.stack)
+    assert.ok(seen > 50, `walked ${seen} staff routes`)
     assert.deepEqual(unclassified, [])
     assert.equal(roleAllows('OPERATOR', 'GET', '/staff'), false)
     assert.equal(roleAllows('OPERATOR', 'GET', '/orders'), true)

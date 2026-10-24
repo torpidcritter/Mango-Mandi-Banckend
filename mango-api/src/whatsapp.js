@@ -6,12 +6,13 @@
 // WhatsApp allows within 24 hours of the customer's last message.
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { env } from './env.js'
-import { logger } from './logger.js'
+import { logger, maskPhone } from './logger.js'
 
 /** A sender for the Cloud API. Resolves to the provider's message id. */
 export function metaSender(opts, fetchImpl = fetch) {
   const url = `https://graph.facebook.com/${opts.apiVersion}/${encodeURIComponent(opts.phoneNumberId)}/messages`
-  return async function sendMeta({ phone, template, params }) {
+  // urlParam: the variable of the template's URL button (index 0), for templates that have one.
+  return async function sendMeta({ phone, template, params, urlParam = null }) {
     const res = await fetchImpl(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${opts.token}` },
@@ -22,7 +23,10 @@ export function metaSender(opts, fetchImpl = fetch) {
         template: {
           name: template,
           language: { code: opts.language },
-          components: [{ type: 'body', parameters: params.map((text) => ({ type: 'text', text: String(text) })) }],
+          components: [
+            { type: 'body', parameters: params.map((text) => ({ type: 'text', text: String(text) })) },
+            ...(urlParam ? [{ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: String(urlParam) }] }] : []),
+          ],
         },
       }),
       signal: AbortSignal.timeout(opts.timeoutMs ?? 10_000),
@@ -69,6 +73,9 @@ export function metaOtpSender(opts, fetchImpl = fetch) {
     })
     const body = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(`WhatsApp ${res.status}: ${body?.error?.message ?? 'request failed'}`)
+    // As for every other message (metaSender above), and as OPS-03 for Jio: a 200
+    // without a message id was not accepted, so the code goes by SMS instead.
+    if (!body?.messages?.[0]?.id) throw new Error('WhatsApp answered without a message id')
   }
 }
 
@@ -152,8 +159,9 @@ export function metaMessenger(opts, fetchImpl = fetch) {
 export const chatMessenger =
   env.WHATSAPP_PROVIDER === 'meta'
     ? metaMessenger({ token: env.WHATSAPP_TOKEN, phoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID, apiVersion: env.WHATSAPP_API_VERSION })
-    : async (phone, reply) => {
-        logger.info({ phone, reply }, 'WhatsApp chat reply')
+    : // eslint-disable-next-line require-await -- a messenger: async like the Meta one
+      async (phone, reply) => {
+        logger.info({ phone: maskPhone(phone), reply }, 'WhatsApp chat reply')
         return 'log'
       }
 

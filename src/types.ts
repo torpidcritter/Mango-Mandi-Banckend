@@ -86,6 +86,11 @@ export interface Product {
   /** False once a manager removes it from sale; it stays for old orders and batches. */
   active?: boolean
   sortOrder?: number
+  /** The shop photo, a path on the API (add API_URL), or null for the drawn mango. */
+  photoUrl?: string | null
+  /** What is in the box, shown on the shop's product page when set: about how many mangoes, and grams each. */
+  fruitsPerBox?: number | null
+  fruitWeightG?: number | null
 }
 
 export interface ProductInput {
@@ -97,6 +102,8 @@ export interface ProductInput {
   hsnCode: string | null
   description: string
   sortOrder: number
+  fruitsPerBox: number | null
+  fruitWeightG: number | null
 }
 
 export interface Summary {
@@ -106,6 +113,20 @@ export interface Summary {
   lowStock: { sku: string; productName: string; available: number }[]
   /** Open orders the stock engine could not keep whole. Ops must act on these. */
   atRiskOrders?: { id: string; number: string; deliveryDate: string; reason: string | null }[]
+  /** Paid orders past their delivery date, or out for delivery too long (INV-G). */
+  overdueOrders?: OverdueOrder[]
+  /** Batches this many days old or older are past the sell limit (the live rule). */
+  maxSellableAge?: number
+}
+
+export interface OverdueOrder {
+  id: string
+  number: string
+  status: OrderStatus
+  deliveryDate: string
+  daysLate: number
+  outSince: string | null
+  reason: string
 }
 
 export interface BatchListItem {
@@ -132,7 +153,12 @@ export interface BatchLine {
   committed: number
   reserveBuffer: number
   available: number
+  /** Packed for orders that haven't left yet: off on hand but still on the shelf, so a count includes them. */
+  packedNotDispatched?: number
 }
+
+/** Why staff changed a count (stored on the ledger row). */
+export type AdjustReason = 'CORRECTION' | 'COUNT' | 'RECEIVED' | 'DAMAGED' | 'THEFT_LOSS' | 'RETURN_RESTOCK' | 'OTHER'
 
 export interface QcEntry {
   id: string
@@ -162,7 +188,10 @@ export interface LedgerEntry {
   delta: number
   actorType: string
   actorId: string
+  /** The staff member's email, when actorId is a staff id. */
+  actorEmail?: string | null
   reason: string | null
+  reasonCode?: AdjustReason | null
   createdAt: string
 }
 
@@ -221,6 +250,8 @@ export interface OrderDetail {
   id: string
   number: string
   status: OrderStatus
+  /** The delivery attempt a missed-delivery report made now is for. */
+  attempt?: number
   customerName: string | null
   phone: string | null
   pincode: string | null
@@ -251,6 +282,8 @@ export interface OrderDetail {
   deliveryAttempts?: DeliveryAttempt[]
   /** The customer's rating after delivery. */
   rating?: { stars: number; comment: string | null; at: string } | null
+  /** Boxes on a cancelled or returned order still to put back on the shelf or write off. */
+  returnedBoxes?: number
 }
 
 export type FailReason = 'NOT_HOME' | 'WRONG_ADDRESS' | 'REFUSED' | 'UNREACHABLE' | 'OTHER'
@@ -281,6 +314,8 @@ export type NotificationKind =
   | 'CANCELLED'
   | 'REFUNDED'
   | 'DATE_MOVED'
+  | 'CLAIM_RECEIVED'
+  | 'CLAIM_REJECTED'
 
 /** A WhatsApp update to the customer, sent from an outbox with retries. */
 export interface OrderNotification {
@@ -336,6 +371,8 @@ export interface Claim {
   photos?: { id: string }[]
   status: ClaimStatus
   resolution?: ClaimResolution | null
+  /** Why staff rejected it, as the customer sees it. */
+  rejectionReason?: string | null
   createdAt?: string
   replacementOrder?: { id: string; number: string } | null
   /** Open claims only: the customer's last 90 days, and how the order was delivered. */
@@ -372,6 +409,14 @@ export interface Rules {
   nearLimitAge: number
   lowStockThreshold: number
   claimWindowHours: number
+  maxUnpaidOrders: number
+  maxHeldBoxes: number
+  /** An order out for delivery this long shows as overdue. */
+  outForDeliveryAlertHours?: number
+  /** A preorder moved forward more times than this waits for a manager. */
+  maxPreorderMoves?: number
+  /** The season's last delivery day (YYYY-MM-DD); preorders after it wait for a manager. */
+  seasonEndsOn?: string | null
   stageProfiles: Record<string, StageWindow[]>
 }
 
@@ -461,7 +506,8 @@ export interface ManifestOrder {
   id: string
   number: string
   customerName: string
-  phone: string
+  /** Left out (null) for packers: they handle boxes, riders handle people. */
+  phone: string | null
   deliveryAddress: string | null
   status: OrderStatus
   packed: boolean
@@ -470,7 +516,15 @@ export interface ManifestOrder {
   attempt?: number
   /** A gift: the name and phone above are the recipient's. */
   gift?: { from: string | null; message: string | null } | null
+  /** The rider the stop is given to (riders only see their own stops). */
+  rider?: { id: string; email: string | null } | null
   items: { sku: string; productName: string; stage: Ripeness | null; quantity: number }[]
+}
+
+/** A rider, for giving them stops on the Deliveries page. */
+export interface Rider {
+  id: string
+  email: string
 }
 
 /** A day's delivery run: one run per slot (or one with no slot), stops by pincode. */
@@ -478,6 +532,8 @@ export interface Manifest {
   date: string
   orders: number
   boxes: number
+  /** Riders only: packed stops on the date given to nobody yet (starting the run takes them). */
+  unassigned?: number
   runs: {
     slot: { id: string; label: string; startsAt: string; endsAt: string } | null
     orders: number
@@ -525,6 +581,8 @@ export interface Analytics {
 /** Problems nobody would otherwise notice: the background loop, failed sends, stuck refunds, bad webhooks. */
 export interface Attention {
   loop: { lastRunAt: string | null; stale: boolean; failingSteps: { step: string; since: string; error: string | null }[] }
+  /** The Docker server's nightly backup; null (or absent) where none is expected, as on Vercel. */
+  backup?: { lastOkAt: string | null; stale: boolean } | null
   failedMessages: {
     id: string
     kind: string
@@ -535,8 +593,25 @@ export interface Attention {
     order: { id: string; number: string } | null
     preorderNumber: string | null
   }[]
-  stuckRefunds: { type: 'order' | 'preorder'; id: string; number: string; requestedAt: string }[]
-  webhookFailures: { id: string; source: 'razorpay' | 'whatsapp'; reason: string; eventKey: string | null; createdAt: string }[]
+  /**
+   * type 'payment': a payment that matched no order (id is its payment id). paymentId is set for a
+   * second payment too. state 'unsent': still retrying (a manager may record it paid back another way).
+   */
+  stuckRefunds: { type: 'order' | 'preorder' | 'payment'; id: string; number: string; requestedAt: string; paymentId?: string | null; state?: 'unsent' | 'unconfirmed' }[]
+  /** Not yet marked resolved. refundable: a captured payment that still matches nothing (a manager may refund it). */
+  webhookFailures: { id: string; source: 'razorpay' | 'whatsapp'; reason: string; eventKey: string | null; createdAt: string; paymentId?: string | null; refundable?: boolean }[]
+  /** Chargebacks still open at Razorpay; answered in the Razorpay dashboard. */
+  disputes?: {
+    id: string
+    paymentId: string | null
+    status: string
+    amount: number | null
+    reasonCode: string | null
+    respondBy: string | null
+    createdAt: string
+    order: { id: string; number: string } | null
+    preorderNumber: string | null
+  }[]
   /** Orders missed too many times: call the customer before sending them out again. */
   failedDeliveries?: { id: string; number: string; name: string | null; phone: string | null; attempts: number }[]
   /** New 1 and 2 star reviews still waiting for a look. */
@@ -545,6 +620,35 @@ export interface Attention {
   photoDeliveries?: PhotoDelivery[]
   /** Stock lines whose counters disagree with the ledger: [counter, source] pairs. */
   ledgerDrift?: LedgerDrift[]
+  /** Paid orders past their date or out for delivery too long. */
+  overdueOrders?: OverdueOrder[]
+  /** Missed deliveries whose retry can't go out as packed (too old, no younger stock): a manager decides. */
+  retryDecisions?: { id: string; number: string; deliveryDate: string; reason: string | null }[]
+  /** Paid preorders moved forward too often or booked past the season end. */
+  preorderDecisions?: { id: string; number: string; customerName: string | null; sku: string; qty: number; weekStart: string; movedCount: number; reason: string }[]
+  /** Cancelled or returned orders whose boxes are still to be put back or written off. */
+  returnedStock?: { id: string; number: string; status: OrderStatus; boxes: number }[]
+}
+
+/** Stock counters: on hand, the reserve buffer, held for unpaid orders and to pack for paid ones. */
+export interface LineCounters {
+  onHand: number
+  reserveBuffer: number
+  held: number
+  committed: number
+}
+
+/** What repairing a drifting line from the ledger would change (GET /batches/:id/lines/:lineId/repair). */
+export interface LedgerRepairPlan {
+  lineId: string
+  batchId: string
+  sku?: string
+  drifting: boolean
+  before: LineCounters | null
+  after: LineCounters | null
+  canRepair: boolean
+  problem: string | null
+  repaired?: boolean
 }
 
 export interface LedgerDrift {

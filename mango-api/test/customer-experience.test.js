@@ -24,6 +24,10 @@ beforeEach(async () => {
 
 const pay = (orderId) => api.post('/v1/dev/pay', { orderId, outcome: 'captured' })
 const confirmWith = async (token, address, { gift } = {}) => {
+  // One unpaid order at a time (INV-02): cancel the last one first, as a customer would.
+  for (const o of (await api.get('/v1/orders', { token })).body) {
+    if (o.status === 'PAYMENT_PENDING') assert.equal((await api.post(`/v1/orders/${o.id}/cancel`, undefined, { token })).status, 204)
+  }
   await api.post('/v1/cart/items', { sku: 'ALP-3', stage: 'RIPE', qty: 1 }, { token })
   const q = await api.post('/v1/checkout/quote', { pincode: '560034' }, { token })
   assert.equal(q.status, 200, JSON.stringify(q.body))
@@ -84,8 +88,9 @@ describe('saved addresses', () => {
     assert.equal((await api.get('/v1/me/addresses', { token: cust.accessToken })).body.length, 0)
     const own = await confirmWith(cust.accessToken, '12, 4th Cross, Koramangala, Bengaluru')
     assert.equal((await api.get('/v1/me/addresses', { token: cust.accessToken })).body.length, 1)
-    // Unpaid, so cancelling closes them with nothing to refund.
-    for (const o of [gift, own]) assert.equal((await api.post(`/v1/orders/${o.orderId}/cancel`, undefined, { token: cust.accessToken })).status, 204)
+    // Unpaid, so cancelling closes it with nothing to refund (the gift order was cancelled to place this one).
+    assert.equal((await api.get(`/v1/orders/${gift.orderId}`, { token: cust.accessToken })).body.status, 'CANCELLED')
+    for (const o of [own]) assert.equal((await api.post(`/v1/orders/${o.orderId}/cancel`, undefined, { token: cust.accessToken })).status, 204)
     assert.equal((await api.del('/v1/me', { token: cust.accessToken })).status, 204)
     assert.equal((await query('SELECT COUNT(*)::int AS n FROM customer_addresses')).rows[0].n, 0)
   })

@@ -83,7 +83,9 @@ export async function migrate(pool, { dir = DIR, lockTimeout = MIGRATION_LOCK_TI
           await client.query('ROLLBACK')
           if (err.code === LOCK_NOT_AVAILABLE && attempt < attempts) {
             logger.warn({ file, attempt }, 'migration waited too long for a table lock; trying again')
-            await new Promise((r) => setTimeout(r, retryMs))
+            await new Promise((r) => {
+              setTimeout(r, retryMs)
+            })
             continue
           }
           const hint = err.code === LOCK_NOT_AVAILABLE ? ` (a table it changes stayed locked for over ${lockTimeout}, ${attempts} times: look for a long transaction in pg_stat_activity)` : ''

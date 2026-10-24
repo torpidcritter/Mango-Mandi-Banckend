@@ -3,9 +3,11 @@
 // payments (failed attempts, double charges), shared rate limits, cross-site
 // session requests, rider scoping, delivery retries, account deletion, and
 // the database environment guard.
+import sharp from 'sharp'
 import { adminToken, checkout, client, closeAll, customerToken, line, makeBatch, resetDb, signWebhook, startServer, T0 } from './helpers.js'
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
+import { drainBackground } from '../src/background.js'
 import { withBudget } from '../src/budget.js'
 import { setNow } from '../src/clock.js'
 import { pool, query, tx } from '../src/db.js'
@@ -202,6 +204,7 @@ describe('payments', () => {
     const c = await checkout(api, (await customerToken(api)).accessToken, [{ sku: 'ALP-3', stage: 'RIPE', qty: 1 }])
     assert.equal((await hook(captured('pay_a', c.body))).body.result, 'confirmed')
     assert.equal((await hook(captured('pay_b', c.body))).body.result, 'duplicate_payment')
+    await drainBackground() // the refund goes out after the webhook has been answered (PAY-B1)
     const dup = (await query('SELECT * FROM duplicate_payments')).rows
     assert.equal(dup.length, 1)
     assert.equal(dup[0].payment_id, 'pay_b')
@@ -290,8 +293,10 @@ describe('riders and deliveries', () => {
     await makeBatch({ age: 5, rating: 'SEMI_RIPE', lines: { 'ALP-3': 5 } })
     const o = await packedOrder(await customerToken(api))
     for (let i = 1; i <= 3; i++) {
+      // Each retry is on a later day (OPS-01).
+      if (i > 1) setNow(new Date(Date.parse(T0) + (i - 1) * 86_400_000).toISOString())
       assert.equal((await api.post(`/admin/v1/orders/${o.orderId}/dispatch`, undefined, { token: admin })).status, 204)
-      const r = await api.post(`/admin/v1/orders/${o.orderId}/delivery`, { outcome: 'FAILED', reason: 'NOT_HOME' }, { token: admin })
+      const r = await api.post(`/admin/v1/orders/${o.orderId}/delivery`, { outcome: 'FAILED', reason: 'NOT_HOME', attempt: i }, { token: admin })
       assert.equal(r.status, 200, JSON.stringify(r.body))
     }
     const after = await order(o.orderId)
@@ -310,7 +315,7 @@ describe('riders and deliveries', () => {
     const o = await packedOrder(cust)
     await query(`UPDATE orders SET gift_recipient_name = 'Asha', gift_recipient_phone = '+919876500099', gift_message = 'Happy Diwali' WHERE id = $1`, [o.orderId])
     await api.post(`/admin/v1/orders/${o.orderId}/dispatch`, undefined, { token: rider })
-    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 7)])
+    const jpeg = await sharp({ create: { width: 16, height: 12, channels: 3, background: '#fa0' } }).jpeg().toBuffer()
     const photo = await api.raw('POST', `/admin/v1/orders/${o.orderId}/delivery-photos`, { token: rider, headers: { 'Content-Type': 'image/jpeg' }, raw: jpeg })
     assert.equal(photo.status, 201)
     const done = await api.post(`/admin/v1/orders/${o.orderId}/delivery`, { outcome: 'DELIVERED', photoId: photo.body.id, receivedBy: 'Security guard' }, { token: rider })

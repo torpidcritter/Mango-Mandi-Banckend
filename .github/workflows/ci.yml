@@ -15,10 +15,25 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # SEC-12: no high or critical advisory in what the shop and panel ship.
+      - name: Dependency audit (shipped packages)
+        run: npm audit --omit=dev --audit-level=high
       - run: npm run typecheck
+      - name: Lint (panel, shop and the API; eslint.config.mjs)
+        run: npm run lint
+      - name: Unit tests (the API clients)
+        run: npm run test:unit
       - run: npm run build
       - name: Build the customer app
         run: npm run shop:build
+        env:
+          # A made-up number for the build check only; production sets the shop's real one.
+          VITE_SUPPORT_WHATSAPP: '910000000000'
+      # Bundle safety: no secrets, dev routes, demo accounts or mock providers in
+      # what ships to browsers (scripts/scan-bundle.mjs; the Vercel builds run it
+      # too, with --forbid-localhost, so a build without VITE_API_URL fails).
+      - name: Scan the built shop and panel
+        run: npm run scan:bundle
       - run: npx playwright install --with-deps chromium
       # Every panel spec. They mock the API, except day-in-the-life, which
       # skips here (no E2E_EMAIL) and runs against the real API in the e2e job.
@@ -58,6 +73,8 @@ jobs:
           cache: npm
           cache-dependency-path: mango-api/package-lock.json
       - run: npm ci
+      - name: Dependency audit (API packages)
+        run: npm audit --omit=dev --audit-level=high
       - name: API tests (engine, flows, concurrency)
         run: npm test
         env:
@@ -97,9 +114,36 @@ jobs:
           TEST_DATABASE_URL: postgres://mango:mango@db-pooler.local:6543/mango_test
           DATABASE_URL_UNPOOLED: postgres://mango:mango@localhost:5432/mango_test
 
+  # OPS-12: a deploy migrates first, and a rollback keeps the new schema, so
+  # the previous release must still pass its own tests on the new tables.
+  previous-release-on-new-schema:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mango
+          POSTGRES_PASSWORD: mango
+          POSTGRES_DB: mango_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U mango" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Old API's tests on the new migrations
+        working-directory: mango-api
+        run: ./scripts/n-minus-1.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
+        env:
+          TEST_DATABASE_URL: postgres://mango:mango@localhost:5432/mango_test
+
   e2e:
     runs-on: ubuntu-latest
-    needs: [build-and-test, api]
+    needs: [build-and-test, api, previous-release-on-new-schema]
     services:
       postgres:
         image: postgres:16
@@ -163,6 +207,8 @@ jobs:
       API_DOMAIN: api.example.in
       ACME_EMAIL: ops@example.in
       POSTGRES_PASSWORD: ci-only
+      # A made-up help number for the image build check; production sets the real one in deploy/.env.
+      VITE_SUPPORT_WHATSAPP: '910000000000'
     steps:
       - uses: actions/checkout@v4
       - run: touch .env

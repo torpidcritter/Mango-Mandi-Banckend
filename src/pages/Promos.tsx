@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { rupees } from '../format'
 import type { NewPromo, Promo } from '../types'
-import { Dialog, EmptyState, FormError, QueryError, Spinner, useToast, scrollRegion } from '../ui'
+import { Dialog, EmptyState, FormError, QueryError, Spinner, useToast, scrollRegion, usePageTitle } from '../ui'
 
 export function promoText(p: Pick<Promo, 'kind' | 'value' | 'maxDiscount'>): string {
   if (p.kind === 'FLAT') return `${rupees(p.value)} off`
@@ -22,6 +22,7 @@ function rules(p: Promo): string {
 }
 
 export default function Promos() {
+  usePageTitle('Promo codes')
   const toast = useToast()
   const queryClient = useQueryClient()
   const q = useQuery({ queryKey: ['promos'], queryFn: api.promos })

@@ -1,5 +1,5 @@
 import type { Page, Route } from '@playwright/test'
-import type { Attention, AuditEntry, Product, Promo, Review, ReviewInsights, StaffMember } from '../src/types'
+import type { Attention, AuditEntry, LedgerEntry, Product, Promo, Review, ReviewInsights, StaffMember } from '../src/types'
 
 /** A 1×1 PNG. */
 const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64')
@@ -52,12 +52,13 @@ export function seed() {
       openClaims: 2,
       batchesNearLimit: [{ id: 'b1', variety: 'Alphonso', ageDays: 7, available: 12 }],
       lowStock: [{ sku: 'ALP-5', productName: 'Alphonso 5kg Box', available: 3 }],
+      maxSellableAge: 7,
     },
     products: [
-      { sku: 'ALP-3', name: 'Alphonso 3kg Box', variety: 'Alphonso', boxSize: '3kg', price: 189900, gstRate: 0, hsnCode: '08045020', description: 'Saffron flesh, rich and sweet.', active: true, sortOrder: 0 },
-      { sku: 'ALP-5', name: 'Alphonso 5kg Box', variety: 'Alphonso', boxSize: '5kg', price: 299900, gstRate: 0, hsnCode: '08045020', description: '', active: true, sortOrder: 0 },
-      { sku: 'KES-3', name: 'Kesar 3kg Box', variety: 'Kesar', boxSize: '3kg', price: 159900, gstRate: 0, hsnCode: '08045020', description: '', active: true, sortOrder: 0 },
-      { sku: 'TOT-3', name: 'Totapuri 3kg Box', variety: 'Totapuri', boxSize: '3kg', price: 79900, gstRate: 0, hsnCode: '08045020', description: '', active: false, sortOrder: 0 },
+      { sku: 'ALP-3', name: 'Alphonso 3kg Box', variety: 'Alphonso', boxSize: '3kg', price: 189900, gstRate: 0, hsnCode: '08045020', description: 'Saffron flesh, rich and sweet.', active: true, sortOrder: 0, photoUrl: '/v1/products/ALP-3/photo?v=1' },
+      { sku: 'ALP-5', name: 'Alphonso 5kg Box', variety: 'Alphonso', boxSize: '5kg', price: 299900, gstRate: 0, hsnCode: '08045020', description: '', active: true, sortOrder: 0, photoUrl: null },
+      { sku: 'KES-3', name: 'Kesar 3kg Box', variety: 'Kesar', boxSize: '3kg', price: 159900, gstRate: 0, hsnCode: '08045020', description: '', active: true, sortOrder: 0, photoUrl: null },
+      { sku: 'TOT-3', name: 'Totapuri 3kg Box', variety: 'Totapuri', boxSize: '3kg', price: 79900, gstRate: 0, hsnCode: '08045020', description: '', active: false, sortOrder: 0, photoUrl: null },
     ] as Product[],
     batch: {
       id: 'b1',
@@ -81,7 +82,7 @@ export function seed() {
     ledger: [
       { eventType: 'INTAKE', sku: 'ALP-3', delta: 20, actorType: 'admin', actorId: 'ops@mandimangoes.test', reason: null, createdAt: '2026-10-08T05:00:00Z' },
       { eventType: 'PACK', sku: 'ALP-3', delta: -2, actorType: 'admin', actorId: 'ops@mandimangoes.test', reason: null, createdAt: '2026-10-10T05:00:00Z' },
-    ],
+    ] as LedgerEntry[],
     orders: {
       page: 1,
       pageSize: 50,
@@ -195,7 +196,7 @@ export function seed() {
       { code: 'DIWALI10', kind: 'PERCENT', value: 10, maxDiscount: 30000, minSubtotal: 100000, startsOn: null, endsOn: '2026-11-05', maxUses: null, perCustomer: 1, firstOrderOnly: false, active: true, description: 'Diwali offer', uses: 4, discountGiven: 52000, createdBy: 'manager@mandimangoes.test', createdAt: '2026-10-10T05:00:00Z' },
     ] as Promo[],
     claims: [
-      { id: 'c1', orderId: 'o2', orderNumber: 'ORD-1043', orderTotal: 129900, customerPhone: '9123456780', issueType: 'DAMAGED', description: 'Two mangoes were crushed.', affectedItems: ['ALP-3'], photoUrl: 'https://abc123.public.blob.vercel-storage.com/claims/p.jpg', photos: [{ id: 'cph1' }], status: 'SUBMITTED', resolution: null, createdAt: '2026-10-14T07:00:00Z' },
+      { id: 'c1', orderId: 'o2', orderNumber: 'ORD-1043', orderTotal: 129900, customerPhone: '9123456780', issueType: 'DAMAGED', description: 'Two mangoes were crushed.', affectedItems: ['ALP-3'], photoUrl: 'https://abc123.public.blob.vercel-storage.com/claims/p.jpg', photos: [{ id: 'cph1' }], status: 'SUBMITTED', resolution: null, rejectionReason: null, createdAt: '2026-10-14T07:00:00Z' },
       { id: 'c2', orderId: 'o2', orderNumber: 'ORD-1043', orderTotal: 129900, customerPhone: '9123456780', issueType: 'WRONG_ITEM', description: 'Got Kesar instead of Alphonso.', affectedItems: ['ALP-3'], photoUrl: null, status: 'UNDER_REVIEW', resolution: null, createdAt: '2026-10-14T07:30:00Z' },
     ],
     reviews: [
@@ -255,6 +256,11 @@ export function seed() {
         nearLimitAge: 5,
         lowStockThreshold: 5,
         claimWindowHours: 24,
+        maxUnpaidOrders: 1,
+        maxHeldBoxes: 40,
+        outForDeliveryAlertHours: 8,
+        maxPreorderMoves: 3,
+        seasonEndsOn: null as string | null,
         stageProfiles: {
           default: [
             { stage: 'RAW', minAge: 3, maxAge: 3 },
@@ -287,6 +293,9 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
     },
     calls: [],
   }
+
+  // Product photos are served by the customer API (public).
+  await page.route('**/v1/products/*/photo**', (route) => route.fulfill({ status: 200, contentType: 'image/png', body: TINY_PNG }))
 
   await page.route('**/admin/v1/**', async (route) => {
     const req = route.request()
@@ -335,11 +344,20 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
       state.twoStep = { ...state.twoStep, enabled: true }
       return json(route, 200, { recoveryCodes: ['abcd-efgh', 'jkmn-pqrs', 'tuvw-xyz2', '3456-789a', 'bcde-fghj', 'kmnp-qrst', 'uvwx-yz23', '4567-89ab', 'cdef-ghjk', 'mnpq-rstu'], accessToken: 'tok', expiresIn: 900 })
     }
+    if (path === '/me/password') {
+      const b = body as { currentPassword: string; newPassword: string }
+      if (b.currentPassword !== 'correct') return json(route, 422, { error: { code: 'WRONG_PASSWORD', message: 'Your current password is not right.', requestId: 'req_p' } })
+      return json(route, 200, { accessToken: 'tok2', expiresIn: 900 })
+    }
     if (path === '/me/two-step/disable') {
       state.twoStep = { ...state.twoStep, enabled: false }
       return route.fulfill({ status: 204 })
     }
     if (state.twoStep.required && !state.twoStep.enabled) return json(route, 403, { error: { code: 'TWO_STEP_SETUP_REQUIRED', message: 'Set up two-step sign-in first', requestId: 'req_s' } })
+    if (path === '/staff/sign-out-all') {
+      if (state.role !== 'MANAGER') return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Requires manager role', requestId: 'req_f' } })
+      return json(route, 200, { signedOut: state.staff.length - 1, keptMe: (body as { keepMe?: boolean })?.keepMe !== false })
+    }
     if (/^\/staff\/[^/]+\/two-step\/reset$/.test(path)) {
       const staffId = path.split('/')[2]
       state.staff = state.staff.map((s) => (s.id === staffId ? { ...s, twoStep: false } : s))
@@ -371,6 +389,43 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
 
     if (path === '/summary') return json(route, 200, state.summary)
     if (path === '/attention') return json(route, 200, state.attention)
+    // Manager ways out of Needs attention items (src/admin/recovery.js). Each takes the item off the list.
+    const managerOnly = () => json(route, 403, { error: { code: 'FORBIDDEN', message: 'Requires manager role', requestId: 'req_f' } })
+    const repair = /^\/batches\/([^/]+)\/lines\/([^/]+)\/repair$/.exec(path)
+    if (repair) {
+      if (state.role !== 'MANAGER') return managerOnly()
+      const d = (state.attention.ledgerDrift ?? []).find((x) => x.lineId === repair[2])
+      const plan = d
+        ? {
+            lineId: d.lineId, batchId: d.batchId, sku: d.sku, drifting: true, canRepair: true, problem: null,
+            before: { onHand: d.onHand[0], reserveBuffer: d.reserveBuffer[0], held: d.held[0], committed: d.committed[0] },
+            after: { onHand: d.onHand[1], reserveBuffer: d.reserveBuffer[1], held: d.held[1], committed: d.committed[1] },
+          }
+        : { lineId: repair[2], batchId: repair[1], drifting: false, before: null, after: null, canRepair: false, problem: null }
+      if (method === 'GET') return json(route, 200, plan)
+      state.attention = { ...state.attention, ledgerDrift: (state.attention.ledgerDrift ?? []).filter((x) => x.lineId !== repair[2]) }
+      return json(route, 200, { ...plan, repaired: true })
+    }
+    const hookAct = /^\/webhook-failures\/([^/]+)\/(resolve|refund)$/.exec(path)
+    if (hookAct) {
+      if (state.role !== 'MANAGER') return managerOnly()
+      state.attention = { ...state.attention, webhookFailures: state.attention.webhookFailures.filter((w) => w.id !== hookAct[1]) }
+      return json(route, 200, hookAct[2] === 'refund' ? { paymentId: 'pay_x', queued: true } : { id: hookAct[1] })
+    }
+    if (/^\/preorders\/[^/]+\/keep$/.test(path)) {
+      if (state.role !== 'MANAGER') return managerOnly()
+      state.attention = { ...state.attention, preorderDecisions: (state.attention.preorderDecisions ?? []).filter((p) => p.id !== path.split('/')[2]) }
+      return json(route, 200, { id: path.split('/')[2], kept: true })
+    }
+    if (/^\/refunds\/[^/]+\/paid-another-way$/.test(path)) {
+      if (state.role !== 'MANAGER') return managerOnly()
+      const refundId = path.split('/')[2]
+      if (((body as { reference?: string })?.reference ?? '').length < 3) {
+        return json(route, 400, { error: { code: 'VALIDATION_ERROR', message: 'Give the reference of the payment you made', requestId: 'req_v' } })
+      }
+      state.attention = { ...state.attention, stuckRefunds: state.attention.stuckRefunds.filter((r) => r.id !== refundId && r.paymentId !== refundId) }
+      return json(route, 200, { id: refundId, refundId: `manual:${(body as { reference: string }).reference}` })
+    }
     if (/^\/notifications\/[^/]+\/retry$/.test(path)) return route.fulfill({ status: 204 })
     if (path === '/products' && method === 'GET') return json(route, 200, state.products)
     if (path === '/products' && method === 'POST') {
@@ -379,6 +434,12 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
       const made: Product = { ...b, active: true }
       state.products = [...state.products, made]
       return json(route, 201, made)
+    }
+    if (/^\/products\/[^/]+\/photo$/.test(path)) {
+      const sku = decodeURIComponent(path.split('/')[2])
+      const photoUrl = method === 'DELETE' ? null : `/v1/products/${sku}/photo?v=${Date.now()}`
+      state.products = state.products.map((x) => (x.sku === sku ? { ...x, photoUrl } : x))
+      return json(route, 200, state.products.find((x) => x.sku === sku))
     }
     if (/^\/products\/[^/]+$/.test(path)) {
       const sku = decodeURIComponent(path.split('/')[2])
@@ -427,18 +488,50 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
         notMoved: [{ ...picked[1], reason: 'No stock on 2026-10-16 or any later open date' }],
       })
     }
+    if (/^\/orders\/[^/]+\/returned-stock$/.test(path)) return json(route, 200, { boxes: 2 })
     if (/^\/orders\/[^/]+\/status$/.test(path)) {
       // DELIVERED from the panel is a manager's override with a reason (mirrors the API).
       const b = body as { status: string; override?: boolean; reason?: string }
       if (b.override && state.role !== 'MANAGER') return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Only a manager can override this', requestId: 'req_x' } })
       if (b.status === 'DELIVERED' && !b.override) return json(route, 403, { error: { code: 'FORBIDDEN', message: 'Only a manager can mark it delivered without proof.', requestId: 'req_x' } })
       if (b.override && !b.reason) return json(route, 400, { error: { code: 'REASON_REQUIRED', message: 'Say why', requestId: 'req_x' } })
+      // Pack list orders move on too; PACKED needs every box packed first (mirrors the API's NOT_ALLOCATED).
+      const packing = state.packList.find((o) => o.id === path.split('/')[2])
+      if (packing) {
+        if (b.status === 'PACKED' && !packing.items.every((it) => it.picks.length > 0 && it.picks.every((pk) => pk.packed))) {
+          return json(route, 400, { error: { code: 'NOT_ALLOCATED', message: 'Allocate the stock before marking the order packed', requestId: 'req_x' } })
+        }
+        packing.status = b.status
+      }
       return route.fulfill({ status: 204 })
     }
-    if (/^\/orders\/[^/]+\/(allocate|cancel|reschedule)$/.test(path)) return route.fulfill({ status: 204 })
+    if (/^\/orders\/[^/]+\/allocate$/.test(path)) {
+      // Picks every box from b1 and packs it, without moving the order on (mirrors allocateOrder).
+      const packing = state.packList.find((o) => o.id === path.split('/')[2])
+      if (packing) {
+        packing.items = packing.items.map((it) => ({
+          ...it,
+          picks: [{ batchId: 'b1', variety: 'Alphonso', pluckedOn: '2026-10-08', quantity: it.quantity, packed: true }],
+        }))
+      }
+      return route.fulfill({ status: 204 })
+    }
+    if (/^\/orders\/[^/]+\/(cancel|reschedule)$/.test(path)) return route.fulfill({ status: 204 })
 
     if (path === '/pack-list') return json(route, 200, state.packList)
     if (path === '/manifest') return json(route, 200, state.manifest)
+    // Giving stops to riders (SEC-02).
+    if (path === '/riders') return json(route, 200, [{ id: 'adm9', email: 'rider@mandimangoes.test' }])
+    if (path === '/manifest/assign') {
+      const b = body as { riderId: string | null; orderIds?: string[] }
+      const assigned: string[] = []
+      for (const o of state.manifest.runs.flatMap((r) => r.stops.flatMap((st) => st.orders)) as { id: string; number: string; rider?: unknown }[]) {
+        if (b.orderIds && !b.orderIds.includes(o.id)) continue
+        o.rider = b.riderId ? { id: b.riderId, email: 'rider@mandimangoes.test' } : null
+        assigned.push(o.number)
+      }
+      return json(route, 200, { assigned })
+    }
     if (path === '/manifest/dispatch') {
       const dispatched: string[] = []
       for (const o of state.manifest.runs.flatMap((r) => r.stops.flatMap((st) => st.orders))) {
@@ -589,3 +682,6 @@ export async function mockApi(page: Page, opts: MockOptions = {}): Promise<MockS
 
   return state
 }
+
+/** A 1x1 orange PNG. */
+export const TINY_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==', 'base64')

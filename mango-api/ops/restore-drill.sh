@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Restore drill for Neon: proves the database can be brought back to a point in
 # time and that what comes back is usable. Run it before launch and once a
-# month in season. Targets: RPO under 1 minute (Neon keeps every change for the
-# history window, 7 days on Launch), RTO 1 hour (restore, check, repoint).
+# month in season. Targets: RPO under 1 minute inside Neon's history window,
+# RTO 1 hour (restore, check, repoint). The window is 1 day by default on paid
+# plans (6 hours on Free) until it is raised: deploy/VERCEL.md step 1.5 sets it
+# to 7 days (the Launch plan's maximum). A point older than the window can't be
+# branched from; use the nightly off-Neon dump (backup.yml) instead.
 #
 # 1. Make a branch of main as it was a few minutes ago (console: Branches →
 #    Create branch → "Point in time"), or with the Neon CLI:
@@ -32,5 +35,10 @@ drift=$(q "SELECT COUNT(*) FROM batch_lines l WHERE l.on_hand <> COALESCE((SELEC
              WHERE g.batch_id = l.batch_id AND g.sku = l.sku AND g.event_type IN ('INTAKE','ADJUST','CONDEMN','RETIRE','PACK','RESTOCK')), 0)")
 held=$(q "SELECT COUNT(*) FROM batch_lines l WHERE l.held <> COALESCE((SELECT SUM(quantity) FROM order_stock s WHERE s.line_id = l.id AND s.state = 'held'), 0)
              OR l.committed <> COALESCE((SELECT SUM(quantity) FROM order_stock s WHERE s.line_id = l.id AND s.state = 'committed'), 0)")
-if [ "$drift" != "0" ] || [ "$held" != "0" ]; then echo "FAILED: $drift on-hand and $held held/committed lines disagree with their sources"; exit 1; fi
+# The reserve buffer too, as the app's own audit (src/inventory.js auditLedger) checks it.
+buffer=$(q "SELECT COUNT(*) FROM batch_lines l WHERE l.reserve_buffer <> COALESCE((SELECT SUM(delta) FROM batch_ledger g
+             WHERE g.batch_id = l.batch_id AND g.sku = l.sku AND g.event_type = 'ADJUST_BUFFER'), 0)")
+if [ "$drift" != "0" ] || [ "$held" != "0" ] || [ "$buffer" != "0" ]; then
+  echo "FAILED: $drift on-hand, $held held/committed and $buffer reserve-buffer lines disagree with their sources"; exit 1
+fi
 echo "restore drill passed in $(( $(date +%s) - start ))s; note the time it took you end to end against the 1 hour target"

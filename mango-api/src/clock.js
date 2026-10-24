@@ -26,4 +26,6 @@ export const addDays = (date, n) => new Date(Date.parse(`${date}T00:00:00Z`) + n
 /** Whole days from b to a (a − b). */
 export const diffDays = (a, b) => Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / DAY_MS)
 
-export const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`))
+// INV-05: the round trip refuses dates JS would roll over (2026-02-31 → 03-03).
+export const isDate = (s) =>
+  typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s

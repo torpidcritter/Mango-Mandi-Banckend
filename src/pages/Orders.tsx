@@ -1,13 +1,12 @@
 import { useEffect, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { api } from '../api'
 import { ORDER_STATUS_LABEL, date, dateTime, rupees } from '../format'
 import { ALL_ORDER_STATUSES, type OrderStatus } from '../types'
-import { ClickableRow, EmptyState, OrderBadge, QueryError, Spinner, scrollRegion } from '../ui'
+import { EmptyState, LinkRow, OrderBadge, QueryError, RowLink, Spinner, StatusFilter, scrollRegion, usePageTitle } from '../ui'
 
 export default function Orders() {
-  const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const status = (params.get('status') as OrderStatus | null) || null
   const from = params.get('from') ?? ''
@@ -15,6 +14,7 @@ export default function Orders() {
   const q = params.get('q') ?? ''
   const page = Math.max(1, Number(params.get('page') ?? '1') || 1)
 
+  usePageTitle('Orders')
   const [search, setSearch] = useState(q)
   useEffect(() => setSearch(q), [q])
 
@@ -33,6 +33,9 @@ export default function Orders() {
     if (search === q) return
     const t = window.setTimeout(() => update({ q: search.trim() || null }), 400)
     return () => window.clearTimeout(t)
+    // Only typing restarts the wait: `update` is a new function every render and `q` follows
+    // the URL this effect writes, so listing them would restart it on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search])
 
   const list = useQuery({
@@ -49,18 +52,15 @@ export default function Orders() {
         <h1>Orders</h1>
       </div>
 
-      <div className="segmented" role="group" aria-label="Filter by status" style={{ marginBottom: '0.75rem' }}>
-        <button type="button" className="btn btn-small" aria-pressed={status === null} onClick={() => update({ status: null })}>
-          All
-        </button>
-        {ALL_ORDER_STATUSES.map((s) => (
-          <button key={s} type="button" className="btn btn-small" aria-pressed={status === s} onClick={() => update({ status: s })}>
-            {ORDER_STATUS_LABEL[s]}
-          </button>
-        ))}
-      </div>
+      <StatusFilter
+        className="mb-3"
+        value={status}
+        options={ALL_ORDER_STATUSES}
+        labels={ORDER_STATUS_LABEL}
+        onChange={(s) => update({ status: s })}
+      />
 
-      <div className="field-inline" style={{ marginBottom: '1rem' }}>
+      <div className="field-inline mb-4">
         <div className="field">
           <label htmlFor="o-from">Placed from</label>
           <input id="o-from" type="date" value={from} onChange={(e) => update({ from: e.target.value || null })} />
@@ -69,8 +69,8 @@ export default function Orders() {
           <label htmlFor="o-to">Placed to</label>
           <input id="o-to" type="date" value={to} onChange={(e) => update({ to: e.target.value || null })} />
         </div>
-        <div className="field" style={{ flex: 1, minWidth: 200 }}>
-          <label htmlFor="o-q">Search order number or phone</label>
+        <div className="field field-grow">
+          <label htmlFor="o-q">Search by order number, phone, name or address</label>
           <input
             id="o-q"
             type="search"
@@ -91,7 +91,7 @@ export default function Orders() {
         <EmptyState>No orders match these filters.</EmptyState>
       ) : (
         <>
-          <div {...scrollRegion('Orders')}>
+          <div {...scrollRegion('Orders', { cards: true })}>
             <table>
               <thead>
                 <tr>
@@ -106,23 +106,27 @@ export default function Orders() {
               </thead>
               <tbody>
                 {list.data.items.map((o) => (
-                  <ClickableRow key={o.id} label={`Open order ${o.number}`} onActivate={() => navigate(`/orders/${o.id}`)}>
-                    <td>
-                      <strong>{o.number}</strong>
+                  <LinkRow key={o.id}>
+                    <td className="card-title">
+                      <RowLink to={`/orders/${o.id}`}>{o.number}</RowLink>
                       {o.channel === 'whatsapp' && <div className="muted small">via WhatsApp</div>}
                     </td>
-                    <td>
+                    <td data-label="Customer">
                       {o.customerName ?? '—'}
                       {o.phone && <div className="muted small">{o.phone}</div>}
                     </td>
-                    <td className="num">{o.itemCount}</td>
-                    <td className="num">{rupees(o.total)}</td>
-                    <td>
+                    <td className="num" data-label="Items">
+                      {o.itemCount}
+                    </td>
+                    <td className="num" data-label="Total">
+                      {rupees(o.total)}
+                    </td>
+                    <td className="card-status">
                       <OrderBadge status={o.status} />
                     </td>
-                    <td>{date(o.deliveryDate)}</td>
-                    <td>{dateTime(o.placedAt)}</td>
-                  </ClickableRow>
+                    <td data-label="Delivery">{date(o.deliveryDate)}</td>
+                    <td data-label="Placed">{dateTime(o.placedAt)}</td>
+                  </LinkRow>
                 ))}
               </tbody>
             </table>

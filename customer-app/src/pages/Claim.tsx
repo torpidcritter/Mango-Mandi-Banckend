@@ -1,16 +1,13 @@
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, errorMessage, type IssueType } from '../api'
-import { shrinkPhoto } from '../photo'
+import { api, type IssueType } from '../api'
+import { Field, PhotoPicker, usePhotoUploads } from '../forms'
 import { ErrorNote, Spinner } from '../ui'
 
 const MAX_PHOTOS = 3
-
-interface Pic {
-  id: string
-  preview: string
-}
+/** The claim window in words, from the order's live rule ("a day" while we don't know it). */
+const within = (hours: number | undefined) => (!hours || hours === 24 ? 'a day' : `${hours} hours`)
 
 const ISSUES: { value: IssueType; label: string }[] = [
   { value: 'DAMAGED', label: 'Damaged or spoilt mangoes' },
@@ -26,13 +23,8 @@ export default function ClaimPage() {
   const [issue, setIssue] = useState<IssueType | null>(null)
   const [skus, setSkus] = useState<string[]>([])
   const [description, setDescription] = useState('')
-  const [photos, setPhotos] = useState<Pic[]>([])
-  const [uploading, setUploading] = useState(false)
-  const [photoError, setPhotoError] = useState<string | null>(null)
-  const [formError, setFormError] = useState<string | null>(null)
-  const previews = useRef(photos)
-  previews.current = photos
-  useEffect(() => () => previews.current.forEach((p) => URL.revokeObjectURL(p.preview)), [])
+  const { photos, uploading, error: photoError, add: addPhotos, remove: removePhoto } = usePhotoUploads(api.uploadClaimPhoto, MAX_PHOTOS)
+  const [formError, setFormError] = useState<{ at?: 'issue' | 'desc'; message: string } | null>(null)
   const send = useMutation({
     mutationFn: () =>
       api.raiseClaim({ orderId: id, issueType: issue!, description: description.trim(), itemSkus: skus, photoIds: photos.map((p) => p.id) }),
@@ -48,36 +40,10 @@ export default function ClaimPage() {
   function submit(e: FormEvent) {
     e.preventDefault()
     setFormError(null)
-    if (!issue) return setFormError('Choose what went wrong.')
-    if (description.trim().length < 5) return setFormError('Tell us a little about what happened.')
-    if (uploading) return setFormError('Wait for the photo to finish uploading.')
+    if (!issue) return setFormError({ at: 'issue', message: 'Choose what went wrong.' })
+    if (description.trim().length < 5) return setFormError({ at: 'desc', message: 'Tell us a little about what happened.' })
+    if (uploading) return setFormError({ message: 'Wait for the photo to finish uploading.' })
     send.mutate()
-  }
-
-  async function addPhotos(e: ChangeEvent<HTMLInputElement>) {
-    const files = [...(e.target.files ?? [])].slice(0, MAX_PHOTOS - photos.length)
-    e.target.value = ''
-    if (!files.length) return
-    setPhotoError(null)
-    setUploading(true)
-    try {
-      for (const file of files) {
-        const small = await shrinkPhoto(file)
-        const { id: photoId } = await api.uploadClaimPhoto(small)
-        setPhotos((p) => [...p, { id: photoId, preview: URL.createObjectURL(small) }])
-      }
-    } catch (err) {
-      setPhotoError(errorMessage(err))
-    } finally {
-      setUploading(false)
-    }
-  }
-  function removePhoto(photoId: string) {
-    setPhotos((p) => {
-      const gone = p.find((x) => x.id === photoId)
-      if (gone) URL.revokeObjectURL(gone.preview)
-      return p.filter((x) => x.id !== photoId)
-    })
   }
 
   const skuOptions = [...new Map(order.data.items.map((i) => [i.sku, i.name])).entries()]
@@ -85,10 +51,10 @@ export default function ClaimPage() {
     <section className="card">
       <h1>Report a problem</h1>
       <p className="muted">
-        Order {order.data.number}. Tell us within a day of delivery and we'll replace what went wrong with a fresh box.
+        Order {order.data.number}. Tell us within {within(order.data.claimWindowHours)} of delivery and we'll replace what went wrong with a fresh box.
       </p>
       <form onSubmit={submit} noValidate>
-        <fieldset className="field">
+        <fieldset className="field" aria-describedby={formError?.at === 'issue' ? 'issue-error' : undefined}>
           <legend>What went wrong?</legend>
           <div className="options">
             {ISSUES.map((i) => (
@@ -98,6 +64,11 @@ export default function ClaimPage() {
               </label>
             ))}
           </div>
+          {formError?.at === 'issue' && (
+            <p id="issue-error" className="field-error" role="alert">
+              {formError.message}
+            </p>
+          )}
         </fieldset>
         {skuOptions.length > 1 && (
           <fieldset className="field">
@@ -116,49 +87,23 @@ export default function ClaimPage() {
             </div>
           </fieldset>
         )}
-        <div className="field">
-          <label htmlFor="desc">What happened?</label>
-          <textarea id="desc" rows={4} maxLength={2000} value={description} onChange={(e) => setDescription(e.target.value)} />
-        </div>
-        <div className="field">
-          <span className="label" id="photos-label">
-            Photos (optional, up to {MAX_PHOTOS})
-          </span>
-          {photos.length > 0 && (
-            <ul className="claim-photos" aria-labelledby="photos-label">
-              {photos.map((p, i) => (
-                <li key={p.id}>
-                  <img src={p.preview} alt={`Photo ${i + 1}`} />
-                  <button type="button" className="link-btn" onClick={() => removePhoto(p.id)}>
-                    Remove<span className="sr-only"> photo {i + 1}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-          {photos.length < MAX_PHOTOS && (
-            <label className="btn btn-quiet photo-pick">
-              {uploading ? 'Uploading…' : photos.length ? 'Add another photo' : 'Add a photo'}
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                className="sr-only"
-                disabled={uploading}
-                onChange={addPhotos}
-                aria-describedby={photoError ? 'photo-error' : 'photos-label'}
-              />
-            </label>
-          )}
-          {photoError && (
-            <p id="photo-error" className="field-error" role="alert">
-              {photoError}
-            </p>
-          )}
-        </div>
-        {formError && (
+        <Field id="desc" label="What happened?" error={formError?.at === 'desc' ? formError.message : null}>
+          <textarea rows={4} maxLength={2000} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </Field>
+        <PhotoPicker
+          id="photos"
+          max={MAX_PHOTOS}
+          accept="image/*"
+          alt={(i) => `Photo ${i + 1}`}
+          photos={photos}
+          uploading={uploading}
+          error={photoError}
+          onAdd={addPhotos}
+          onRemove={removePhoto}
+        />
+        {formError && !formError.at && (
           <p className="field-error" role="alert">
-            {formError}
+            {formError.message}
           </p>
         )}
         <ErrorNote error={send.error} />

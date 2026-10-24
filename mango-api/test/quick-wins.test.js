@@ -3,14 +3,13 @@
 import { adminToken, checkout, client, closeAll, customerToken, makeBatch, resetDb, startServer, T0 } from './helpers.js'
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
-import { addDays, setNow, todayIST } from '../src/clock.js'
+import { addDays, setNow } from '../src/clock.js'
 import { query } from '../src/db.js'
 import { sendReorderReminders, sendStockAlerts } from '../src/engagement.js'
 import { readyWords, sendDueNotifications } from '../src/notify.js'
 
 let srv
 let api
-let admin
 before(async () => {
   srv = await startServer()
   api = client(srv.base)
@@ -21,7 +20,7 @@ after(async () => {
 })
 beforeEach(async () => {
   await resetDb()
-  admin = await adminToken(api)
+  await adminToken(api)
 })
 
 const sendAll = async () => {

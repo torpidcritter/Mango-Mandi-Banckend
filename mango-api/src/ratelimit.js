@@ -47,6 +47,19 @@ export class PgStore {
   }
 }
 
+/** The window of the per-address login-code limit. */
+export const OTP_IP_WINDOW_MS = 15 * 60_000
+
+/**
+ * Login-code requests one address may make per 15 minutes. It was 30, which a
+ * launch-day crowd behind one mobile carrier's NAT address uses up in
+ * minutes. Abuse is stopped by what sits behind it, not by this: Turnstile
+ * before a code is sent, 5 codes an hour and 10 a day per number and
+ * address, 16 a day per number, and the shop's daily SMS budget (customer.js
+ * checkOtpBudget). OTP_IP_LIMIT overrides it.
+ */
+export const otpIpLimit = (e = env) => e.OTP_IP_LIMIT ?? (e.NODE_ENV === 'production' ? 200 : 300)
+
 let limitsInTests = false
 /** Tests that check a limiter turn the shared limiters on (they are off under NODE_ENV=test). */
 export function enforceLimitsInTests(on) {

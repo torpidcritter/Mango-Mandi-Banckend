@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ApiError, api, errorMessage, signedInPhone, type Order, type OrderStatus, type Stage } from '../api'
-import { CANCELLABLE, STAGE_LABEL, STATUS_LABEL, day, rupees, slotText, when } from '../format'
+import { ApiError, api, signedInPhone, type Order, type OrderStatus, type Stage } from '../api'
+import { CANCELLABLE, STAGE_LABEL, STATUS_LABEL, day, helpLink, rupees, slotText, when } from '../format'
+import { DayChips, SlotPicker } from '../forms'
 import { MIN_PAY_SECONDS, openRazorpay } from '../payment'
-import { Dialog, ErrorNote, Spinner } from '../ui'
+import { ConfirmDialog, Dialog, DocTitle, ErrorNote, PageHeader, Spinner } from '../ui'
 import { CARE, MangoArt } from '../mango'
 import { useStore } from '../store'
 import { OrderReviews } from './Review'
@@ -28,17 +29,38 @@ const STEPS: { label: string; status: OrderStatus; reached: OrderStatus[] }[] = 
 ]
 /** Orders a customer can still move to another day: confirmed, before packing starts. Mirrors the API. */
 const MOVABLE: OrderStatus[] = ['CONFIRMED']
+/** Packed and on its way: too late to cancel or move. */
+const PACKED_ON: OrderStatus[] = ['PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY']
+/** How long after a hold runs out the page keeps checking for a late payment. */
+const LATE_PAYMENT_WATCH_MS = 30 * 60_000
+const latePaymentPossible = (o: Order | undefined) =>
+  o?.status === 'CANCELLED' &&
+  o.cancelReason === 'HOLD_EXPIRED' &&
+  o.paymentStatus !== 'SUCCEEDED' &&
+  o.refundStatus === null &&
+  Boolean(o.cancelledAt) &&
+  Date.now() - new Date(o.cancelledAt!).getTime() < LATE_PAYMENT_WATCH_MS
 const ISSUE_LABEL = { DAMAGED: 'Damaged or spoilt', WRONG_ITEM: 'Wrong item', NOT_DELIVERED: 'Not delivered' }
 
 export default function OrderPage() {
   const { id = '' } = useParams()
+  const queryClient = useQueryClient()
   const q = useQuery({
     queryKey: ['order', id],
-    queryFn: () => api.order(id),
+    queryFn: async () => {
+      // Still waiting on the payment: the status check also asks Razorpay a
+      // minute after checkout (throttled by the API), so a late webhook can't keep it waiting.
+      if (queryClient.getQueryData<Order>(['order', id])?.status === 'PAYMENT_PENDING') await api.paymentStatus(id).catch(() => null)
+      return api.order(id)
+    },
     refetchInterval: (query) => {
-      const status = query.state.data?.status
+      const o = query.state.data
       // Waiting on the payment: check often. On the way: notice the delivery.
-      return status === 'PAYMENT_PENDING' ? 3000 : status === 'OUT_FOR_DELIVERY' ? 30_000 : false
+      if (o?.status === 'PAYMENT_PENDING') return 3000
+      if (o?.status === 'OUT_FOR_DELIVERY') return 30_000
+      // The hold ran out, but a payment made just before can still land: keep watching for a while.
+      if (latePaymentPossible(o)) return 10_000
+      return false
     },
   })
   if (q.isPending) return <Spinner label="Loading your order" />
@@ -46,6 +68,7 @@ export default function OrderPage() {
     if (q.error instanceof ApiError && q.error.status === 404) {
       return (
         <section className="card">
+          <DocTitle title="Order not found" />
           <h1>Order not found</h1>
           <Link to="/orders">See my orders</Link>
         </section>
@@ -79,11 +102,12 @@ function OrderView({ order }: { order: Order }) {
   const holdLeftMs = order.holdExpiresAt ? new Date(order.holdExpiresAt).getTime() - Date.now() : 0
   const holdOpen = holdLeftMs > 0
   const canPay = holdLeftMs > MIN_PAY_SECONDS * 1000
-  // A payment sheet that failed to open straight after checkout.
-  const sheetError = (useLocation().state as { payError?: string } | null)?.payError ?? null
+  // Straight after checkout: the order was just placed, and maybe the payment sheet failed to open.
+  const arrived = useLocation().state as { payError?: string; placed?: boolean } | null
+  const sheetError = arrived?.payError ?? null
 
   const payAgain = useMutation({
-    mutationFn: () => openRazorpay({ key: payKey!, rzp: order.razorpayOrderId!, total: order.total, number: order.number, holdExpiresAt: order.holdExpiresAt }, signedInPhone()),
+    mutationFn: () => openRazorpay({ orderId: order.id, key: payKey!, rzp: order.razorpayOrderId!, total: order.total, number: order.number, holdExpiresAt: order.holdExpiresAt }, signedInPhone()),
     onSettled: refresh,
   })
   const devPay = useMutation({ mutationFn: (outcome: 'captured' | 'failed') => api.devPay(order.id, outcome), onSettled: refresh })
@@ -95,13 +119,50 @@ function OrderView({ order }: { order: Order }) {
     },
   })
   const paid = order.paymentStatus === 'SUCCEEDED'
+  // The money went back (FE-6): the total row says so rather than "Total".
+  const refunded = order.refundStatus === 'REFUNDED' || order.paymentStatus === 'REFUNDED'
+  const help = helpLink(`Help with order ${order.number}`)
+  // A thank-you once the payment goes through: seen here, or already done when checkout hands over.
+  const [thanks, setThanks] = useState(() => Boolean(arrived?.placed) && paid && order.status !== 'CANCELLED')
+  // After a cancel or a payment the button that was pressed is gone: move focus to the outcome.
+  const cancelledNote = useRef<HTMLElement>(null)
+  const thanksNote = useRef<HTMLElement>(null)
+  const wasStatus = useRef(order.status)
+  useEffect(() => {
+    if (order.status === 'CANCELLED' && wasStatus.current !== 'CANCELLED') cancelledNote.current?.focus()
+    // Paid: straight from waiting, or a late payment that revived an order whose hold ran out.
+    const waited = wasStatus.current === 'PAYMENT_PENDING' || wasStatus.current === 'CANCELLED'
+    if (waited && order.status !== 'PAYMENT_PENDING' && order.status !== 'CANCELLED') setThanks(true)
+    wasStatus.current = order.status
+  }, [order.status])
+  useEffect(() => {
+    if (thanks) thanksNote.current?.focus()
+  }, [thanks])
+  const canMove = MOVABLE.includes(order.status)
+  const canCancel = CANCELLABLE.includes(order.status)
+  const refund = paid ? ' for a full refund' : ''
+  const policy =
+    order.status === 'CONFIRMED'
+      ? `You can change the day until we start preparing it, and cancel${refund} until it's packed.`
+      : order.status === 'PROCESSING'
+        ? `We're preparing your boxes. You can still cancel${refund} until they're packed.`
+        : `You can cancel${refund} until it's packed.`
 
   return (
     <>
-      <div className="title-row">
-        <h1>Order {order.number}</h1>
+      <DocTitle title={`Order ${order.number}`} />
+      <PageHeader title={`Order ${order.number}`}>
         <StatusPill status={order.status} />
-      </div>
+      </PageHeader>
+
+      {thanks && order.status !== 'CANCELLED' && (
+        <section className="card note-card thanks-card" ref={thanksNote} tabIndex={-1} aria-labelledby="thanks-title">
+          <p id="thanks-title">
+            <strong>Thank you, your order is placed.</strong> We'll deliver it on {day(order.deliveryDate)}
+            {order.slot && `, ${slotText(order.slot)}`}.
+          </p>
+        </section>
+      )}
 
       {order.status === 'PAYMENT_PENDING' && (
         <section className="card note-card" aria-live="polite">
@@ -115,7 +176,10 @@ function OrderView({ order }: { order: Order }) {
             </button>
           )}
           {payKey && holdOpen && !canPay && (
-            <p className="small">The hold on your boxes is about to end. If your payment hasn't gone through, place the order again from the shop.</p>
+            <p className="small">
+              The hold on your boxes is about to end. If you've already paid, stay here: this page updates when the payment reaches us. Please
+              don't pay again.
+            </p>
           )}
           {import.meta.env.DEV && !payKey && (
             <div className="dev-pay">
@@ -135,15 +199,28 @@ function OrderView({ order }: { order: Order }) {
       )}
 
       {order.status === 'CANCELLED' && (
-        <section className="card note-card">
+        <section className="card note-card" ref={cancelledNote} tabIndex={-1}>
           <p>
             <strong>This order was cancelled.</strong>{' '}
             {order.refundStatus === 'REFUNDED'
               ? `Your refund of ${rupees(order.total)} has been sent. Banks take up to 5 to 7 days to show it.`
               : order.refundStatus === 'PENDING'
                 ? `Your full refund of ${rupees(order.total)} is on its way.`
-                : 'Nothing was charged.'}
+                : order.cancelReason === 'HOLD_EXPIRED'
+                  ? "We didn't receive your payment in time."
+                  : 'We have no payment for this order. If money has left your account, it is refunded in full.'}
           </p>
+          {order.cancelReason === 'HOLD_EXPIRED' && order.refundStatus === null && (
+            <p className="small">
+              If money has left your account, please don't pay again. A payment that arrives late is still matched to this order and confirmed,
+              moved to the next day with stock if these boxes have sold out.{' '}
+              {latePaymentPossible(order) ? 'This page keeps checking.' : (
+                <>
+                  Check My orders again later, or <Link to="/help">contact us</Link>.
+                </>
+              )}
+            </p>
+          )}
         </section>
       )}
 
@@ -172,12 +249,80 @@ function OrderView({ order }: { order: Order }) {
         </section>
       )}
 
-      {order.status === 'DELIVERY_FAILED' && (
-        <section className="card note-card">
+      {order.status === 'DELIVERED' &&
+        (claim ? (
+          <section className="card">
+            <h2>Your report</h2>
+            <p>
+              {ISSUE_LABEL[claim.issueType]}:{' '}
+              {claim.status === 'RESOLVED'
+                ? claim.resolution === 'REPLACEMENT_APPROVED'
+                  ? 'a free replacement is on its way'
+                  : 'we looked into it and could not offer a replacement'
+                : 'we are looking into it'}
+              .
+            </p>
+            {/* UX-4: staff give a reason for every rejection; the customer sees it in their words. */}
+            {claim.status === 'RESOLVED' && claim.resolution === 'REJECTED' && claim.rejectionReason && (
+              <p className="claim-reason">
+                <strong>Why:</strong> {claim.rejectionReason}
+              </p>
+            )}
+            {claim.status === 'RESOLVED' && claim.resolution === 'REJECTED' && (
+              <p className="small muted">
+                If you think we got it wrong, <Link to="/help">talk to us</Link>.
+              </p>
+            )}
+            {claim.replacementOrder && <Link to={`/orders/${claim.replacementOrder.id}`}>See replacement order {claim.replacementOrder.number}</Link>}
+          </section>
+        ) : (
+          <ClaimPrompt order={order} loading={claims.isPending} />
+        ))}
+
+      {order.findingStock && (
+        <section className="card note-card" role="status">
           <p>
-            <strong>We missed you.</strong> We'll try again on {day(order.deliveryDate)}.
+            <strong>We're finding fresh stock for your order.</strong> Your payment is safe. The delivery day may change, and we'll message you on
+            WhatsApp as soon as it's settled. You can still cancel for a full refund until it's packed.
           </p>
         </section>
+      )}
+
+      {order.status === 'DELIVERY_FAILED' && (
+        <section className="card note-card">
+          {/* No retry booked after the last attempt: never name the missed day as the next one. */}
+          {order.retryScheduled === false ? (
+            <p>
+              <strong>We missed you{order.deliveryFailures > 1 ? ' again' : ''}.</strong> We'll call you to arrange a new delivery.
+            </p>
+          ) : (
+            <p>
+              <strong>We missed you.</strong> We'll try again on {day(order.deliveryDate)}.
+            </p>
+          )}
+        </section>
+      )}
+
+      {(canMove || canCancel) && (
+        <section className="card order-actions" aria-label="Change or cancel">
+          <p className="small">{policy}</p>
+          <div className="order-actions-row">
+            {canMove && (
+              <button type="button" className="btn" onClick={() => setMoving(true)}>
+                Change delivery day
+              </button>
+            )}
+            <button type="button" className="btn btn-danger-quiet" onClick={() => setCancelling(true)}>
+              Cancel order
+            </button>
+          </div>
+        </section>
+      )}
+      {PACKED_ON.includes(order.status) && (
+        <p className="muted small order-policy">
+          It's packed, so it can no longer be cancelled or moved. If a box arrives damaged, report it within {order.claimWindowHours} hours of delivery
+          for a free replacement.
+        </p>
       )}
 
       {!['PAYMENT_PENDING', 'CANCELLED', 'RTO'].includes(order.status) && (
@@ -263,7 +408,7 @@ function OrderView({ order }: { order: Order }) {
           </div>
         )}
         <div className="total-row">
-          <span>{paid ? 'Paid' : 'Total'}</span>
+          <span>{refunded ? 'Refunded' : paid ? 'Paid' : 'Total'}</span>
           <strong>{rupees(order.total)}</strong>
         </div>
       </section>
@@ -272,42 +417,9 @@ function OrderView({ order }: { order: Order }) {
 
       {!['PAYMENT_PENDING', 'CANCELLED', 'RTO'].includes(order.status) && stages.length > 0 && <CareTips stages={stages} />}
 
-      {order.status === 'DELIVERED' &&
-        (claim ? (
-          <section className="card">
-            <h2>Your report</h2>
-            <p>
-              {ISSUE_LABEL[claim.issueType]}:{' '}
-              {claim.status === 'RESOLVED'
-                ? claim.resolution === 'REPLACEMENT_APPROVED'
-                  ? 'a free replacement is on its way'
-                  : 'we looked into it and could not offer a replacement'
-                : 'we are looking into it'}
-              .
-            </p>
-            {claim.replacementOrder && <Link to={`/orders/${claim.replacementOrder.id}`}>See replacement order {claim.replacementOrder.number}</Link>}
-          </section>
-        ) : (
-          <Link to={`/orders/${order.id}/claim`} className="btn btn-block">
-            Report a problem with this order
-          </Link>
-        ))}
-
-      {MOVABLE.includes(order.status) && (
-        <button type="button" className="btn btn-block" onClick={() => setMoving(true)}>
-          Change delivery day
-        </button>
-      )}
-
       {['DELIVERED', 'CANCELLED'].includes(order.status) && (
         <button type="button" className="btn btn-block btn-primary" onClick={buyAgain}>
           Buy these again
-        </button>
-      )}
-
-      {CANCELLABLE.includes(order.status) && (
-        <button type="button" className="btn btn-block btn-danger-quiet" onClick={() => setCancelling(true)}>
-          Cancel order
         </button>
       )}
 
@@ -315,28 +427,59 @@ function OrderView({ order }: { order: Order }) {
         All my orders
       </Link>
 
+      {/* UX-1: always a way to reach us; production builds always have the WhatsApp number. */}
+      <p className="small muted center">
+        Need help with this order?{' '}
+        {help ? (
+          <a href={help} target="_blank" rel="noopener noreferrer">
+            Message us on WhatsApp<span className="sr-only"> (opens WhatsApp)</span>
+          </a>
+        ) : (
+          <Link to="/help">See how to reach us</Link>
+        )}
+      </p>
+
       {moving && <MoveDialog order={order} onClose={() => setMoving(false)} onMoved={refresh} />}
 
       {cancelling && (
-        <Dialog
+        <ConfirmDialog
           title={`Cancel order ${order.number}?`}
+          keepLabel="Keep order"
+          confirmLabel="Cancel order"
+          busyLabel="Cancelling…"
+          busy={cancel.isPending}
+          error={cancel.error}
+          onConfirm={() => cancel.mutate()}
           onClose={() => setCancelling(false)}
-          footer={
-            <>
-              <button type="button" className="btn" data-autofocus onClick={() => setCancelling(false)}>
-                Keep order
-              </button>
-              <button type="button" className="btn btn-danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}>
-                {cancel.isPending ? 'Cancelling…' : 'Cancel order'}
-              </button>
-            </>
-          }
         >
-          <p>{paid ? `You'll get a full refund of ${rupees(order.total)} to the way you paid.` : 'Nothing has been charged for this order.'}</p>
-          {cancel.error && <p className="field-error">{errorMessage(cancel.error)}</p>}
-        </Dialog>
+          <p>{paid ? `You'll get a full refund of ${rupees(order.total)} to the way you paid.` : 'No payment has reached us for this order. If you have just paid, cancelling refunds it in full.'}</p>
+        </ConfirmDialog>
       )}
     </>
+  )
+}
+
+/** On a delivered order: until when a problem can be reported for a free replacement, and the way to do it. */
+function ClaimPrompt({ order, loading }: { order: Order; loading: boolean }) {
+  // The window comes from the API, from the latest delivery and the live rule.
+  const deadline = order.claimUntil ? new Date(order.claimUntil) : null
+  const open = deadline != null && deadline.getTime() > Date.now()
+  // Until the reports load we don't know whether one was sent: keep the space, show nothing.
+  if (loading) return null
+  const report = (
+    <Link to={`/orders/${order.id}/claim`} className="btn btn-block">
+      Report a problem with this order
+    </Link>
+  )
+  // Past our count of the window the link stays: the API has the last word on a late report.
+  if (!open) return report
+  return (
+    <section className="card claim-prompt" aria-label="Report a problem">
+      <p>
+        <strong>Something wrong?</strong> Report it by {when(deadline!.toISOString())} for a free replacement.
+      </p>
+      {report}
+    </section>
   )
 }
 
@@ -431,30 +574,18 @@ function MoveDialog({ order, onClose, onMoved }: { order: Order; onClose: () => 
       ) : (
         <>
           <p className="muted small">Your boxes are packed for the ripeness you chose on the new day.</p>
-          <div className="chips" role="radiogroup" aria-label="New delivery day">
-            {choices.map((d) => (
-              <button key={d} type="button" role="radio" aria-checked={d === date} className="chip" onClick={() => { setDate(d); setSlotId(null) }}>
-                {day(d)}
-              </button>
-            ))}
-          </div>
+          <DayChips
+            label="New delivery day"
+            days={choices}
+            value={date}
+            format={day}
+            onChange={(d) => {
+              setDate(d)
+              setSlotId(null)
+            }}
+          />
           {date && slots.isPending && <Spinner label="Loading delivery times" />}
-          {needSlot && (
-            <fieldset className="field">
-              <legend>Delivery time</legend>
-              <div className="options">
-                {slots.data!.slots.map((sl) => (
-                  <label key={sl.id} className={`option${sl.available ? '' : ' option-off'}`}>
-                    <input type="radio" name="move-slot" checked={slotId === sl.id} disabled={!sl.available} onChange={() => setSlotId(sl.id)} />
-                    <span>
-                      {slotText(sl)}
-                      {!sl.available && <span className="muted small"> · Full</span>}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-          )}
+          {needSlot && <SlotPicker name="move-slot" slots={slots.data!.slots} value={slotId} onChange={setSlotId} />}
         </>
       )}
       <ErrorNote error={problem} />

@@ -4,8 +4,9 @@ import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { now, setNow } from '../src/clock.js'
 import { cleanupExpired } from '../src/maintenance.js'
-import { usePhotoStore } from '../src/photos.js'
-import { query } from '../src/db.js'
+import { cleanImage, usePhotoStore } from '../src/photos.js'
+import sharp from 'sharp'
+import { query, tx } from '../src/db.js'
 import { sendDueNotifications } from '../src/notify.js'
 
 let srv
@@ -29,7 +30,9 @@ beforeEach(async () => {
   rider = await adminToken(api, 'ravi@mandimangoes.test', 'long-enough-1')
 })
 
-const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 7)])
+// A real photo: uploads are re-encoded (EXIF dropped), so what is served back is STORED.
+const JPEG = await sharp({ create: { width: 16, height: 12, channels: 3, background: '#fa0' } }).jpeg().toBuffer()
+const STORED = (await cleanImage(JPEG)).bytes
 
 /** A paid order, packed and ready for the rider. */
 async function packedOrder(cust) {
@@ -93,7 +96,10 @@ describe('proof of delivery', () => {
     await makeBatch({ age: 5, rating: 'SEMI_RIPE', lines: { 'ALP-3': 10 } })
     const cust = await customerToken(api)
     const { id } = await packedOrder(cust)
-    assert.equal((await upload(id, JPEG)).body.error.code, 'INVALID_TRANSITION')
+    // Not the rider's stop until they send it out (SEC-02); and photos wait until it is out.
+    assert.equal((await upload(id, JPEG)).body.error.code, 'NOT_FOUND')
+    const staffUpload = await api.raw('POST', `/admin/v1/orders/${id}/delivery-photos`, { token: admin, headers: { 'Content-Type': 'image/jpeg' }, raw: JPEG })
+    assert.equal(staffUpload.body.error.code, 'INVALID_TRANSITION')
     assert.equal((await api.post(`/admin/v1/orders/${id}/dispatch`, undefined, { token: rider })).status, 204)
 
     assert.equal((await upload(id, Buffer.from('not an image at all'), 'image/png')).body.error.code, 'PHOTO_INVALID')
@@ -108,7 +114,7 @@ describe('proof of delivery', () => {
     })
     const pic = await fetch(`${srv.base}/v1/orders/${id}/delivery-photo`, { headers: { Authorization: `Bearer ${cust.accessToken}` } })
     assert.equal(pic.headers.get('content-type'), 'image/jpeg')
-    assert.ok(Buffer.from(await pic.arrayBuffer()).equals(JPEG))
+    assert.ok(Buffer.from(await pic.arrayBuffer()).equals(STORED))
     const stranger = await customerToken(api)
     assert.equal((await api.get(`/v1/orders/${id}/delivery-photo`, { token: stranger.accessToken })).status, 404)
     const staffPic = await fetch(`${srv.base}/admin/v1/orders/${id}/delivery-photos/${up.body.id}`, { headers: { Authorization: `Bearer ${admin}` } })
@@ -123,14 +129,19 @@ describe('proof of delivery', () => {
     await api.post(`/admin/v1/orders/${id}/dispatch`, undefined, { token: rider })
     const code = (await mine(cust, id)).body.deliveryCode
 
-    assert.equal((await deliver(id, { outcome: 'FAILED' })).body.error.code, 'REASON_REQUIRED')
-    assert.equal((await deliver(id, { outcome: 'FAILED', reason: 'NOT_HOME', note: 'Called twice' })).status, 200)
+    assert.equal((await deliver(id, { outcome: 'FAILED', reason: 'NOT_HOME' })).body.error.code, 'ATTEMPT_REQUIRED')
+    assert.equal((await deliver(id, { outcome: 'FAILED', attempt: 1 })).body.error.code, 'REASON_REQUIRED')
+    assert.equal((await deliver(id, { outcome: 'FAILED', reason: 'NOT_HOME', note: 'Called twice', attempt: 1 })).status, 200)
     const failed = (await api.get(`/admin/v1/orders/${id}`, { token: admin })).body
     assert.equal(failed.status, 'DELIVERY_FAILED')
     assert.notEqual(failed.deliveryDate, date)
     assert.match(failed.events.at(-1).reason, /^Customer not home; retrying on /)
     assert.equal(failed.deliveryAttempts[0].note, 'Called twice')
 
+    // Not again the same day (OPS-01): it goes out on its new day.
+    const sameDay = await api.post('/admin/v1/manifest/dispatch', { date: failed.deliveryDate }, { token: admin })
+    assert.match(sameDay.body.skipped[0]?.reason ?? '', /missed today/)
+    setNow(`${failed.deliveryDate}T04:00:00Z`)
     const retry = await api.post('/admin/v1/manifest/dispatch', { date: failed.deliveryDate }, { token: rider })
     assert.deepEqual(retry.body.dispatched, [failed.number])
     assert.equal((await mine(cust, id)).body.deliveryCode, code)
@@ -172,13 +183,15 @@ describe('proof of delivery', () => {
 
 describe('photos in Blob storage', () => {
   const blobs = new Map()
+  let onPut = null // runs while an upload is in flight
   const fake = {
-    put: async (path, bytes) => (blobs.set(path, Buffer.from(bytes)), path),
+    put: async (path, bytes) => (await onPut?.(), blobs.set(path, Buffer.from(bytes)), path),
     get: async (path) => blobs.get(path) ?? null,
     del: async (path) => void blobs.delete(path),
   }
   beforeEach(() => {
     blobs.clear()
+    onPut = null
     usePhotoStore(fake)
   })
   after(() => usePhotoStore(null))
@@ -198,7 +211,7 @@ describe('photos in Blob storage', () => {
     assert.ok(blobs.has(row.blob_path))
     await deliver(id, { outcome: 'DELIVERED', photoId: up.body.id, receivedBy: 'Neighbour' })
     const pic = await fetch(`${srv.base}/v1/orders/${id}/delivery-photo`, { headers: { Authorization: `Bearer ${cust.accessToken}` } })
-    assert.ok(Buffer.from(await pic.arrayBuffer()).equals(JPEG))
+    assert.ok(Buffer.from(await pic.arrayBuffer()).equals(STORED))
 
     // Claim photos: uploaded first, then sent with the claim.
     assert.equal((await claimPhoto(cust, Buffer.from('nope'))).body.error.code, 'PHOTO_INVALID')
@@ -217,7 +230,7 @@ describe('photos in Blob storage', () => {
     assert.deepEqual(listed.photos.map((p) => p.id), ids.slice(0, 2))
     const staffPic = await fetch(`${srv.base}/admin/v1/claims/${claim.body.id}/photos/${ids[0]}`, { headers: { Authorization: `Bearer ${admin}` } })
     assert.equal(staffPic.status, 200)
-    assert.ok(Buffer.from(await staffPic.arrayBuffer()).equals(JPEG))
+    assert.ok(Buffer.from(await staffPic.arrayBuffer()).equals(STORED))
     assert.equal((await api.get(`/admin/v1/claims/${claim.body.id}/photos/${ids[3]}`, { token: admin })).status, 404)
 
     // Photos never sent with a claim are cleared after a day, blobs too.
@@ -225,5 +238,27 @@ describe('photos in Blob storage', () => {
     await cleanupExpired(new Date(now().getTime() + 2 * 86_400_000))
     assert.equal(blobs.size, before - 3)
     assert.equal((await query('SELECT COUNT(*)::int AS n FROM claim_photos')).rows[0].n, 2)
+  })
+
+  test('a delivery photo uploads outside the order lock, and an upload whose save fails is deleted (OPS-26)', async () => {
+    await makeBatch({ age: 5, rating: 'SEMI_RIPE', lines: { 'ALP-3': 10 } })
+    const cust = await customerToken(api)
+    const { id } = await packedOrder(cust)
+    await api.post(`/admin/v1/orders/${id}/dispatch`, undefined, { token: rider })
+    // While the photo uploads, nothing holds the order: another transaction locks it at once.
+    onPut = () => tx((c) => c.query('SELECT 1 FROM orders WHERE id = $1 FOR UPDATE NOWAIT', [id]))
+    const up = await upload(id, JPEG)
+    assert.equal(up.status, 201, JSON.stringify(up.body))
+    assert.equal(blobs.size, 1)
+    // The order moves on while a second photo is uploading: the save is refused and the file deleted again.
+    onPut = () => query(`UPDATE orders SET status = 'DELIVERY_FAILED' WHERE id = $1`, [id])
+    const late = await upload(id, JPEG)
+    assert.equal(late.status, 400, JSON.stringify(late.body))
+    assert.equal(late.body.error.code, 'INVALID_TRANSITION')
+    assert.equal(blobs.size, 1)
+    assert.equal((await query('SELECT COUNT(*)::int AS n FROM delivery_photos WHERE order_id = $1', [id])).rows[0].n, 1)
+    // An order not out for delivery is refused before anything is uploaded.
+    onPut = () => assert.fail('nothing should be uploaded')
+    assert.equal((await upload(id, JPEG)).status, 400)
   })
 })

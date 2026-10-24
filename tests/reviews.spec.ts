@@ -1,5 +1,5 @@
 import AxeBuilder from '@axe-core/playwright'
-import { expect, test } from './fixtures'
+import { expect, test, navLinkAnyState, openNavTo } from './fixtures'
 import { mockApi } from './mock-api'
 
 // Reviews: the moderation queue, the detail drawer (photos, reasons, the
@@ -24,13 +24,13 @@ test('an operator publishes a review with its photo, rejects a flagged one with 
   await drawer.getByLabel('Publish photo 1').check()
   await drawer.getByRole('button', { name: 'Publish with 1 photo' }).click()
   await expect(page.getByText('Review published')).toBeVisible()
-  expect(api.calls.find((c) => c.path === '/reviews/rvw1/approve')?.body).toEqual({ photoIds: ['rph1'], reason: null })
+  await expect.poll(() => api.calls.find((c) => c.path === '/reviews/rvw1/approve')?.body).toEqual({ photoIds: ['rph1'], reason: null })
 
   await drawer.getByRole('button', { name: 'Write a reply' }).click()
   await drawer.getByLabel(/Public reply/).fill('Thank you, Asha!')
   await drawer.getByRole('button', { name: 'Save reply' }).click()
   await expect(drawer).toContainText('Thank you, Asha!')
-  expect(api.calls.find((c) => c.method === 'PUT' && c.path === '/reviews/rvw1/reply')?.body).toEqual({ body: 'Thank you, Asha!' })
+  await expect.poll(() => api.calls.find((c) => c.method === 'PUT' && c.path === '/reviews/rvw1/reply')?.body).toEqual({ body: 'Thank you, Asha!' })
   await drawer.getByRole('button', { name: 'Close' }).click()
 
   await page.getByRole('button', { name: 'Open review from Vikram S.' }).click()
@@ -41,7 +41,7 @@ test('an operator publishes a review with its photo, rejects a flagged one with 
   await second.getByLabel(/Reason for/).fill('Shares a phone number')
   await second.getByRole('button', { name: 'Reject review' }).click()
   await expect(page.getByText('Review rejected')).toBeVisible()
-  expect(api.calls.find((c) => c.path === '/reviews/rvw2/reject')?.body).toEqual({ reason: 'Shares a phone number' })
+  await expect.poll(() => api.calls.find((c) => c.path === '/reviews/rvw2/reject')?.body).toEqual({ reason: 'Shares a phone number' })
 })
 
 test('bulk approve publishes the selected reviews; bulk reject asks for a reason', async ({ page }) => {
@@ -51,12 +51,13 @@ test('bulk approve publishes the selected reviews; bulk reject asks for a reason
   await expect(page.getByRole('region', { name: 'Bulk actions' })).toContainText('2 selected')
   await page.getByRole('button', { name: 'Reject 2' }).click()
   const dialog = page.getByRole('dialog', { name: 'Reject 2 reviews' })
-  await dialog.getByRole('button', { name: 'Reject' }).click()
-  await expect(dialog.getByText('Give a short reason.')).toBeVisible()
+  // The shared reason dialog: Reject waits for a reason, and says so in text.
+  await expect(dialog.getByRole('button', { name: 'Reject' })).toBeDisabled()
+  await expect(dialog.getByText('At least 3 characters.')).toBeVisible()
   await dialog.getByRole('button', { name: 'Cancel' }).click()
   await page.getByRole('button', { name: 'Approve 2' }).click()
   await expect(page.getByText('2 reviews published')).toBeVisible()
-  expect(api.calls.find((c) => c.path === '/reviews/bulk')?.body).toEqual({ action: 'approve', ids: ['rvw1', 'rvw2'], reason: null })
+  await expect.poll(() => api.calls.find((c) => c.path === '/reviews/bulk')?.body).toEqual({ action: 'approve', ids: ['rvw1', 'rvw2'], reason: null })
   await expect(page.getByText('No reviews here.')).toBeVisible()
   await page.getByRole('button', { name: /Published/ }).click()
   await expect(page.getByRole('region', { name: 'Reviews', exact: true }).locator('tbody tr')).toHaveCount(3)
@@ -76,11 +77,11 @@ test('QC sees ripeness insights only; packers and riders do not see Reviews', as
   await page.goto('/reviews')
   await expect(page.getByRole('heading', { name: 'What reviews say' })).toBeVisible()
   await expect(page.getByRole('group', { name: 'Review status' })).toHaveCount(0)
-  await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Reviews' })).toBeVisible()
+  await expect(await openNavTo(page, 'Reviews')).toBeVisible()
 
   await mockApi(page, { signedIn: true, role: 'PACKER' })
   await page.goto('/pack-list')
-  await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Reviews' })).toHaveCount(0)
+  await expect(navLinkAnyState(page, 'Reviews')).toHaveCount(0)
   await page.goto('/reviews')
   await expect(page.getByRole('heading', { name: 'Not available for your role' })).toBeVisible()
 })

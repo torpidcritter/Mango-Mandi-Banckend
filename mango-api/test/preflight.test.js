@@ -9,6 +9,8 @@ const good = {
   RAZORPAY_KEY_SECRET: 's3cret',
   RAZORPAY_WEBHOOK_SECRET: 'whsec_live',
   SMS_PROVIDER: 'jio',
+  JIO_SMS_SUCCESS_PATH: 'status',
+  JIO_SMS_SUCCESS_VALUES: 'accepted',
   ADMIN_ORIGIN: 'https://admin.mandimangoes.in',
   CUSTOMER_ORIGIN: 'https://mandimangoes.in,https://www.mandimangoes.in',
   WHATSAPP_PROVIDER: 'meta',
@@ -120,10 +122,30 @@ describe('production preflight', () => {
     assert.ok(r.errors.some((e) => e.startsWith('ADMIN_BOOTSTRAP_* is set on previews')))
   })
 
-  it('Turnstile needs both keys; without it there is a warning', () => {
+  it('Turnstile needs both keys, and production needs it (previews only warn)', () => {
     assert.ok(checkProduction({ ...good, TURNSTILE_SITE_KEY: '' }).errors.some((e) => e.includes('TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY')))
     const off = checkProduction({ ...good, TURNSTILE_SITE_KEY: '', TURNSTILE_SECRET_KEY: '' })
-    assert.deepEqual(off.errors, [])
-    assert.ok(off.warnings.some((w) => w.startsWith('TURNSTILE_SECRET_KEY is unset')))
+    assert.ok(off.errors.some((e) => e.startsWith('TURNSTILE_SECRET_KEY and TURNSTILE_SITE_KEY are required')))
+    const preview = checkProduction({ ...staging, TURNSTILE_SITE_KEY: '', TURNSTILE_SECRET_KEY: '' }, { vercel: true, target: 'preview' })
+    assert.ok(!preview.errors.some((e) => e.includes('TURNSTILE')))
+    assert.ok(preview.warnings.some((w) => w.startsWith('TURNSTILE_SECRET_KEY is unset')))
+  })
+
+  it('Jio needs its documented accepted status; WhatsApp-only codes are allowed with a warning (OPS-03)', () => {
+    const noContract = checkProduction({ ...good, JIO_SMS_SUCCESS_PATH: '', JIO_SMS_SUCCESS_VALUES: '' })
+    assert.ok(noContract.errors.some((e) => e.startsWith('JIO_SMS_SUCCESS_PATH and JIO_SMS_SUCCESS_VALUES are required')))
+    const waOnly = checkProduction({ ...good, SMS_PROVIDER: 'log', OTP_DEFAULT_CHANNEL: 'whatsapp' })
+    assert.deepEqual(waOnly.errors, [])
+    assert.ok(waOnly.warnings.some((w) => w.startsWith('Login codes go by WhatsApp only')))
+    const smsFirstWithoutSms = checkProduction({ ...good, SMS_PROVIDER: 'log' })
+    assert.ok(smsFirstWithoutSms.errors.some((e) => e.includes('set OTP_DEFAULT_CHANNEL=whatsapp')))
+    const nothing = checkProduction({ ...good, SMS_PROVIDER: 'log', WHATSAPP_PROVIDER: 'log' })
+    assert.ok(nothing.errors.some((e) => e.startsWith('No way to send login codes')))
+  })
+
+  it('production needs Sentry; a preview only warns (OPS-09)', () => {
+    assert.ok(checkProduction({ ...good, SENTRY_DSN: '' }).errors.some((e) => e.startsWith('SENTRY_DSN is required in production')))
+    const preview = checkProduction({ ...staging, SENTRY_DSN: '' }, { vercel: true, target: 'preview' })
+    assert.ok(!preview.errors.some((e) => e.includes('SENTRY_DSN')))
   })
 })

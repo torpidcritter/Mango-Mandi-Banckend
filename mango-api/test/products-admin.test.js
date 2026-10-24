@@ -102,4 +102,56 @@ describe('products', () => {
     assert.equal((await api.patch('/admin/v1/products/ALP-3', { active: true }, { token: admin })).body.active, true)
     assert.ok((await shopItem('ALP-3')).qty > 0)
   })
+
+  test('a manager adds, replaces and removes a product photo; the shop shows it', async () => {
+    const sharp = (await import('sharp')).default
+    const png = await sharp({ create: { width: 2400, height: 1600, channels: 3, background: '#f59e0b' } }).png().toBuffer()
+    const put = (bytes, token = admin, type = 'image/png') =>
+      api.raw('PUT', '/admin/v1/products/ALP-3/photo', { token, headers: { 'Content-Type': type }, raw: bytes })
+
+    const ops = await adminToken(api, 'ops@mandimangoes.test', 'operator123')
+    assert.equal((await put(png, ops)).status, 403)
+    assert.equal((await put(Buffer.from('not an image'))).body.error.code, 'PHOTO_INVALID')
+    assert.equal((await api.raw('PUT', '/admin/v1/products/NOPE-1/photo', { token: admin, headers: { 'Content-Type': 'image/png' }, raw: png })).status, 404)
+
+    const first = await put(png)
+    assert.equal(first.status, 200, JSON.stringify(first.body))
+    assert.match(first.body.photoUrl, /^\/v1\/products\/ALP-3\/photo\?v=\d+$/)
+    const v1 = Number(first.body.photoUrl.split('v=')[1])
+    assert.equal((await shopItem('ALP-3', 'RAW')).photoUrl, first.body.photoUrl)
+    assert.equal((await shopItem('BAD-3', 'RAW')).photoUrl, null)
+
+    // Public, shrunk to 1200 px, re-encoded as a JPEG, and cacheable for good at its version.
+    const pic = await fetch(`${srv.base}${first.body.photoUrl}`)
+    assert.equal(pic.status, 200)
+    assert.equal(pic.headers.get('content-type'), 'image/jpeg')
+    assert.match(pic.headers.get('cache-control'), /immutable/)
+    assert.equal(pic.headers.get('cross-origin-resource-policy'), 'cross-origin')
+    const meta = await sharp(Buffer.from(await pic.arrayBuffer())).metadata()
+    assert.deepEqual([meta.format, meta.width, meta.height], ['jpeg', 1200, 800])
+
+    const second = await put(png)
+    const v2 = Number(second.body.photoUrl.split('v=')[1])
+    assert.ok(v2 > v1, `${v2} > ${v1}`)
+    assert.match((await fetch(`${srv.base}/v1/products/ALP-3/photo?v=${v1}`)).headers.get('cache-control'), /max-age=60\b/)
+
+    assert.equal((await api.del('/admin/v1/products/ALP-3/photo', { token: ops })).status, 403)
+    const gone = await api.del('/admin/v1/products/ALP-3/photo', { token: admin })
+    assert.equal(gone.body.photoUrl, null)
+    assert.equal((await fetch(`${srv.base}/v1/products/ALP-3/photo?v=${v2}`)).status, 404)
+    assert.equal((await api.del('/admin/v1/products/ALP-3/photo', { token: admin })).status, 404)
+
+    // Added again after removal: the version is the upload time in seconds, so it never
+    // goes back to an old number a browser may still have cached for a year.
+    const before = Math.floor(Date.now() / 1000)
+    const again = await put(png)
+    assert.ok(Number(again.body.photoUrl.split('v=')[1]) >= before)
+    await api.del('/admin/v1/products/ALP-3/photo', { token: admin })
+
+    // A product deleted outright takes its photo with it.
+    await api.post('/admin/v1/products', KESAR, { token: admin })
+    await api.raw('PUT', '/admin/v1/products/KES-3/photo', { token: admin, headers: { 'Content-Type': 'image/png' }, raw: png })
+    assert.equal((await api.del('/admin/v1/products/KES-3', { token: admin })).body.outcome, 'deleted')
+    assert.equal((await query('SELECT COUNT(*)::int AS n FROM product_photos')).rows[0].n, 0)
+  })
 })

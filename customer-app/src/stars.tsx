@@ -1,6 +1,17 @@
 import { useRef, type KeyboardEvent } from 'react'
 import type { RatingSummary } from './api'
 
+const STAR_PATH = 'M12 2.8l2.8 5.9 6.4.8-4.7 4.4 1.2 6.4L12 17.2l-5.7 3.1 1.2-6.4-4.7-4.4 6.4-.8z'
+
+/** One star mark: filled when on, otherwise an outline at 3:1 so an empty star is still seen (WCAG 1.4.11). */
+function StarMark({ on }: { on: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" width="1em" height="1em" aria-hidden="true" className={on ? 'star-mark on' : 'star-mark'}>
+      <path d={STAR_PATH} fill={on ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 export const STAR_WORDS = ['', 'Poor', 'Not great', 'Okay', 'Good', 'Loved them']
 
 /**
@@ -58,7 +69,7 @@ export function StarInput({
             className={value != null && n <= value ? 'star on' : 'star'}
             onClick={() => pick(n)}
           >
-            <span aria-hidden="true">★</span>
+            <StarMark on={value != null && n <= value} />
           </button>
         ))}
         {value != null && (
@@ -76,10 +87,9 @@ export function Stars({ value, small = false }: { value: number; small?: boolean
   const full = Math.round(value)
   return (
     <span className={small ? 'stars-shown small' : 'stars-shown'} role="img" aria-label={`${value} out of 5 stars`}>
-      <span aria-hidden="true">{'★'.repeat(full)}</span>
-      <span className="stars-off" aria-hidden="true">
-        {'★'.repeat(5 - full)}
-      </span>
+      {[1, 2, 3, 4, 5].map((n) => (
+        <StarMark key={n} on={n <= full} />
+      ))}
     </span>
   )
 }

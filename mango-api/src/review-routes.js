@@ -16,10 +16,11 @@ import {
   deleteUpload,
   dropPhoto,
   MAX_REVIEW_UPLOAD_BYTES,
-  photoBytes,
+  photoWidth,
   readUpload,
   reviewUploadToken,
   sendPhoto,
+  sendPublicPhoto,
   storePhoto,
   UPLOAD_PREFIX,
 } from './photos.js'
@@ -193,7 +194,7 @@ customerReviews.post(
  */
 customerReviews.post(
   '/reviews/photos',
-  express.raw({ type: IMAGE_TYPES, limit: MAX_REVIEW_UPLOAD_BYTES }),
+  express.raw({ type: IMAGE_TYPES, limit: MAX_REVIEW_UPLOAD_BYTES, inflate: false }),
   asyncHandler(async (req, res) => {
     const me = req.customer.id
     let bytes = req.body
@@ -450,23 +451,25 @@ customerReviews.get(
   }),
 )
 
-/** An approved photo of an approved review. Anything else is "not found". */
+/**
+ * Review photos never change once uploaded (a new photo gets a new id; a removed one loses its
+ * bytes and turns "not found"), so browsers keep them for 30 days. Shared caches keep them only
+ * 10 minutes, so a photo taken down by moderation or erasure stops being served soon after.
+ */
+export const REVIEW_PHOTO_CACHE = 'public, max-age=2592000, s-maxage=600, immutable'
+
+/** An approved photo of an approved review. Anything else is "not found". ?w= sends a thumbnail (see PHOTO_WIDTHS). */
 customerReviews.get(
   '/review-photos/:id',
   asyncHandler(async (req, res) => {
+    const width = photoWidth(req.query.w)
     const { rows } = await query(
       `SELECT p.mime, p.bytes, p.blob_path FROM review_photos p JOIN reviews r ON r.id = p.review_id
         WHERE p.id = $1 AND p.approved_at IS NOT NULL AND p.removed_at IS NULL AND r.status = 'APPROVED'`,
       [req.params.id],
     )
     if (!rows.length) throw notFound('Photo not found')
-    res
-      .set('Content-Type', rows[0].mime)
-      .set('Cache-Control', PUBLIC_CACHE)
-      .set('X-Content-Type-Options', 'nosniff')
-      // Public by design: the shop, on another origin, shows it in an <img>.
-      .set('Cross-Origin-Resource-Policy', 'cross-origin')
-      .send(await photoBytes(rows[0]))
+    await sendPublicPhoto(res, rows[0], { key: `review:${req.params.id}`, width, cache: REVIEW_PHOTO_CACHE })
   }),
 )
 
@@ -622,7 +625,7 @@ const moderated = (req, why) => ({ moderated_by: req.admin.email, moderated_at: 
 
 /** Approves a pending review, and the photos named in photoIds (others stay private). */
 async function approve(c, req, id, { reason: why = null, photoIds: approvedPhotos = [] } = {}) {
-  return transition(c, id, 'APPROVE', {
+  return await transition(c, id, 'APPROVE', {
     actor: `staff:${req.admin.email}`,
     reason: why,
     set: moderated(req, why),

@@ -22,3 +22,44 @@ export const test = base.extend<{ consoleErrors: string[] }>({
 })
 
 export { expect }
+
+type Page = import('@playwright/test').Page
+
+/** The main navigation. Its links are behind Menu on a phone and inside group dropdowns on a desktop. */
+export const mainNav = (page: Page) => page.getByRole('navigation', { name: 'Main' })
+
+/**
+ * Opens whatever holds the nav link `name`: the Menu below 900px, or the link's group dropdown
+ * on a desktop (a group with one link is a plain link and needs nothing). Returns the link.
+ */
+export async function openNavTo(page: Page, name: string) {
+  const link = mainNav(page).getByRole('link', { name, exact: true })
+  const menu = page.getByRole('button', { name: 'Menu' })
+  // A page that is still loading can take focus as it appears (e.g. the QC form on a new batch),
+  // which closes a menu opened a moment before. So open it again until the link shows.
+  await expect(async () => {
+    if (await link.isVisible()) return
+    if (await menu.isVisible()) {
+      if ((await menu.getAttribute('aria-expanded')) !== 'true') await menu.click()
+    } else {
+      const group = mainNav(page)
+        .locator('.nav-group')
+        .filter({ has: page.getByRole('link', { name, exact: true, includeHidden: true }) })
+      const button = group.locator('.nav-group-btn')
+      if ((await button.count()) && (await button.getAttribute('aria-expanded')) !== 'true') await button.click()
+    }
+    await expect(link).toBeVisible({ timeout: 1000 })
+  }).toPass({ timeout: 10_000 })
+  return link
+}
+
+/** A nav link whether or not its menu is open: use for checks that a role never gets a screen. */
+export const navLinkAnyState = (page: Page, name: string) =>
+  mainNav(page).getByRole('link', { name, exact: true, includeHidden: true })
+
+/** The account button in the top bar (named "<email> · <role>"); opens its menu. */
+export async function openAccount(page: Page) {
+  const button = page.locator('.account-btn')
+  if ((await button.getAttribute('aria-expanded')) !== 'true') await button.click()
+  return page.locator('#account-menu')
+}

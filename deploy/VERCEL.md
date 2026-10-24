@@ -3,7 +3,8 @@
 This is the hosted setup: three Vercel projects from this one repository, and a
 Neon Postgres database in Singapore. Nothing to patch, back up by hand or renew.
 (The single-server Docker setup in [README.md](README.md) still works if you ever
-want to leave Vercel.)
+want to leave Vercel.) For every release after the first, follow
+[RELEASE.md](RELEASE.md); when something breaks, [RUNBOOKS.md](RUNBOOKS.md).
 
 | Vercel project | Root directory | Serves | Example domain |
 |----------------|----------------|--------|----------------|
@@ -16,9 +17,9 @@ The API runs in Singapore (`sin1`), next to the database.
 
 ## What you need first
 
-- [ ] **Vercel Pro** (about $20 a month per member). Pro is needed for the
-  maintenance job to run every minute; Hobby only allows once a day, and holds,
-  payment checks and WhatsApp messages would stall.
+- [ ] **An every-minute scheduler** for the maintenance job: Vercel Pro, or on
+  Hobby a free external pinger such as cron-job.org. See [SCHEDULER.md](SCHEDULER.md).
+  Without it, payment checks, refund retries and WhatsApp messages stall.
 - [ ] **Neon** account (the Launch plan is enough to start).
 - [ ] **A domain**, e.g. `mandimangoes.in`, with access to its DNS.
 - [ ] **Razorpay live account** with KYC done. Jio DLT and Meta WhatsApp approval
@@ -61,8 +62,15 @@ The API runs in Singapore (`sin1`), next to the database.
 
    Do the same on the `staging` branch for the preview values.
 
-Neon keeps point-in-time history (7 days on Launch), so a bad change can be undone
-by restoring a branch to a minute before it. See [Backups and restore drill](#backups-and-restore-drill).
+5. **Set the restore window to 7 days.** Neon keeps point-in-time history for a
+   window that is **1 day by default on paid plans** (6 hours on Free). In the Neon
+   console's project **Settings**, set the history (restore) window to **7 days**,
+   the most the Launch plan allows (history storage is billed per GB-month). Write the date
+   you set it in the go-live checks below. Without this step a mistake noticed on
+   day two cannot be undone from Neon.
+
+With the window set, a bad change can be undone by restoring a branch to a minute
+before it. See [Backups and restore drill](#backups-and-restore-drill).
 
 The first deploy against each branch records which environment it belongs to
 (production for `main`, preview for `staging`). After that a preview build
@@ -106,13 +114,17 @@ secrets with `openssl rand -hex 32`. Never commit them.
 | `SENTRY_DSN` | from Sentry | same | |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | live keys | test keys | a preview refuses live keys |
 | `RAZORPAY_WEBHOOK_SECRET` | from the Razorpay webhook | test webhook | |
+| `RAZORPAY_WEBHOOK_SECRET_PREVIOUS` | unset; the old secret for a day while rotating | unset | webhooks signed with it are still accepted (preflight warns while it is set) |
+| `WHATSAPP_PAYMENT_CONFIG` | leave unset | unset | Payments on WhatsApp has no reconcile yet (preflight warns when set); unset, chat orders get a Razorpay payment link |
 | `SMS_PROVIDER` and `JIO_SMS_*` | `jio` and Jio's values | `log`, with `LOG_OTP_CODES=true` to read codes in the Vercel logs | see [mango-api/README.md](../mango-api/README.md#login-codes-by-sms-jio); production refuses `LOG_OTP_CODES` |
 | `WHATSAPP_*` | Meta's values | `log` | see [mango-api/README.md](../mango-api/README.md#whatsapp-order-updates) |
 | `OTP_DAILY_LIMIT` | `3000` | `200` | login codes per day before sending pauses; Sentry warns at 80% |
 | `OTP_NEW_NUMBER_SHARE` | `0.6` | | the part of that budget numbers with no account may use; the rest is kept for existing customers |
 | `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | from Cloudflare Turnstile | Cloudflare's test keys | a check, usually invisible, before a login code is sent; set both or neither |
 | `API_RATE_LIMIT` | `3000` | | requests per 15 minutes from one address before 429. Mobile carriers put many customers behind one address, so keep it high; it only stops floods |
-| `METRICS_TOKEN` | random | | protects `/metrics` |
+| `OTP_IP_LIMIT` | leave unset (`200`) | | login-code requests per 15 minutes from one address. High on purpose, for the same carrier-NAT reason: Turnstile, the per-number caps (5 an hour, 16 a day) and `OTP_DAILY_LIMIT` are what stop SMS pumping. Lower it only if Sentry shows one address pumping codes |
+| `METRICS_TOKEN` | not needed | | `/metrics` answers 404 on Vercel; it and `ops/alerts.yml` are for the Docker path only |
+| `BACKUP_HEARTBEAT_EXPECTED` | `true` once the backup workflow records its heartbeat (see [Backups](#backups-and-restore-drill)) | | Needs attention and Sentry warn when no backup has succeeded for 26 hours |
 
 `TRUST_PROXY` and the database pool size are set for Vercel automatically.
 
@@ -121,6 +133,7 @@ secrets with `openssl rand -hex 32`. Never commit them.
 | Variable | Production | Preview |
 |----------|-----------|---------|
 | `VITE_API_URL` | `https://api.mandimangoes.in` | the API preview URL |
+| `VITE_SUPPORT_WHATSAPP` (`mandi-shop` only) | the shop's help WhatsApp number, country code and number, digits only (91 and the 10-digit number) | the same, or a team number | **required**: a production build of the shop fails without it, so every page has a help contact (footer, order page, /help, /terms) |
 
 ### Check before the first real deploy
 
@@ -168,7 +181,7 @@ saying which release stopped using it.
 Then point the webhooks at the API:
 
 - Razorpay dashboard → **Webhooks**: `https://api.mandimangoes.in/webhooks/razorpay`,
-  events `payment.authorized`, `payment.captured`, `payment.failed`, `payment_link.paid`, `refund.processed` and `refund.failed`.
+  events `payment.authorized`, `payment.captured`, `payment.failed`, `payment_link.paid`, `refund.processed`, `refund.failed` and the `payment.dispute.*` events (disputes are only recorded and shown in Needs attention).
 - Meta app → **WhatsApp → Configuration**: callback `https://api.mandimangoes.in/webhooks/whatsapp`
   with your `WHATSAPP_VERIFY_TOKEN`, subscribed to `messages`.
 
@@ -176,8 +189,11 @@ Then point the webhooks at the API:
 
 - **Firewall rate limit on sign-in.** On `mandi-api`, **Firewall → Configure → New
   rule**: if the request path starts with `/v1/auth/` or `/admin/v1/auth/`, rate limit
-  to 20 requests per minute per IP, action **Deny**. The API has its own limits too;
-  this stops floods before they cost function time.
+  to 60 requests per minute per IP, action **Deny**. The API has its own limits too;
+  this stops floods before they cost function time. Don't go much lower: one mobile
+  carrier address can carry many customers signing in at once (each sign-in is a code
+  request and a verify), and the API's own per-address limit is 200 codes per 15
+  minutes (`OTP_IP_LIMIT`).
 - **Turn on Vercel's bot protection** in the shop project's Firewall settings.
 - **Deployment protection (required).** On all three projects, **Settings → Deployment
   Protection → Vercel Authentication** for previews, so only your team can open them.
@@ -197,6 +213,16 @@ Then point the webhooks at the API:
 
 ## 8. Watch it
 
+**Who is on call.** Write the names here before launch; the alerts below must reach them.
+
+| Alert | Goes to (name, phone) | Backup person |
+|-------|-----------------------|---------------|
+| Uptime monitor on `/ready` (SMS/phone) | _fill in_ | _fill in_ |
+| Sentry: new errors, cron monitor `maintenance`, refund failures | _fill in_ | _fill in_ |
+| Panel "Needs attention" (checked every morning) | _fill in_ | _fill in_ |
+
+Production refuses to start without `SENTRY_DSN`.
+
 - **Uptime monitor** (Better Stack, UptimeRobot, or Vercel's own): check
   `https://api.mandimangoes.in/ready` every minute and alert by SMS. It fails when the
   database is down or the maintenance job has not run for a few minutes.
@@ -205,15 +231,22 @@ Then point the webhooks at the API:
   turn on an alert for missed and failed check-ins. Together with the uptime monitor,
   someone hears about a stopped job even if nobody opens the panel.
 - **Sentry** e-mails you on new errors from the API, and warns when login codes reach
-  80% of the day's budget.
+  80% of the day's budget. The maintenance job also sends a Sentry warning (at most
+  hourly each) for overdue messages or refunds, failing webhooks, a missed backup
+  (with `BACKUP_HEARTBEAT_EXPECTED=true`) and stock counters that disagree with the
+  ledger. Set a Sentry alert rule on these warnings, not only on errors. (The
+  Prometheus rules in `ops/alerts.yml` are for the Docker path; nothing reads them
+  on Vercel.)
 - **Vercel → Logs** for request logs; **Neon → Monitoring** for database load.
 - The panel's **Today** page shows a "Needs attention" card when messages, refunds or
   webhooks are failing.
 
 ## Backups and restore drill
 
-- **What you can lose (RPO).** Neon keeps every change for its history window (7 days
-  on Launch, longer on Scale), so `main` can go back to any second inside it. The
+- **What you can lose (RPO).** Neon keeps every change for its history window, so
+  `main` can go back to any second inside it. The window is **1 day by default on paid
+  plans** (6 hours on Free); step 1.5 sets it to 7 days, the Launch plan's maximum
+  (longer on Scale). Check it under Neon → **Settings** before trusting a restore. The
   nightly off-Neon copy (below) covers older mistakes and Neon itself being down, but
   anything after the last copy is lost in that case: up to a day.
 - **How long it takes (RTO): aim for an hour**, from deciding to restore to the shop
@@ -232,6 +265,24 @@ Then point the webhooks at the API:
      password manager or a USB stick in a safe), never in GitHub.
   3. In GitHub → **Settings → Secrets and variables → Actions**, add
      `BACKUP_DATABASE_URL` and `BACKUP_GPG_PUBLIC_KEY`. Run the workflow once by hand.
+  4. **Heartbeat, so a missed backup is noticed.** The workflow's last step records each
+     backup in the app (`ops/backup-heartbeat.sh`). In the SQL editor on `main`, make a
+     role that can write only that record and read nothing else:
+
+     ```sql
+     CREATE ROLE mango_backup_beat LOGIN PASSWORD '<a long random password>';
+     GRANT USAGE ON SCHEMA public TO mango_backup_beat;
+     GRANT SELECT (step), INSERT (step, last_ok_at, last_err_at, last_error),
+           UPDATE (last_ok_at, last_err_at, last_error) ON maintenance_runs TO mango_backup_beat;
+     ```
+
+     Add its connection string (pooled is fine) as the secret
+     `BACKUP_HEARTBEAT_DATABASE_URL`, run the workflow once by hand, then set
+     `BACKUP_HEARTBEAT_EXPECTED=true` on `mandi-api` (Production). From then on the
+     panel's Needs attention card and Sentry warn when no backup has succeeded for 26
+     hours: a failing run, missing secrets, or GitHub pausing the schedule (it stops
+     scheduled workflows in a repository with no activity for 60 days, as can happen
+     off-season).
   Prove a copy loads with `ops/restore-check.sh` after `gpg --decrypt`.
 - **Personal data in backups.** Dumps hold names, phones and addresses, which is why they
   are encrypted and kept only 30 days. A deleted account can still be inside an older
@@ -252,8 +303,11 @@ the pass marks.
       the staging shop, then in Razorpay → **Webhooks** check the delivery shows 200.
 - [ ] The k6 browse scenario passes against staging (`ops/load/shop.js`).
 - [ ] The Sentry cron monitor and the uptime monitor on `/ready` are set up and alert someone.
+- [ ] Neon's history (restore) window is set to 7 days, not the 1-day default (step 1.5).
+      Set on: _date_.
 - [ ] One restore drill done on a Neon branch, with the time it took written down.
-- [ ] The nightly backup workflow ran once and its artifact decrypts.
+- [ ] The nightly backup workflow ran once and its artifact decrypts; its heartbeat is
+      recorded and `BACKUP_HEARTBEAT_EXPECTED=true` is set (Backups, step 4).
 - [ ] Turnstile keys set; deployment protection on for previews.
 - [ ] `https://api.mandimangoes.in/ready` returns `{"ready":true,...}`.
 - [ ] Sign in to the panel as the bootstrap manager, set up two-step, then remove
@@ -262,6 +316,29 @@ the pass marks.
 - [ ] Place one real order with a live card or UPI, then cancel it and see the
       refund arrive.
 - [ ] Get the privacy notice at `/privacy` reviewed by a lawyer before launch.
+
+## Refunds the system sends on its own
+
+The owner's rule is that money goes back only when a customer cancels before packing,
+or a manager cancels an order or booking we can't deliver. Besides those two, the
+API refunds in these cases, because the payment bought nothing:
+
+- **A second payment** for an order or booking that is already paid (two tabs, a
+  retried link): that payment alone is refunded (`duplicate_payments`); the order
+  stays as it is.
+- **A rejected capture**: a payment that is short, in another currency or has no
+  amount confirms nothing and is refunded in full (also via `duplicate_payments`),
+  and is listed in Needs attention.
+- **A payment after a cancel**: a payment that lands after the customer or the shop
+  cancelled is refunded, not used to revive the order.
+- **After a restore, `ops/replay-payments.js --refund-missing`**: captured payments
+  whose order the restore lost are refunded in full. Without the flag they are only
+  listed.
+
+Every refund is leased and looked up at Razorpay before it is sent, so it is never
+paid twice; each new attempt carries a new receipt (`<number>-r<attempt>`).
+Refunds are sent after the webhook is answered and retried every minute by the
+maintenance job; one stuck for 30 minutes shows in Needs attention.
 
 ## Rolling back
 
@@ -280,7 +357,11 @@ the pass marks.
      would; lost orders are listed in Needs attention):
      `node --env-file=.env ops/replay-payments.js --from <restore point>`.
      Rebuild lost orders by hand where you can, or re-run with `--refund-missing` to
-     refund them in full, and tell those customers.
+     refund them in full, and tell those customers. The replay also lists (in Needs
+     attention, as a Razorpay webhook problem) every order Razorpay refunded after the
+     restore point that the restored database still shows as paid: check those
+     before they are delivered. It reads Razorpay's refund list for the window
+     (`GET /v1/refunds?from=&to=`).
   3. Delete again the accounts deleted since then:
      `node --env-file=.env ops/reapply-deletions.js --old-url <backup branch URL> --since <restore point>`.
   4. Check the panel's Needs attention card, then delete the backup branch.

@@ -2,11 +2,11 @@ import { useState, type FormEvent } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
-import { BATCH_STATUS_LABEL, ORDER_STATUS_LABEL, dateTime } from '../format'
+import { BATCH_STATUS_LABEL, ORDER_STATUS_LABEL, dateTime, rupees } from '../format'
 import { ALL_ROLES, ROLE_LABEL } from '../permissions'
 import { useSession } from '../session'
 import type { AuditEntry, BatchStatus, OrderStatus, Role, StaffMember } from '../types'
-import { Dialog, EmptyState, FormError, QueryError, Spinner, useToast, scrollRegion } from '../ui'
+import { ConfirmDialog, Dialog, EmptyState, FormError, QueryError, ReasonDialog, Spinner, useToast, scrollRegion, usePageTitle } from '../ui'
 
 const ROLE_HINT: Record<Role, string> = {
   MANAGER: 'Everything, including staff, rules and condemning batches',
@@ -18,6 +18,7 @@ const ROLE_HINT: Record<Role, string> = {
 
 /** Managers add staff, set roles and see who did what. */
 export default function Staff() {
+  usePageTitle('Staff')
   const { me } = useSession()
   const toast = useToast()
   const queryClient = useQueryClient()
@@ -26,6 +27,8 @@ export default function Staff() {
   const [resetting, setResetting] = useState<StaffMember | null>(null)
   const [removing, setRemoving] = useState<StaffMember | null>(null)
   const [unlocking, setUnlocking] = useState<StaffMember | null>(null)
+  // A role picked in the table, waiting for the manager to confirm it (the select shows it meanwhile).
+  const [changing, setChanging] = useState<{ staff: StaffMember; role: Role } | null>(null)
   // A two-step setup code, shown once to hand over in person.
   const [shownCode, setShownCode] = useState<{ email: string; code: string } | null>(null)
 
@@ -38,9 +41,9 @@ export default function Staff() {
     mutationFn: (p: { id: string; role: Role }) => api.updateStaff(p.id, { role: p.role }),
     onSuccess: (s) => {
       toast.success(`${s.email} is now ${ROLE_LABEL[s.role]}. They will need to sign in again.`)
+      setChanging(null)
       refresh()
     },
-    onError: (err) => toast.error(err),
   })
   const remove = useMutation({
     mutationFn: (id: string) => api.removeStaff(id),
@@ -48,6 +51,20 @@ export default function Staff() {
       toast.success(`${removing?.email} removed`)
       setRemoving(null)
       refresh()
+    },
+  })
+
+  // Everyone's sessions end at once (optionally not this one): a leaked password or a lost device.
+  const [signingOut, setSigningOut] = useState(false)
+  const [keepMe, setKeepMe] = useState(true)
+  const signOutAll = useMutation({
+    mutationFn: (b: { reason: string; keepMe: boolean }) => api.signOutAllStaff(b.reason, b.keepMe),
+    onSuccess: (r) => {
+      setSigningOut(false)
+      refresh()
+      // Signed out too: this session is gone, so go back to sign-in.
+      if (!r.keptMe) return void api.logout()
+      toast.success(`${r.signedOut} ${r.signedOut === 1 ? 'person' : 'people'} signed out. They sign in again to carry on.`)
     },
   })
 
@@ -70,6 +87,9 @@ export default function Staff() {
       <div className="topbar">
         <h1>Staff</h1>
         <span className="spacer" />
+        <button type="button" className="btn" onClick={() => setSigningOut(true)}>
+          Sign out all staff
+        </button>
         <button type="button" className="btn btn-primary" onClick={() => setAdding(true)}>
           Add person
         </button>
@@ -110,9 +130,13 @@ export default function Staff() {
                         </label>
                         <select
                           id={`role-${s.id}`}
-                          value={s.role}
+                          value={changing?.staff.id === s.id ? changing.role : s.role}
                           disabled={self || setRole.isPending}
-                          onChange={(e) => setRole.mutate({ id: s.id, role: e.target.value as Role })}
+                          onChange={(e) => {
+                            const role = e.target.value as Role
+                            setRole.reset()
+                            setChanging(role === s.role ? null : { staff: s, role })
+                          }}
                         >
                           {ALL_ROLES.map((r) => (
                             <option key={r} value={r}>
@@ -163,6 +187,22 @@ export default function Staff() {
 
       <Activity />
 
+      {changing && (
+        <ConfirmDialog
+          title={`Make ${changing.staff.email} ${/^[AEIOU]/.test(ROLE_LABEL[changing.role]) ? 'an' : 'a'} ${ROLE_LABEL[changing.role]}?`}
+          confirmLabel={`Make ${ROLE_LABEL[changing.role]}`}
+          busy={setRole.isPending}
+          error={setRole.error}
+          onClose={() => setChanging(null)}
+          onConfirm={() => setRole.mutate({ id: changing.staff.id, role: changing.role })}
+        >
+          <p>
+            They go from {ROLE_LABEL[changing.staff.role]} to {ROLE_LABEL[changing.role]}: {ROLE_HINT[changing.role].charAt(0).toLowerCase() + ROLE_HINT[changing.role].slice(1)}.
+            They'll be signed out and need to sign in again.
+          </p>
+        </ConfirmDialog>
+      )}
+
       {adding && (
         <AddDialog
           onClose={() => setAdding(false)}
@@ -190,46 +230,51 @@ export default function Staff() {
       )}
       {resetting && <PasswordDialog member={resetting} onClose={() => setResetting(null)} />}
       {unlocking && (
-        <Dialog
+        <ConfirmDialog
           title={`Reset two-step sign-in for ${unlocking.email}?`}
+          confirmLabel="Reset"
+          busy={resetTwoStep.isPending}
+          error={resetTwoStep.error}
           onClose={() => setUnlocking(null)}
-          footer={
-            <>
-              <button type="button" className="btn" onClick={() => setUnlocking(null)}>
-                Cancel
-              </button>
-              <button type="button" className="btn btn-primary" disabled={resetTwoStep.isPending} onClick={() => resetTwoStep.mutate(unlocking.id)}>
-                Reset
-              </button>
-            </>
-          }
+          onConfirm={() => resetTwoStep.mutate(unlocking.id)}
         >
           <p>
             Use this when they have lost their phone. They are signed out, and set up two-step sign-in again with their new phone, using the setup code
             shown next.
           </p>
-          <FormError error={resetTwoStep.error} />
-        </Dialog>
+        </ConfirmDialog>
       )}
       {removing && (
-        <Dialog
+        <ConfirmDialog
           title={`Remove ${removing.email}?`}
           tone="danger"
+          confirmLabel="Remove"
+          busy={remove.isPending}
+          error={remove.error}
           onClose={() => setRemoving(null)}
-          footer={
-            <>
-              <button type="button" className="btn" onClick={() => setRemoving(null)}>
-                Cancel
-              </button>
-              <button type="button" className="btn btn-danger" disabled={remove.isPending} onClick={() => remove.mutate(removing.id)}>
-                Remove
-              </button>
-            </>
-          }
+          onConfirm={() => remove.mutate(removing.id)}
         >
           <p>They are signed out and can no longer sign in. What they did stays in the activity log.</p>
-          <FormError error={remove.error} />
-        </Dialog>
+        </ConfirmDialog>
+      )}
+      {signingOut && (
+        <ReasonDialog
+          title="Sign out all staff?"
+          label="Why"
+          confirmLabel="Sign everyone out"
+          hint="For a leaked password or a lost device. Everyone signs in again; their passwords and two-step stay as they are."
+          maxLength={500}
+          busy={signOutAll.isPending}
+          error={signOutAll.error}
+          onClose={() => setSigningOut(false)}
+          onSubmit={(reason) => signOutAll.mutate({ reason, keepMe })}
+        >
+          <div className="field radio-row">
+            <label>
+              <input type="checkbox" checked={keepMe} onChange={(e) => setKeepMe(e.target.checked)} /> Keep me signed in on this device
+            </label>
+          </div>
+        </ReasonDialog>
       )}
     </>
   )
@@ -254,7 +299,7 @@ function AddDialog({ onClose, onDone }: { onClose: () => void; onDone: (s: Staff
     e.preventDefault()
     setFormError(null)
     if (!/^\S+@\S+\.\S+$/.test(email.trim())) return setFormError('Enter a work email.')
-    if (password.length < 10) return setFormError('Use a password of at least 10 characters.')
+    if (password.length < 12) return setFormError('Use a password of at least 12 characters.')
     add.mutate()
   }
 
@@ -294,7 +339,7 @@ function AddDialog({ onClose, onDone }: { onClose: () => void; onDone: (s: Staff
         <div className="field">
           <label htmlFor="staff-password">First password</label>
           <input id="staff-password" type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} />
-          <p className="hint">At least 10 characters. Give it to them in person.</p>
+          <p className="hint">At least 12 characters, not a common one. Give it to them in person.</p>
         </div>
         <FormError error={formError ?? add.error} />
       </form>
@@ -316,7 +361,7 @@ function PasswordDialog({ member, onClose }: { member: StaffMember; onClose: () 
   function onSubmit(e: FormEvent) {
     e.preventDefault()
     setFormError(null)
-    if (password.length < 10) return setFormError('Use a password of at least 10 characters.')
+    if (password.length < 12) return setFormError('Use a password of at least 12 characters.')
     save.mutate()
   }
   return (
@@ -378,6 +423,15 @@ const ACTION_LABEL: Record<string, string | ((d: Record<string, unknown>) => str
   'POST /slots': 'Added a delivery slot',
   'PATCH /slots/:id': 'Changed a delivery slot',
   'PUT /preorder-capacity/:weekStart/:sku': 'Set preorder capacity',
+  // ADM-2: the row holds the values before the change (`before`) and an optional reason.
+  'PATCH /products/:sku': (d) => {
+    const was = (d.before ?? {}) as Record<string, unknown>
+    if (typeof was.price === 'number' && typeof d.price === 'number') return `Changed a price from ${rupees(was.price)} to ${rupees(d.price)}`
+    if (d.active === true) return 'Put a product back on sale'
+    return 'Changed a product'
+  },
+  'POST /products': 'Added a product',
+  'DELETE /products/:sku': 'Removed a product',
   'POST /staff': 'Added a person',
   'PATCH /staff/:id': 'Changed a person',
   'DELETE /staff/:id': 'Removed a person',
@@ -396,7 +450,7 @@ function describe(a: AuditEntry) {
 function details(a: AuditEntry) {
   if (!a.detail) return ''
   return Object.entries(a.detail)
-    .filter(([k, v]) => v !== '[removed]' && !(k === 'status' && a.action.endsWith('/status')))
+    .filter(([k, v]) => v !== '[removed]' && !(k === 'status' && a.action.endsWith('/status')) && k !== 'before')
     .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
     .join(', ')
 }
@@ -434,8 +488,8 @@ function Activity() {
     <section className="card">
       <h2>Activity</h2>
       <p className="muted small">Every change made in the panel, newest first, and each sign-in.</p>
-      <div className="btn-row" style={{ marginBottom: '0.75rem' }}>
-        <div className="field" style={{ margin: 0 }}>
+      <div className="btn-row mb-3">
+        <div className="field m-0">
           <label htmlFor="act-staff" className="sr-only">
             Person
           </label>
@@ -448,13 +502,13 @@ function Activity() {
             ))}
           </select>
         </div>
-        <div className="field" style={{ margin: 0 }}>
+        <div className="field m-0">
           <label htmlFor="act-from" className="sr-only">
             From
           </label>
           <input id="act-from" type="date" value={from ?? ''} onChange={(e) => set('from', e.target.value)} />
         </div>
-        <div className="field" style={{ margin: 0 }}>
+        <div className="field m-0">
           <label htmlFor="act-to" className="sr-only">
             To
           </label>

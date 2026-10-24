@@ -1,7 +1,7 @@
 name: Deploy
 
 # Deploys main to the production server after CI passes on it, or on demand
-# (Actions > Deploy > Run workflow). Does nothing until the repository variable
+# (Actions > Deploy > Run workflow) for a commit CI already passed on main. Does nothing until the repository variable
 # DEPLOY_HOST is set. Setup: deploy/README.md, "Automatic deploys".
 on:
   workflow_run:
@@ -23,7 +23,29 @@ jobs:
       (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     environment: production
+    permissions:
+      actions: read
+      contents: read
     steps:
+      # TST-4: a hand-started deploy is held to the same rule as the automatic
+      # one: the exact commit must have a successful CI run on main. The commit
+      # id (not a branch name) is what gets deployed, so nothing newer slips in.
+      - name: Require a green CI run for this commit
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ inputs.ref || github.event.workflow_run.head_sha || 'main' }}
+        run: |
+          case "$REF" in *[!A-Za-z0-9._/-]*) echo "bad ref"; exit 1;; esac
+          REF="${REF#origin/}"
+          SHA=$(gh api "repos/$REPO/commits/$REF" --jq .sha)
+          OK=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&branch=main&status=success&per_page=1" --jq .total_count)
+          if [ "$OK" -lt 1 ]; then
+            echo "::error::CI has not passed on main for $SHA; not deploying"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
       - name: Deploy over SSH
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -31,7 +53,7 @@ jobs:
           HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
           DEPLOY_DIR: ${{ vars.DEPLOY_DIR || 'mandimangoes' }}
-          REF: ${{ inputs.ref || github.event.workflow_run.head_sha || 'origin/main' }}
+          REF: ${{ steps.sha.outputs.sha }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key

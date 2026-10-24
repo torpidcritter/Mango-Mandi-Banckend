@@ -8,7 +8,7 @@ things:
 | `web` | Caddy: HTTPS for all three domains (certificates issued and renewed automatically), serves the customer shop and the staff panel, and forwards the API |
 | `api` | mango-api: migrates the database on start, runs the maintenance loop |
 | `db` | PostgreSQL 16, on a Docker volume |
-| `backup` | a `pg_dump` at start and every 24 hours into `deploy/backups/`, kept 14 days |
+| `backup` | a `pg_dump` at start and every 24 hours, encrypted, copied off the server, and kept 14 days in `deploy/backups/` (see [Backups](#backups)) |
 
 | Address | Serves |
 |---------|--------|
@@ -50,7 +50,9 @@ These take days to weeks and only the business can do them, so start them now:
    ```
    The repository is private, so this needs a GitHub deploy key or access token on the server.
 4. **Settings.** Fill in `deploy/.env`. Every line is explained there. Generate secrets
-   with `openssl rand -hex 32`. Never commit this file.
+   with `openssl rand -hex 32`. Never commit this file. `VITE_SUPPORT_WHATSAPP` (the shop's
+   help WhatsApp number, country code and number, digits only) is required: the shop build
+   fails without it, because every shop page shows customers how to reach a person.
 5. **Deploy.**
    ```bash
    ./deploy/deploy.sh
@@ -63,7 +65,7 @@ These take days to weeks and only the business can do them, so start them now:
    to go back. The old containers stop before the new ones start, so expect up to a
    minute of downtime when a deploy goes wrong.
 6. **Webhooks.** In Razorpay (Dashboard > Webhooks) add `https://API_DOMAIN/webhooks/razorpay`
-   with events `payment.authorized`, `payment.captured`, `payment.failed`, `payment_link.paid`, `refund.processed` and `refund.failed`. Use the same secret as `RAZORPAY_WEBHOOK_SECRET`.
+   with events `payment.authorized`, `payment.captured`, `payment.failed`, `payment_link.paid`, `refund.processed`, `refund.failed` and the `payment.dispute.*` events (disputes are only recorded and shown in Needs attention). Use the same secret as `RAZORPAY_WEBHOOK_SECRET`. To rotate it, set the old one as `RAZORPAY_WEBHOOK_SECRET_PREVIOUS` for a day (Razorpay may retry older events signed with it), then remove it.
    For WhatsApp, set the callback URL `https://API_DOMAIN/webhooks/whatsapp` and your
    `WHATSAPP_VERIFY_TOKEN` in the Meta app.
 7. **Set up the shop.** Sign in to `https://ADMIN_DOMAIN` with `ADMIN_BOOTSTRAP_EMAIL`, then:
@@ -123,18 +125,15 @@ The `Deploy` GitHub Action deploys `main` after CI passes on it, and can be run 
 | Restart the API | `docker compose restart api` |
 | Database shell | `docker compose exec db psql -U mango mango` |
 
-**Backups.** The `backup` service writes `deploy/backups/mango-*.dump` daily (set
-`BACKUP_GPG_RECIPIENT` to encrypt them; they hold customers' personal details). A backup on
-the same server is lost with the server, so copy them off it every night. For example,
-use `rclone` to object storage in a cron job:
-`0 3 * * * rclone copy ~/mandimangoes/deploy/backups remote:mandimangoes-backups`.
-Prove the backups work once a month with
-[`../mango-api/ops/restore-check.sh`](../mango-api/ops/restore-check.sh).
+**Backups.** Set up once, then checked by the staff panel: see [Backups](#backups).
+`docker compose logs --tail 20 backup` shows the last runs.
 
 **Monitoring.** Point an uptime checker (UptimeRobot, Better Stack) at
 `https://API_DOMAIN/ready` and the shop's home page. The alert rules in
 [`../mango-api/ops/alerts.yml`](../mango-api/ops/alerts.yml) need Prometheus scraping
 `api:3000/metrics` from inside the server; Caddy keeps `/metrics` off the internet.
+These rules and `/metrics` apply to this Docker setup only; on Vercel `/metrics` is
+404 and alerting is Sentry plus an uptime monitor ([VERCEL.md, Watch it](VERCEL.md#8-watch-it)).
 
 **Rolling back a migration.** Migrations only move forward. Going back to an older commit
 keeps the newer tables, which older code ignores. If a migration itself is wrong, prefer a
@@ -142,3 +141,94 @@ new migration that repairs it. Restoring a backup loses every order, payment and
 deletion since the backup while Razorpay keeps the money, so after any restore run
 `ops/replay-payments.js` and `ops/reapply-deletions.js` (see
 [VERCEL.md, Rolling back](VERCEL.md#rolling-back)).
+
+## Backups
+
+The `backup` service takes a backup when it starts and every 24 hours after. A backup
+holds customers' names, phones and addresses, so each one is:
+
+- **encrypted** with your public key before it is written. Without the key it takes no
+  backup at all: there is never an unencrypted copy on the server.
+- **copied off the server** in the same run, because a backup on the server is lost with
+  the server. Until the copy is set up, every run counts as failed.
+- **kept 14 days** in `deploy/backups/` too (`BACKUP_RETAIN_DAYS` in `deploy/.env`).
+- **recorded in the database.** When no backup has succeeded for 26 hours, the staff
+  panel's **Needs attention** says so, and a failed run shows there as "Nightly backup
+  is failing". After a failure it tries again in an hour.
+
+Set it up once, right after the first deploy (until then Needs attention shows the
+warning).
+
+**1. Make a key pair on your own computer, not on the server.** Install GPG (Mac:
+`brew install gnupg` or GPG Suite; Windows: Gpg4win; Linux already has it), then run:
+
+```bash
+gpg --quick-generate-key "MandiMangoes backups" default default never
+gpg --armor --export "MandiMangoes backups" > backup-public-key.asc
+gpg --armor --export-secret-keys "MandiMangoes backups" > backup-PRIVATE-key.asc
+```
+
+It asks for a passphrase: choose a strong one and write it down. Keep
+`backup-PRIVATE-key.asc` and the passphrase offline in two places (for example a password
+manager and a USB stick in a safe). Without them nobody can read the backups, you
+included. Never put the private key on the server or in GitHub; the backup refuses to run
+if it finds one. (On Vercel, the same public key goes in the `BACKUP_GPG_PUBLIC_KEY`
+secret.)
+
+**2. Put the public key on the server**, from your computer:
+
+```bash
+scp backup-public-key.asc deploy@YOUR_SERVER_IP:mandimangoes/deploy/backup-config/
+```
+
+`deploy.sh` makes the `deploy/backup-config/` folder (Git ignores it). The file must be
+named `backup-public-key.asc`.
+
+**3. Copy each backup off the server.** Any storage works. This uses
+[rclone](https://rclone.org) with Backblaze B2 or any S3-compatible storage: create a
+bucket (e.g. `mandimangoes-backups`) and an application key that can write to it but not
+delete from it. Then on the server, once as root: `apt-get install -y unzip`. Then as
+`deploy`:
+
+```bash
+cd ~/mandimangoes/deploy/backup-config
+curl -fsSLO https://downloads.rclone.org/rclone-current-linux-amd64.zip   # an ARM server: linux-arm64
+unzip -j rclone-current-linux-amd64.zip '*/rclone' && rm rclone-current-linux-amd64.zip
+./rclone config --config ./rclone.conf   # n (new remote), name it offsite, pick your provider, paste the key
+```
+
+Then add this line to `deploy/.env`, **with the single quotes**:
+
+```bash
+BACKUP_UPLOAD_CMD='/backup-config/rclone --config /backup-config/rclone.conf copy "$BACKUP_FILE" offsite:mandimangoes-backups'
+```
+
+The backup service sees `deploy/backup-config/` as `/backup-config`, and `$BACKUP_FILE` is
+the encrypted file it just wrote. Any other command that copies that file works too.
+
+**4. Start it and check:**
+
+```bash
+cd ~/mandimangoes/deploy
+docker compose up -d backup
+docker compose logs --tail 20 backup
+```
+
+You should see `backup written: /backups/mango-....dump.gpg` and `backup copied off the
+server`, and the file should be in your bucket. If you see `backup FAILED while ...`, the
+line above it says what to fix. Fix it, then `docker compose restart backup`.
+
+**Restore.** Prove the backups work once a month, on your own computer (it needs
+PostgreSQL 16 and the private key):
+
+1. Download a `mango-....dump.gpg` from the bucket.
+2. Once per computer, import the private key: `gpg --import backup-PRIVATE-key.asc`.
+3. Decrypt it (it asks for the passphrase):
+   `gpg --decrypt mango-....dump.gpg > mango.dump`
+4. Check it restores into a scratch database (the script creates and drops its own):
+   `ADMIN_URL=postgres://USER:PASSWORD@localhost:5432/postgres ./mango-api/ops/restore-check.sh mango.dump`
+   It should end with `restore check passed`.
+5. Delete `mango.dump` afterwards: it is customers' data, unencrypted.
+
+Putting a backup back into production loses every order since it was taken: read
+**Rolling back a migration** above first.

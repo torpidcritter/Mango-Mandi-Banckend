@@ -41,5 +41,10 @@ drift=$(q "SELECT COUNT(*) FROM batch_lines l WHERE l.on_hand <> COALESCE((SELEC
              WHERE g.batch_id = l.batch_id AND g.sku = l.sku AND g.event_type IN ('INTAKE','ADJUST','CONDEMN','RETIRE','PACK','RESTOCK')), 0)")
 held=$(q "SELECT COUNT(*) FROM batch_lines l WHERE l.held <> COALESCE((SELECT SUM(quantity) FROM order_stock s WHERE s.line_id = l.id AND s.state = 'held'), 0)
              OR l.committed <> COALESCE((SELECT SUM(quantity) FROM order_stock s WHERE s.line_id = l.id AND s.state = 'committed'), 0)")
-if [ "$drift" != "0" ] || [ "$held" != "0" ]; then echo "FAILED: $drift on-hand and $held held/committed lines disagree with their sources"; exit 1; fi
+# The reserve buffer too, as the app's own audit (src/inventory.js auditLedger) checks it.
+buffer=$(q "SELECT COUNT(*) FROM batch_lines l WHERE l.reserve_buffer <> COALESCE((SELECT SUM(delta) FROM batch_ledger g
+             WHERE g.batch_id = l.batch_id AND g.sku = l.sku AND g.event_type = 'ADJUST_BUFFER'), 0)")
+if [ "$drift" != "0" ] || [ "$held" != "0" ] || [ "$buffer" != "0" ]; then
+  echo "FAILED: $drift on-hand, $held held/committed and $buffer reserve-buffer lines disagree with their sources"; exit 1
+fi
 echo "restore check passed: restore $((restored - start))s, checks $(( $(date +%s) - restored ))s"

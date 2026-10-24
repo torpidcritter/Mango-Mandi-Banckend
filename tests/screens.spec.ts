@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures'
+import { expect, test, navLinkAnyState, openNavTo } from './fixtures'
 import { mockApi } from './mock-api'
 
 // Backend-free walk through every screen against the mocked API.
@@ -9,7 +9,8 @@ test('Today shows tiles, aging batches and low stock', async ({ page }) => {
   await expect(page.getByRole('link', { name: /3\s*Confirmed/ })).toHaveAttribute('href', '/orders?status=CONFIRMED')
   await expect(page.getByRole('link', { name: /2\s*Open claims/ })).toBeVisible()
   await expect(page.getByText(/Last updated \d\d:\d\d IST/)).toBeVisible()
-  await expect(page.getByRole('button', { name: /Alphonso batch, 7 days old/ })).toBeVisible()
+  // The row's first cell links to the batch; the row itself is read cell by cell.
+  await expect(page.getByRole('row', { name: /Alphonso batch.*7 days/ }).getByRole('link', { name: 'Alphonso batch' })).toHaveAttribute('href', /^\/batches\//)
   await expect(page.getByText('Alphonso 5kg Box')).toBeVisible()
 })
 
@@ -42,7 +43,10 @@ test('Batches lists batches, flags missing QC, and filters by status in the URL'
   await mockApi(page, { signedIn: true })
   await page.goto('/batches')
   await expect(page.getByText('No QC: not sellable yet')).toBeVisible()
-  await page.getByRole('button', { name: 'Selling', exact: true }).click()
+  // Chips on a wide screen; a select on a phone.
+  const select = page.getByRole('combobox', { name: 'Status' })
+  if (await select.isVisible()) await select.selectOption('SELLING')
+  else await page.getByRole('button', { name: 'Selling', exact: true }).click()
   await expect(page).toHaveURL(/status=SELLING/)
 })
 
@@ -100,7 +104,7 @@ test('Adjust stock requires a reason', async ({ page }) => {
   await dialog.getByLabel('Reason').fill('2 crushed')
   await dialog.getByRole('button', { name: 'Save adjustment' }).click()
   await expect(dialog).toHaveCount(0)
-  expect(api.calls.find((c) => c.method === 'PATCH' && c.path === '/batches/b1/lines/l1')?.body).toEqual({ onHand: 18, reason: '2 crushed' })
+  expect(api.calls.find((c) => c.method === 'PATCH' && c.path === '/batches/b1/lines/l1')?.body).toEqual({ onHand: 18, reason: '2 crushed', reasonCode: 'CORRECTION' })
 })
 
 test('Adjusting below what is promised records a short arrival', async ({ page }) => {
@@ -114,7 +118,7 @@ test('Adjusting below what is promised records a short arrival', async ({ page }
   await dialog.getByRole('button', { name: 'Record short arrival' }).click()
   await expect(dialog).toHaveCount(0)
   await expect(page.getByText('Short arrival recorded: moved ORD-1044')).toBeVisible()
-  expect(api.calls.find((c) => c.path === '/batches/b1/lines/l1/short-arrival')?.body).toEqual({ onHand: 3, reason: '2 boxes short off the truck' })
+  expect(api.calls.find((c) => c.path === '/batches/b1/lines/l1/short-arrival')?.body).toEqual({ onHand: 3, reason: '2 boxes short off the truck', reasonCode: 'RECEIVED' })
   expect(api.calls.some((c) => c.method === 'PATCH' && c.path === '/batches/b1/lines/l1')).toBe(false)
 })
 
@@ -165,9 +169,17 @@ test('Orders list filters and opens a detail page', async ({ page }) => {
   await mockApi(page, { signedIn: true })
   await page.goto('/orders')
   await expect(page.getByText('2 orders · page 1 of 1')).toBeVisible()
-  await page.getByLabel('Search order number or phone').fill('ORD-1042')
+  await page.getByLabel('Search by order number, phone, name or address').fill('ORD-1042')
   await expect(page).toHaveURL(/q=ORD-1042/)
-  await page.getByRole('button', { name: 'Open order ORD-1042' }).click()
+  // Each row's first cell is a real link (the row stays a row for screen readers),
+  // and it covers the whole row, so a click on any cell opens the order.
+  await expect(page.getByRole('link', { name: 'ORD-1042' })).toHaveAttribute('href', '/orders/o1')
+  // (A real mouse click: the link sits on top of the cell, so Playwright's own click would refuse it.)
+  // Scroll the row into view first: a mouse click does not scroll, and on a phone the row can sit below the fold.
+  const asha = page.getByRole('cell', { name: /Asha Rao/ })
+  await asha.scrollIntoViewIfNeeded()
+  const cell = (await asha.boundingBox())!
+  await page.mouse.click(cell.x + cell.width / 2, cell.y + cell.height / 2)
   await expect(page).toHaveURL(/\/orders\/o1$/)
 })
 
@@ -175,7 +187,7 @@ test('Order detail: mark packed waits for allocation; cancelling a paid order re
   const api = await mockApi(page, { signedIn: true })
   await page.goto('/orders/o1')
   await expect(page.getByRole('button', { name: 'Mark packed (allocate first)' })).toBeDisabled()
-  await page.getByRole('button', { name: 'Allocate and pack' }).click()
+  await page.getByRole('button', { name: 'Allocate stock' }).click()
   await expect.poll(() => api.calls.some((c) => c.path === '/orders/o1/allocate')).toBe(true)
 
   await page.getByRole('button', { name: 'Cancel and refund' }).click()
@@ -217,7 +229,7 @@ test('Pack list: by order with allocate shortcut, by batch with unallocated sect
   await page.goto('/pack-list?date=2026-10-16')
   await expect(page.getByRole('link', { name: 'ORD-1042' })).toBeVisible()
   await expect(page.locator('.pack-order').first()).toContainText('Morning')
-  await expect(page.getByRole('button', { name: 'Allocate and pack ORD-1042' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Allocate stock for ORD-1042' })).toBeVisible()
   await page.getByRole('button', { name: 'By batch' }).click()
   await expect(page).toHaveURL(/view=batch/)
   await expect(page.getByRole('heading', { name: 'Not allocated yet' })).toBeVisible()
@@ -232,6 +244,9 @@ test('Claims: start review and resolve as replacement', async ({ page }) => {
   await page.getByRole('button', { name: 'Resolve ORD-1043' }).click()
   const dialog = page.getByRole('dialog')
   await expect(dialog.getByText(/refund/i)).toHaveCount(0)
+  // Nothing is picked for the manager: the button waits for a choice.
+  await expect(dialog.getByRole('radio', { checked: true })).toHaveCount(0)
+  await expect(dialog.getByRole('button', { name: 'Resolve claim' })).toBeDisabled()
   await dialog.getByLabel(/Replacement/).check()
   await dialog.getByRole('button', { name: 'Approve replacement' }).click()
   await expect.poll(() => api.calls.find((c) => c.path === '/claims/c2/resolve')?.body).toEqual({ resolution: 'REPLACEMENT_APPROVED' })
@@ -308,6 +323,12 @@ test('Planning: managers add and switch off delivery slots', async ({ page }) =>
   await expect(table.getByRole('row', { name: /Late/ })).toBeVisible()
 
   await page.getByRole('button', { name: 'Switch off Evening' }).click()
+  // Switching a slot off asks first and says what happens.
+  const off = page.getByRole('dialog', { name: 'Switch off Evening?' })
+  await expect(off).toContainText('Orders already booked in it keep their slot.')
+  expect(api.calls.some((c) => c.method === 'PATCH' && c.path === '/slots/slt2')).toBe(false)
+  await off.getByRole('button', { name: 'Switch off' }).click()
+  await expect(off).toHaveCount(0)
   await expect.poll(() => api.calls.find((c) => c.method === 'PATCH' && c.path === '/slots/slt2')?.body).toEqual({ active: false })
 })
 
@@ -322,6 +343,9 @@ test('Planning: coverage gaps, closing a day, and manager-only rules', async ({ 
   await page.getByRole('button', { name: 'Change a day' }).click()
   const day = page.getByRole('dialog', { name: 'Change a delivery day' })
   await day.getByLabel('Date').fill('2026-11-01')
+  // A new day starts as Open: closing one is a choice, never the default.
+  await expect(day.getByLabel('Open')).toBeChecked()
+  await day.getByLabel('Closed').check()
   await day.getByLabel('Note (optional)').fill('Bandh')
   await day.getByRole('button', { name: 'Save' }).click()
   await expect(day).toHaveCount(0)
@@ -400,7 +424,8 @@ test('Deliveries: the rider run by slot and pincode, flagging unpacked orders', 
   const stop = page.getByRole('list', { name: 'Morning · 07:00–11:00, 400001' })
   await expect(stop.getByRole('listitem', { name: 'ORD-1042' })).toContainText('12 Marine Drive')
   await expect(stop.getByRole('listitem', { name: 'ORD-1044' })).toContainText('Not packed yet')
-  await expect(stop.getByRole('link', { name: '9876543210' })).toHaveAttribute('href', 'tel:+919876543210')
+  await expect(stop.getByRole('listitem', { name: 'ORD-1042' })).toContainText('9876543210')
+  await expect(stop.getByRole('link', { name: 'Call ORD-1042' })).toHaveAttribute('href', 'tel:+919876543210')
   await expect(stop.getByRole('link', { name: 'Map for ORD-1042' })).toHaveAttribute('href', /google\.com\/maps\/search\/.*12%20Marine%20Drive%20400001/)
   expect(api.calls.some((c) => c.path === '/manifest')).toBe(true)
 })
@@ -411,10 +436,10 @@ test('a rider starts the run and proves each delivery with the code, or says why
   await page.context().setGeolocation({ latitude: 18.9438, longitude: 72.8231 })
   await page.goto('/')
   await expect(page).toHaveURL(/\/deliveries/)
-  const nav = page.getByRole('navigation', { name: 'Main' })
-  await expect(nav.getByRole('link', { name: 'Deliveries' })).toBeVisible()
-  for (const name of ['Today', 'Orders', 'Pack list', 'Staff']) await expect(nav.getByRole('link', { name, exact: true })).toHaveCount(0)
-  await expect(nav).toContainText('rider@mandimangoes.test · Rider')
+  await expect(await openNavTo(page, 'Deliveries')).toBeVisible()
+  for (const name of ['Today', 'Orders', 'Pack list', 'Staff']) await expect(navLinkAnyState(page, name)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'rider@mandimangoes.test · Rider' })).toBeVisible()
+  await page.keyboard.press('Escape')
 
   await page.goto('/deliveries?date=2026-10-16')
   const stop = page.getByRole('list', { name: 'Morning · 07:00–11:00, 400001' })
@@ -440,7 +465,10 @@ test('a rider starts the run and proves each delivery with the code, or says why
   const at = { lat: 18.9438, lng: 72.8231 }
   // The attempt number from the manifest goes back with each report, so a late resend can be refused.
   expect(sent).toEqual([{ outcome: 'DELIVERED', code: '1111', ...at, attempt: 1 }, { outcome: 'DELIVERED', code: '4821', ...at, attempt: 1 }])
-  await expect(stop.getByRole('listitem', { name: 'ORD-1042' })).toContainText('Delivered')
+  // Delivered stops fold away for the rider; the summary and the folded list still show them.
+  await expect(page.getByRole('status', { name: 'Run summary' })).toContainText('0 to deliver · 1 delivered · 1 not packed yet')
+  await page.getByRole('button', { name: 'Show delivered (1)' }).click()
+  await expect(page.getByRole('list', { name: 'Morning · 07:00–11:00, delivered' }).getByRole('listitem', { name: 'ORD-1042' })).toContainText('Delivered')
 })
 
 test('a rider records a missed delivery with a reason, and a handover with a photo', async ({ page }) => {
@@ -518,13 +546,12 @@ test('a packer sees only the pack list, deliveries and order steps', async ({ pa
   await mockApi(page, { signedIn: true, role: 'PACKER' })
   await page.goto('/')
   await expect(page).toHaveURL(/\/pack-list/)
-  const nav = page.getByRole('navigation', { name: 'Main' })
-  await expect(nav.getByRole('link', { name: 'Pack list' })).toBeVisible()
-  await expect(nav.getByRole('link', { name: 'Deliveries' })).toBeVisible()
+  await expect(await openNavTo(page, 'Pack list')).toBeVisible()
+  await expect(await openNavTo(page, 'Deliveries')).toBeVisible()
   for (const name of ['Today', 'Batches', 'Orders', 'Claims', 'Pincodes', 'Planning', 'Staff']) {
-    await expect(nav.getByRole('link', { name, exact: true })).toHaveCount(0)
+    await expect(navLinkAnyState(page, name)).toHaveCount(0)
   }
-  await expect(nav).toContainText('packer@mandimangoes.test · Packer')
+  await expect(page.getByRole('button', { name: 'packer@mandimangoes.test · Packer' })).toBeVisible()
 
   await page.goto('/orders/o1')
   await expect(page.getByRole('heading', { name: /^Order ORD-1042/ })).toBeVisible()
@@ -541,9 +568,8 @@ test('QC staff land on batches and see nothing else', async ({ page }) => {
   await mockApi(page, { signedIn: true, role: 'QC' })
   await page.goto('/')
   await expect(page).toHaveURL(/\/batches/)
-  const nav = page.getByRole('navigation', { name: 'Main' })
-  await expect(nav.getByRole('link', { name: 'Batches' })).toBeVisible()
-  await expect(nav.getByRole('link', { name: 'Pack list' })).toHaveCount(0)
+  await expect(await openNavTo(page, 'Batches')).toBeVisible()
+  await expect(navLinkAnyState(page, 'Pack list')).toHaveCount(0)
   await page.goto('/today')
   await expect(page.getByRole('heading', { name: 'Not available for your role' })).toBeVisible()
 })
@@ -559,7 +585,7 @@ test('Staff: a manager adds a packer, changes a role and reads the activity log'
   await dialog.getByLabel('Work email').fill('ravi@mandimangoes.test')
   await dialog.getByLabel('First password').fill('short')
   await dialog.getByRole('button', { name: 'Add' }).click()
-  await expect(dialog).toContainText('at least 10 characters')
+  await expect(dialog).toContainText('at least 12 characters')
   await dialog.getByLabel('First password').fill('long-enough-1')
   await dialog.getByRole('button', { name: 'Add' }).click()
   await expect(page.getByText('ravi@mandimangoes.test added as Packer')).toBeVisible()
@@ -568,7 +594,18 @@ test('Staff: a manager adds a packer, changes a role and reads the activity log'
   await expect(page.getByRole('dialog', { name: 'Setup code for ravi@mandimangoes.test' })).toContainText('mnpq-7890')
   await page.getByRole('dialog').getByRole('button', { name: 'Done' }).click()
 
-  await page.getByLabel('Role for ops@mandimangoes.test').selectOption('QC')
+  // A role change is staged and confirmed; Cancel puts the select back.
+  const role = page.getByLabel('Role for ops@mandimangoes.test')
+  await role.selectOption('RIDER')
+  const confirm = page.getByRole('dialog', { name: 'Make ops@mandimangoes.test a Rider?' })
+  await expect(confirm).toContainText("They'll be signed out")
+  await confirm.getByRole('button', { name: 'Cancel' }).click()
+  await expect(confirm).toHaveCount(0)
+  await expect(role).toHaveValue('OPERATOR')
+  expect(api.calls.some((c) => c.method === 'PATCH' && c.path.startsWith('/staff/'))).toBe(false)
+
+  await role.selectOption('QC')
+  await page.getByRole('dialog', { name: 'Make ops@mandimangoes.test a QC?' }).getByRole('button', { name: 'Make QC' }).click()
   await expect(page.getByText('ops@mandimangoes.test is now QC. They will need to sign in again.')).toBeVisible()
 
   const log = page.getByRole('region', { name: 'Activity' })
@@ -580,7 +617,7 @@ test('Staff: a manager adds a packer, changes a role and reads the activity log'
 test('Staff is a manager-only screen', async ({ page }) => {
   await mockApi(page, { signedIn: true, role: 'OPERATOR' })
   await page.goto('/today')
-  await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Staff' })).toHaveCount(0)
+  await expect(navLinkAnyState(page, 'Staff')).toHaveCount(0)
   await page.goto('/staff')
   await expect(page.getByRole('heading', { name: 'Not available for your role' })).toBeVisible()
 })

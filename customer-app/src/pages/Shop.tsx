@@ -1,24 +1,34 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Stars } from '../stars'
-import { ApiError, api, errorMessage, type CatalogueItem } from '../api'
-import { STAGE_HINT, STAGE_LABEL, day, rupees } from '../format'
+import { ApiError, api, errorMessage, type CatalogueItem, type RatingSummary } from '../api'
+import { STAGE_HINT, STAGE_LABEL, boxContents, day, rupees } from '../format'
 import { useStore } from '../store'
-import { ErrorNote, Spinner } from '../ui'
-import { BookAheadCard } from './Preorder'
-import { MangoArt } from '../mango'
+import { ErrorNote } from '../ui'
+import { catalogueQuery, productsQuery } from '../queries'
+import { BookAheadCard } from './BookAheadCard'
+import { MangoArt, ProductImage } from '../mango'
 import type { Stage } from '../api'
+import { UnpaidOrderBanner } from '../unpaid'
 
 export default function Shop() {
   const { pincode, date, setWhere, cart } = useStore()
-  const [editing, setEditing] = useState(!pincode)
+  const [params, setParams] = useSearchParams()
+  // The header's address button opens the pincode form with ?where=1.
+  const editing = params.get('where') === '1'
+  const search = (params.get('q') ?? '').trim()
   const boxes = cart.reduce((n, l) => n + l.qty, 0)
   const pickDate = useCallback((d: string | null) => setWhere(pincode, d), [setWhere, pincode])
-  const [params] = useSearchParams()
+  const closeForm = () => {
+    const next = new URLSearchParams(params)
+    next.delete('where')
+    setParams(next, { replace: true })
+  }
 
   return (
     <>
+      <UnpaidOrderBanner />
       {params.get('deleted') === '1' && (
         <p className="note" role="status">
           Your account is deleted. Thank you for buying from MandiMangoes.
@@ -27,24 +37,20 @@ export default function Shop() {
       {editing || !pincode ? (
         <PincodeForm
           initial={pincode ?? ''}
+          onCancel={pincode ? closeForm : undefined}
           onDone={(pin, first) => {
             setWhere(pin, first)
-            setEditing(false)
+            closeForm()
           }}
-        />
+        >
+          {/* UX-5: the boxes and prices before a pincode; the pincode is needed for stock, ripeness and adding to the cart. */}
+          {!pincode && <PriceList search={search} />}
+        </PincodeForm>
       ) : (
-        <div className="where">
-          <span>
-            Delivering to <strong>{pincode}</strong>
-          </span>
-          <button type="button" className="link-btn" onClick={() => setEditing(true)}>
-            Change
-          </button>
-        </div>
+        <Catalogue pincode={pincode} date={date} onDate={pickDate} search={search} />
       )}
-      {pincode && !editing && <Catalogue pincode={pincode} date={date} onDate={pickDate} />}
-      <BookAheadCard />
-      <Promises />
+      {!search && <BookAheadCard />}
+      {!search && <Promises />}
       {boxes > 0 && (
         <div className="sticky-cart">
           <Link to="/cart" className="btn btn-primary btn-block">
@@ -56,7 +62,57 @@ export default function Shop() {
   )
 }
 
-function PincodeForm({ initial, onDone }: { initial: string; onDone: (pincode: string, firstDate: string | null) => void }) {
+function PincodeForm({
+  initial,
+  onDone,
+  onCancel,
+  children,
+}: {
+  initial: string
+  onDone: (pincode: string, firstDate: string | null) => void
+  onCancel?: () => void
+  children?: ReactNode
+}) {
+  return (
+    <section className="hero">
+      <img src="/brand/logo-320.webp" srcSet="/brand/logo-320.webp 1x, /brand/logo-640.webp 2x" width="128" height="128" alt="MandiMangoes" className="hero-logo" />
+      <h1>Mangoes picked for the day you want to eat them</h1>
+      <p className="lead">Choose raw, semi-ripe or ripe, and the day it arrives. We pack each box from the batch that will be just right on that day.</p>
+      <PincodeCheck initial={initial} onDone={onDone} onCancel={onCancel} />
+      {children}
+      <ol className="how" aria-label="How it works">
+        <li>
+          <strong>Pick the ripeness and the day</strong>
+          <span className="muted small">Raw to ripen at home, semi-ripe for later this week, or ripe to eat on arrival.</span>
+        </li>
+        <li>
+          <strong>We pack from the right batch</strong>
+          <span className="muted small">We track every batch from the day it was picked, so your box is at the ripeness you chose on that day.</span>
+        </li>
+        <li>
+          <strong>It arrives at your door</strong>
+          <span className="muted small">Free delivery in your chosen time slot, with updates on WhatsApp.</span>
+        </li>
+      </ol>
+      <RipenessGuide />
+    </section>
+  )
+}
+
+/** The pincode box: checks we deliver there and that a day is open. Also on the product page before a pincode is set. */
+export function PincodeCheck({
+  initial,
+  onDone,
+  onCancel,
+  label = 'Your delivery pincode',
+  submitLabel = 'Show mangoes',
+}: {
+  initial: string
+  onDone: (pincode: string, firstDate: string | null) => void
+  onCancel?: () => void
+  label?: string
+  submitLabel?: string
+}) {
   const [pin, setPin] = useState(initial)
   const [error, setError] = useState<string | null>(null)
   const check = useMutation({
@@ -74,11 +130,8 @@ function PincodeForm({ initial, onDone }: { initial: string; onDone: (pincode: s
     check.mutate()
   }
   return (
-    <section className="hero">
-      <h1>Mangoes picked for the day you want to eat them</h1>
-      <p className="lead">Choose raw, semi-ripe or ripe, and the day it arrives. We pack each box from the batch that will be just right on that day.</p>
       <form className="pin-form" onSubmit={submit} noValidate>
-        <label htmlFor="pincode">Your delivery pincode</label>
+        <label htmlFor="pincode">{label}</label>
         <div className="row">
           <input
             id="pincode"
@@ -90,30 +143,62 @@ function PincodeForm({ initial, onDone }: { initial: string; onDone: (pincode: s
             aria-describedby={error ? 'pin-error' : undefined}
           />
           <button type="submit" className="btn btn-primary" disabled={check.isPending}>
-            {check.isPending ? 'Checking…' : 'Show mangoes'}
+            {check.isPending ? 'Checking…' : submitLabel}
           </button>
         </div>
+        {onCancel && (
+          <button type="button" className="link-btn" onClick={onCancel}>
+            Keep {initial}
+          </button>
+        )}
         {(error || check.error) && (
           <p id="pin-error" className="field-error" role="alert">
             {error ?? (check.error as Error).message}
           </p>
         )}
       </form>
-      <ol className="how" aria-label="How it works">
-        <li>
-          <strong>Pick the ripeness and the day</strong>
-          <span className="muted small">Raw to ripen at home, semi-ripe for later this week, or ripe to eat on arrival.</span>
-        </li>
-        <li>
-          <strong>We pack from the right batch</strong>
-          <span className="muted small">We track every batch from the day it was picked, so your box is at the ripeness you chose on that day.</span>
-        </li>
-        <li>
-          <strong>It arrives at your door</strong>
-          <span className="muted small">Free delivery in your chosen time slot, with updates on WhatsApp.</span>
-        </li>
-      </ol>
-      <RipenessGuide />
+  )
+}
+
+/**
+ * UX-5: every box and its price before a pincode is entered (search and ad visitors, and people
+ * outside our area, see what we sell). No stock or ripeness here: those depend on the delivery day.
+ */
+function PriceList({ search }: { search: string }) {
+  const q = useQuery(productsQuery())
+  if (q.isPending) return null
+  if (q.isError) return <ErrorNote error={q.error} onRetry={() => q.refetch()} />
+  const words = search.toLowerCase()
+  const products = words ? q.data.items.filter((p) => `${p.name} ${p.variety}`.toLowerCase().includes(words)) : q.data.items
+  if (!q.data.items.length) return null
+  return (
+    <section aria-labelledby="price-list" className="price-list">
+      <h2 id="price-list" className="section-title">
+        {search ? `Mangoes matching “${search}”` : 'Our mangoes and prices'}
+      </h2>
+      <p className="muted small">Price per box, free delivery. Enter your pincode to see the ripeness and days we have for you.</p>
+      {products.length === 0 && <p className="card empty">No mangoes match “{search}”. Try another name, such as Alphonso.</p>}
+      <ul className="tiles">
+        {products.map((p, i) => (
+          <li key={p.sku} className="card tile">
+            <div className="tile-img">
+              <ProductImage photoUrl={p.photoUrl} name={p.name} size={88} eager={i < FIRST_SCREEN_TILES} />
+            </div>
+            <div className="tile-body">
+              <h3 className="tile-name">
+                <Link to={`/mangoes/${p.sku}`} className="card-link">
+                  {p.name}
+                </Link>
+              </h3>
+              <ProductRating sku={p.sku} variety={p.variety} />
+              <p className="tile-foot">
+                <strong className="price">{rupees(p.price)}</strong>
+                {boxContents(p) && <span className="small muted">{boxContents(p)}</span>}
+              </p>
+            </div>
+          </li>
+        ))}
+      </ul>
     </section>
   )
 }
@@ -159,124 +244,136 @@ function Promises() {
   )
 }
 
-function Catalogue({ pincode, date, onDate }: { pincode: string; date: string | null; onDate: (d: string | null) => void }) {
-  const q = useQuery({ queryKey: ['catalogue', pincode, date], queryFn: () => api.catalogue(pincode, date) })
+function Catalogue({ pincode, date, onDate, search }: { pincode: string; date: string | null; onDate: (d: string | null) => void; search: string }) {
+  const q = useQuery(catalogueQuery(pincode, date))
+  const { cart } = useStore()
+  // Grouped once per answer, so each tile gets the same product object until the stock changes.
+  const all = useMemo(() => (q.data ? groupBySku(q.data.items) : []), [q.data])
   // A saved day that has passed or closed: fall back to the earliest open one.
   const stale = q.error instanceof ApiError && q.error.code === 'INVALID_DATE'
   useEffect(() => {
     if (stale) onDate(null)
   }, [stale, onDate])
-  if (q.isPending) return <Spinner label="Loading mangoes" />
-  if (q.isError) return <ErrorNote error={q.error} onRetry={() => q.refetch()} />
-  if (!q.data.serviceable) return <ErrorNote error={`We don't deliver to ${pincode} yet.`} />
-  const products = groupBySku(q.data.items)
+  // The page's h1 stays while the mangoes load or fail, for screen-reader heading navigation.
+  const quietTitle = <h1 className="sr-only">Pick your mangoes</h1>
+  if (q.isPending) return <TilesSkeleton search={search} />
+  if (q.isError) return <>{quietTitle}<ErrorNote error={q.error} onRetry={() => q.refetch()} /></>
+  if (!q.data.serviceable) return <>{quietTitle}<ErrorNote error={`We don't deliver to ${pincode} yet.`} /></>
+  const words = search.toLowerCase()
+  const products = words ? all.filter((p) => `${p.name} ${p.variety}`.toLowerCase().includes(words)) : all
   const chosen = q.data.deliveryDate!
 
   return (
     <>
-      <section aria-labelledby="when">
-        <h2 id="when" className="section-title">
-          When should it arrive?
-        </h2>
-        <div className="chips" role="radiogroup" aria-labelledby="when">
-          {q.data.deliveryDates!.map((d) => (
-            <button key={d} type="button" role="radio" aria-checked={d === chosen} className="chip" onClick={() => onDate(d)}>
-              {day(d)}
-            </button>
-          ))}
-        </div>
-        <p className="muted small">Orders for the next day close at {q.data.cutoffTime!.replace(' IST', '')} (India time).</p>
-      </section>
-
       <section aria-labelledby="pick">
-        <h2 id="pick" className="section-title">
-          Pick your mangoes for {day(chosen)}
-        </h2>
-        <div className="products">
-          {products.map((p) => (
-            <article key={p.sku} className="card product" aria-labelledby={`p-${p.sku}`}>
-              <header className="product-head">
-                <MangoArt stage="RIPE" size={52} />
-                <div className="product-name">
-                  <h3 id={`p-${p.sku}`}>{p.name}</h3>
-                  {p.description && <p className="muted small">{p.description}</p>}
-                  <ProductRating sku={p.sku} variety={p.variety} />
-                </div>
-                <strong className="price">{rupees(p.price)}</strong>
-              </header>
-              <ul className="stages">
-                {p.stages.map((item) => (
-                  <StageRow key={item.stage} item={item} onDate={onDate} />
-                ))}
-              </ul>
-            </article>
+        {/* The page's h1, at section-title size so it reads like the rest of the home page. */}
+        <h1 id="pick" className="section-title">
+          {search ? `Mangoes matching “${search}”` : 'Pick your mangoes'}
+        </h1>
+        <p className="muted small">Showing what we have for {day(chosen)}. You choose the delivery day at checkout.</p>
+        {products.length === 0 && (
+          <p className="card empty">
+            No mangoes match “{search}”. Try another name, such as Alphonso.
+          </p>
+        )}
+        <ul className="tiles">
+          {products.map((p, i) => (
+            <ProductTile
+              key={p.sku}
+              product={p}
+              inCart={cart.reduce((n, l) => (l.sku === p.sku ? n + l.qty : n), 0)}
+              // The first row (four across on a desktop) is on the first screen: load those photos at once.
+              eager={i < FIRST_SCREEN_TILES}
+            />
           ))}
-        </div>
+        </ul>
       </section>
+      {!search && <GiftBanner />}
     </>
   )
 }
 
-function StageRow({ item, onDate }: { item: CatalogueItem; onDate: (d: string | null) => void }) {
-  const { cart, setQty } = useStore()
-  const inCart = cart.find((l) => l.sku === item.sku && l.stage === item.stage)?.qty ?? 0
-  const max = Math.min(20, item.qty)
-  const set = (n: number) => setQty({ sku: item.sku, stage: item.stage, name: item.name, price: item.price }, Math.max(0, Math.min(max, n)))
-  const label = `${item.name}, ${STAGE_LABEL[item.stage]}`
+/** Tiles whose photos load at once rather than when scrolled to. */
+const FIRST_SCREEN_TILES = 4
+
+/**
+ * Placeholder tiles the same size as the real ones (title, date line, square photo, name, rating
+ * and price), so the page below does not move when the mangoes arrive.
+ */
+function TilesSkeleton({ search }: { search: string }) {
   return (
-    <li className="stage">
-      <span className={`stage-dot stage-${item.stage.toLowerCase()}`} aria-hidden="true" />
-      <div className="stage-text">
-        <strong>{STAGE_LABEL[item.stage]}</strong>
-        <span className="muted small">{STAGE_HINT[item.stage]}</span>
-        <span className="small">
-          {item.qty === 0 ? (
-            <span className="sold-out">
-              Sold out for this day
-              {item.nextAvailableDate ? (
-                <>
-                  {' · '}
-                  <button type="button" className="link-btn" onClick={() => onDate(item.nextAvailableDate!)}>
-                    Available {day(item.nextAvailableDate)}
-                  </button>
-                </>
-              ) : (
-                <>
-                  {' · '}
-                  <NotifyMe item={item} label={label} />
-                </>
-              )}
-            </span>
-          ) : (
-            <>
-              Eat by {day(item.eatBy)}
-              {item.qty <= 5 && <span className="low"> · Only {item.qty} left</span>}
-            </>
-          )}
+    <section aria-labelledby="pick" aria-busy="true">
+      <h1 id="pick" className="section-title">
+        {search ? `Mangoes matching “${search}”` : 'Pick your mangoes'}
+      </h1>
+      <p className="muted small">
+        <span className="sr-only">Loading mangoes…</span>
+        <span aria-hidden="true">
+          Showing what we have for <span className="sk-text">Thu, 22 Oct</span>. You choose the delivery day at checkout.
         </span>
-      </div>
-      {item.qty > 0 &&
-        (inCart === 0 ? (
-          <button type="button" className="btn btn-small" onClick={() => set(1)} aria-label={`Add ${label}`}>
-            Add
-          </button>
-        ) : (
-          <div className="stepper" role="group" aria-label={`${label} quantity`}>
-            <button type="button" onClick={() => set(inCart - 1)} aria-label={`One less ${label}`}>
-              −
-            </button>
-            <span aria-live="polite">{inCart}</span>
-            <button type="button" onClick={() => set(inCart + 1)} disabled={inCart >= max} aria-label={`One more ${label}`}>
-              +
-            </button>
-          </div>
+      </p>
+      <ul className="tiles" aria-hidden="true">
+        {Array.from({ length: FIRST_SCREEN_TILES }, (_, i) => (
+          <li key={i} className="card tile">
+            <div className="tile-img sk" />
+            <div className="tile-body">
+              <h3 className="tile-name">
+                <span className="sk-text">Mango 3kg Box</span>
+              </h3>
+              <span className="product-rating" />
+              <p className="tile-foot">
+                <strong className="price sk-text">₹1,899</strong>
+              </p>
+            </div>
+          </li>
         ))}
+      </ul>
+    </section>
+  )
+}
+
+/** One tile per box on the home page. Tapping it opens the product page, where the customer picks the ripeness. */
+const ProductTile = memo(function ProductTile({ product: p, inCart, eager }: { product: ProductGroup; inCart: number; eager: boolean }) {
+  const soldOut = !p.stages.some((s) => s.qty > 0)
+  const soonest = p.stages.map((s) => s.nextAvailableDate).filter(Boolean).sort()[0]
+  return (
+    <li className={soldOut ? 'card tile tile-sold-out' : 'card tile'}>
+      <div className="tile-img">
+        <ProductImage photoUrl={p.photoUrl} name={p.name} size={88} eager={eager} />
+        {inCart > 0 && <span className="tile-badge">{inCart} in cart</span>}
+      </div>
+      <div className="tile-body">
+        <h3 id={`p-${p.sku}`} className="tile-name">
+          <Link to={`/mangoes/${p.sku}`} className="card-link">
+            {p.name}
+          </Link>
+        </h3>
+        <ProductRating sku={p.sku} variety={p.variety} />
+        <p className="tile-foot">
+          <strong className="price">{rupees(p.price)}</strong>
+          {soldOut && <span className="small sold-out">Sold out{soonest ? `, back ${day(soonest)}` : ''}</span>}
+        </p>
+      </div>
     </li>
+  )
+})
+
+function GiftBanner() {
+  return (
+    <section className="card gift-banner" aria-labelledby="gift-title">
+      <div>
+        <h2 id="gift-title">Send a box as a gift</h2>
+        <p className="muted small">Pick any box, then tick "This is a gift" at checkout. We add your note and message them on WhatsApp.</p>
+      </div>
+      <Link to="/quality" className="link-btn">
+        How we pick and check
+      </Link>
+    </section>
   )
 }
 
 /** Sold out on every open day: a WhatsApp message when it is back. */
-function NotifyMe({ item, label }: { item: CatalogueItem; label: string }) {
+export function NotifyMe({ item, label }: { item: CatalogueItem; label: string }) {
   const { profile, pincode } = useStore()
   const location = useLocation()
   const queryClient = useQueryClient()
@@ -309,27 +406,50 @@ function NotifyMe({ item, label }: { item: CatalogueItem; label: string }) {
   )
 }
 
-function groupBySku(items: CatalogueItem[]) {
-  const map = new Map<string, { sku: string; name: string; variety: string; boxSize: string; price: number; description: string; stages: CatalogueItem[] }>()
+export type ProductGroup = {
+  sku: string
+  name: string
+  variety: string
+  boxSize: string
+  price: number
+  description: string
+  photoUrl: string | null
+  stages: CatalogueItem[]
+}
+
+export function groupBySku(items: CatalogueItem[]) {
+  const map = new Map<string, ProductGroup>()
   for (const i of items) {
-    const p = map.get(i.sku) ?? { sku: i.sku, name: i.name, variety: i.variety, boxSize: i.boxSize, price: i.price, description: i.description ?? '', stages: [] }
+    const p = map.get(i.sku) ?? { sku: i.sku, name: i.name, variety: i.variety, boxSize: i.boxSize, price: i.price, description: i.description ?? '', photoUrl: i.photoUrl ?? null, stages: [] }
     p.stages.push(i)
     map.set(i.sku, p)
   }
   return [...map.values()]
 }
 
-/** The variety's average and review count, linking to its reviews. One request per variety (the 3 and 5 kg boxes share it). */
-function ProductRating({ sku, variety }: { sku: string; variety: string }) {
-  const q = useQuery({ queryKey: ['rating', variety || sku], queryFn: () => api.productReviews(sku, { limit: 1 }), staleTime: 5 * 60_000 })
-  const s = q.data?.summary
-  if (!s || !s.count || s.average == null) return null
-  return (
-    <Link to={`/mangoes/${sku}`} className="product-rating">
+/**
+ * The variety's average and review count. One request per variety (the 3 and 5 kg boxes share it);
+ * the product page passes the `summary` it already has instead. Its line is kept (empty) while
+ * it loads and when there are no reviews yet, so nothing under it moves.
+ */
+export function ProductRating({ sku, variety, href, summary }: { sku: string; variety: string; href?: string; summary?: RatingSummary | null }) {
+  const own = summary === undefined
+  const q = useQuery({ queryKey: ['rating', variety || sku], queryFn: () => api.productReviews(sku, { limit: 1 }), staleTime: 5 * 60_000, enabled: own })
+  const s = own ? q.data?.summary : summary
+  if (!s || !s.count || s.average == null) return <span className="product-rating" aria-hidden="true" />
+  const body = (
+    <>
       <Stars value={s.average} small />
       <span className="small">
         {s.average.toFixed(1)} · {s.count} {s.count === 1 ? 'review' : 'reviews'}
       </span>
-    </Link>
+    </>
+  )
+  return href ? (
+    <a href={href} className="product-rating">
+      {body}
+    </a>
+  ) : (
+    <span className="product-rating">{body}</span>
   )
 }

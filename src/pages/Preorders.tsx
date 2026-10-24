@@ -3,10 +3,10 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { RIPENESS_LABEL, date, istDate, rupees, type Tone } from '../format'
-import { MANAGER_ONLY_HINT, can } from '../permissions'
+import { can } from '../permissions'
 import { useSession } from '../session'
 import type { Preorder, PreorderStatus } from '../types'
-import { Badge, Dialog, EmptyState, FormError, GatedButton, QueryError, Spinner, scrollRegion, useToast } from '../ui'
+import { Badge, Dialog, EmptyState, FormError, GatedButton, ManagerOnlyNote, PhoneLink, QueryError, ReasonDialog, Spinner, scrollRegion, useToast, usePageTitle } from '../ui'
 
 const STATUS_LABEL: Record<PreorderStatus, string> = {
   PAYMENT_PENDING: 'Awaiting payment',
@@ -26,6 +26,7 @@ const FILTERS: (PreorderStatus | null)[] = [null, 'BOOKED', 'WAITLISTED', 'PAYME
 const weekLabel = (d: string) => `Week of ${date(d)}`
 
 export default function Preorders() {
+  usePageTitle('Preorders')
   return (
     <>
       <div className="topbar">
@@ -46,8 +47,8 @@ function Capacity() {
 
   return (
     <section className="card">
-      <div className="topbar" style={{ marginBottom: '0.5rem' }}>
-        <h2 style={{ margin: 0 }}>Weekly capacity</h2>
+      <div className="topbar section-head">
+        <h2>Weekly capacity</h2>
         <span className="spacer" />
         <GatedButton allowed={allowed} className="btn" onClick={() => setOpen(true)}>
           Set capacity
@@ -93,7 +94,7 @@ function Capacity() {
           </table>
         </div>
       )}
-      {!allowed && <p className="hint">Changing capacity: {MANAGER_ONLY_HINT.toLowerCase()}.</p>}
+      {!allowed && <ManagerOnlyNote what="Changing capacity" />}
       {open && <CapacityDialog onClose={() => setOpen(false)} />}
     </section>
   )
@@ -195,7 +196,7 @@ function PreorderList() {
   return (
     <section className="card">
       <h2>Bookings</h2>
-      <div className="segmented" role="group" aria-label="Filter by status" style={{ marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+      <div className="segmented mb-3" role="group" aria-label="Filter by status">
         {FILTERS.map((s) => (
           <button key={s ?? 'all'} type="button" className="btn btn-small" aria-pressed={status === s} onClick={() => setStatus(s)}>
             {s ? STATUS_LABEL[s] : 'All'}
@@ -233,7 +234,11 @@ function PreorderList() {
                   </td>
                   <td>
                     {p.customerName ?? '—'}
-                    <div className="muted small">{p.phone}</div>
+                    {p.phone && (
+                      <div className="small">
+                        <PhoneLink phone={p.phone} who={p.customerName ?? 'the customer'} />
+                      </div>
+                    )}
                   </td>
                   <td>
                     {p.qty} × {p.productName}
@@ -272,6 +277,7 @@ function PreorderList() {
           </table>
         </div>
       )}
+      {me?.role !== 'MANAGER' && q.data?.some((p) => OPEN.includes(p.status)) && <ManagerOnlyNote what="Cancelling a booking" />}
       {cancelling && <CancelPreorderDialog preorder={cancelling} onClose={() => setCancelling(null)} />}
     </section>
   )
@@ -283,10 +289,9 @@ const OPEN: PreorderStatus[] = ['PAYMENT_PENDING', 'BOOKED', 'WAITLISTED']
 function CancelPreorderDialog({ preorder, onClose }: { preorder: Preorder; onClose: () => void }) {
   const toast = useToast()
   const queryClient = useQueryClient()
-  const [reason, setReason] = useState('')
   const paid = preorder.paymentStatus === 'SUCCEEDED'
   const cancel = useMutation({
-    mutationFn: () => api.cancelPreorder(preorder.id, reason.trim()),
+    mutationFn: (reason: string) => api.cancelPreorder(preorder.id, reason),
     onSuccess: (r) => {
       toast.success(r.refunded ? `${preorder.number} cancelled; ${rupees(preorder.total)} is being refunded` : `${preorder.number} cancelled`)
       void queryClient.invalidateQueries({ queryKey: ['preorders'] })
@@ -294,43 +299,24 @@ function CancelPreorderDialog({ preorder, onClose }: { preorder: Preorder; onClo
       onClose()
     },
   })
-  const valid = reason.trim().length >= 3
   return (
-    <Dialog
+    <ReasonDialog
       title={`Cancel preorder ${preorder.number}?`}
-      tone="danger"
+      confirmLabel={paid ? 'Cancel and refund' : 'Cancel booking'}
+      cancelLabel="Keep booking"
+      busyLabel="Cancelling…"
+      hint="At least 3 characters. Saved on the booking's history."
+      busy={cancel.isPending}
+      error={cancel.error}
       onClose={onClose}
-      footer={
-        <>
-          <button type="button" className="btn" onClick={onClose}>
-            Keep booking
-          </button>
-          <button type="submit" form="cancel-preorder-form" className="btn btn-danger" disabled={!valid || cancel.isPending}>
-            {cancel.isPending ? 'Cancelling…' : paid ? 'Cancel and refund' : 'Cancel booking'}
-          </button>
-        </>
-      }
+      onSubmit={(reason) => cancel.mutate(reason)}
     >
-      <form
-        id="cancel-preorder-form"
-        onSubmit={(e: FormEvent) => {
-          e.preventDefault()
-          if (valid) cancel.mutate()
-        }}
-      >
-        <p>
-          {paid
-            ? `The customer paid ${rupees(preorder.total)}. It goes back to them in full. Use this when we can't fill the booking (crop failure, the season ending).`
-            : 'The booking has not been paid, so there is nothing to refund.'}{' '}
-          The boxes go back into the week's capacity.
-        </p>
-        <div className="field">
-          <label htmlFor="cancel-preorder-reason">Reason</label>
-          <textarea id="cancel-preorder-reason" value={reason} onChange={(e) => setReason(e.target.value)} data-autofocus />
-          <p className="hint">At least 3 characters. Saved on the booking's history.</p>
-        </div>
-        <FormError error={cancel.error} />
-      </form>
-    </Dialog>
+      <p>
+        {paid
+          ? `The customer paid ${rupees(preorder.total)}. It goes back to them in full. Use this when we can't fill the booking (crop failure, the season ending).`
+          : 'The booking has not been paid, so there is nothing to refund.'}{' '}
+        The boxes go back into the week's capacity.
+      </p>
+    </ReasonDialog>
   )
 }

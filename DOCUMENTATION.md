@@ -168,6 +168,11 @@ open a dialog that names the consequence before it runs.
 - No customer data in URLs or logs beyond order numbers.
 - All API text is rendered as plain text; the app ships no third-party scripts.
 - Use HTTPS in production and set the API's `ADMIN_ORIGIN` to the panel's host.
+- Riders see only the stops given to them. Managers and operators give stops (one, or a whole
+  slot) to a rider with the picker on the Deliveries page; a rider can also take the packed
+  stops nobody has yet ("Take them and start").
+- Staff passwords are at least 12 characters and not a common password. Everyone can change
+  their own on the Two-step sign-in page (Your password); their other sessions end.
 
 ## 8. Deploying
 
@@ -182,6 +187,7 @@ npm run build          # type-checks, then builds to dist/
 
 ```bash
 npm run typecheck                                  # tsc --noEmit
+npm run lint && npm run test:unit                  # ESLint (hooks, unused) and unit tests
 npx playwright test tests/smoke.spec.ts tests/a11y.spec.ts   # no backend needed
 # full flow against a live backend:
 E2E_EMAIL=manager@mandimangoes.test E2E_PASSWORD=manager123 \

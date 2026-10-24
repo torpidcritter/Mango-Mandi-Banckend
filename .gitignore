@@ -9,4 +9,6 @@ test-results-shop
 playwright-report-shop
 deploy/.env
 deploy/backups/
+# The backup public key and off-site storage settings stay on the server
+deploy/backup-config/
 .local/

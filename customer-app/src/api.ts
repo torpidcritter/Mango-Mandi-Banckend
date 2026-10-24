@@ -3,6 +3,8 @@
 // cookie. The access token is short-lived and refreshed once on a 401; a
 // refresh the API refuses (401) signs the customer out.
 
+import { ApiError, readAnswer } from './answer'
+
 export const API_URL = (import.meta.env.VITE_API_URL ?? 'http://localhost:3000').replace(/\/$/, '')
 
 export type Stage = 'RAW' | 'SEMI_RIPE' | 'RIPE'
@@ -45,8 +47,33 @@ export interface CatalogueItem {
   eatBy: string
   /** A line about the fruit. */
   description?: string
+  /** The product photo the shop team added (a path on the API), or null for the drawn mango. */
+  photoUrl?: string | null
   /** When sold out on this day: the next bookable day it is in stock, if any. */
   nextAvailableDate?: string | null
+  /** What is in the box, when the shop team has filled it in: about how many mangoes, and grams each. */
+  fruitsPerBox?: number | null
+  fruitWeightG?: number | null
+}
+/** The live rules the help and terms pages quote (GET /v1/policy). */
+export interface ShopPolicy {
+  holdMinutes: number
+  /** "18:00 IST" */
+  cutoffTime: string
+  maxDaysAhead: number
+  claimWindowHours: number
+}
+/** A box on sale with its price, known before a pincode (GET /v1/products): no stock or ripeness. */
+export interface ProductListing {
+  sku: string
+  name: string
+  variety: string
+  boxSize: string
+  price: number
+  description: string
+  photoUrl: string | null
+  fruitsPerBox: number | null
+  fruitWeightG: number | null
 }
 export interface Catalogue {
   serviceable: boolean
@@ -75,6 +102,8 @@ export interface Quote {
   discount: number
   total: number
   expiresAt: string
+  /** How long the boxes are held once Pay is tapped (the live rule); older APIs leave it out. */
+  holdMinutes?: number
 }
 export interface Gift {
   recipientName: string
@@ -99,6 +128,8 @@ export interface OrderSummary {
   total: number
   itemCount: number
   placedAt: string
+  /** Set while the order waits for payment with its boxes held. */
+  holdExpiresAt?: string | null
 }
 export interface Order {
   id: string
@@ -113,12 +144,15 @@ export interface Order {
   promoCode: string | null
   total: number
   gift: Gift | null
-  paymentStatus: 'INITIATED' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | null
+  paymentStatus: 'INITIATED' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'REFUNDED' | null
   refundStatus: 'PENDING' | 'REFUNDED' | null
   razorpayOrderId: string | null
   /** Razorpay's public key id, while the order waits for payment, so checkout can be reopened anywhere. */
   razorpayKeyId?: string | null
   holdExpiresAt: string | null
+  /** Why a cancelled order was cancelled. HOLD_EXPIRED: no payment arrived in time, but a late one can still confirm it. */
+  cancelReason?: 'HOLD_EXPIRED' | 'STAFF' | 'OTHER' | null
+  cancelledAt?: string | null
   slot: Slot | null
   items: { sku: string; name: string; stage: Stage | null; quantity: number; unitPrice: number; linePrice: number; eatBy: string | null; readyOn?: string | null }[]
   timeline: { status: OrderStatus; at: string }[]
@@ -128,6 +162,16 @@ export interface Order {
   delivery?: { at: string; method: 'code' | 'photo' | 'staff' | null; receivedBy: string | null; hasPhoto: boolean } | null
   /** The customer's stars once delivered. */
   rating?: { stars: number; comment: string | null; at: string } | null
+  /** Hours after delivery a problem can be reported for a free replacement (the live rule). */
+  claimWindowHours: number
+  /** Until when a problem can be reported; set once delivered. */
+  claimUntil: string | null
+  /** Failed delivery attempts so far. */
+  deliveryFailures: number
+  /** On a failed delivery: true when another attempt is booked, false when we will call first. Null otherwise. */
+  retryScheduled: boolean | null
+  /** Paid, but no stock for its date yet: the day may change and we message once it's settled. */
+  findingStock?: boolean
 }
 export interface SavedAddress {
   id: string
@@ -160,6 +204,8 @@ export interface Claim {
   issueType: IssueType
   status: 'SUBMITTED' | 'UNDER_REVIEW' | 'RESOLVED'
   resolution: string | null
+  /** Why staff rejected the claim, in their words. */
+  rejectionReason?: string | null
   replacementOrder: { id: string; number: string } | null
   createdAt: string
 }
@@ -285,16 +331,7 @@ export interface ReviewPage {
   nextCursor: string | null
 }
 
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    public code: string,
-    message: string,
-    public detail: Record<string, unknown> = {},
-  ) {
-    super(message)
-  }
-}
+export { ApiError }
 
 // The refresh token lives in an httpOnly cookie set by the API ("X-Session:
 // cookie"), so page scripts never see it. The short-lived access token is kept
@@ -358,6 +395,7 @@ const PERSONAL_KEYS = ['mm.address', 'mm.cart']
  * address and cart go too. An expired session keeps them for the next sign-in.
  */
 function signedOut(forget = false) {
+  epoch++
   const was = profile
   accessToken = null
   profile = null
@@ -366,12 +404,17 @@ function signedOut(forget = false) {
   if (was || forget) window.dispatchEvent(new CustomEvent(SIGNOUT_EVENT, { detail: { forget } }))
 }
 
+/** Goes up on every sign-out, so a refresh that was already on its way cannot sign the customer back in. */
+let epoch = 0
 let refreshing: Promise<boolean> | null = null
 function refreshOnce(): Promise<boolean> {
   if (!profile) return Promise.resolve(false)
   refreshing ??= (async () => {
+    const started = epoch
     try {
-      signedIn(await raw<TokenResponse>('POST', '/auth/token/refresh', {}))
+      const r = await raw<TokenResponse>('POST', '/auth/token/refresh', {})
+      if (epoch !== started) return false
+      signedIn(r)
       return true
     } catch (err) {
       // Only a refused session (401) is a sign-out. Offline, busy (429) or a
@@ -400,22 +443,7 @@ async function raw<T>(method: string, path: string, body?: unknown, headers: Rec
     body: body === undefined ? undefined : blob ? body : JSON.stringify(body),
   })
   if (res.status === 204) return undefined as T
-  const text = await res.text()
-  let json: { error?: { code?: string; message?: string } & Record<string, unknown> } | null = null
-  try {
-    json = text ? JSON.parse(text) : null
-  } catch {
-    // Not JSON: a proxy's or host's own error page.
-    if (res.ok) throw new ApiError(res.status, 'BAD_RESPONSE', 'MandiMangoes sent an answer we could not read. Please try again.')
-  }
-  if (!res.ok) {
-    if (json === null && res.status >= 500) {
-      throw new ApiError(res.status, 'UNAVAILABLE', 'MandiMangoes is busy right now. Please try again in a minute.')
-    }
-    const e = json?.error
-    throw new ApiError(res.status, e?.code ?? 'ERROR', e?.message ?? `Request failed (${res.status})`, e ?? {})
-  }
-  return json as T
+  return readAnswer<T>(res.status, await res.text())
 }
 
 async function request<T>(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<T> {
@@ -437,6 +465,17 @@ const qs = (params: Record<string, string | null | undefined>) => {
   return s ? `?${s}` : ''
 }
 const id = encodeURIComponent
+
+/** What Razorpay Checkout's success handler receives. */
+export interface CheckoutReply {
+  razorpay_payment_id: string
+  razorpay_order_id: string
+  razorpay_signature: string
+}
+export interface PaymentState {
+  status: Order['paymentStatus']
+  orderStatus: OrderStatus
+}
 
 export const api = {
   requestCode: (phone: string, channel?: 'sms' | 'whatsapp', captchaToken?: string) =>
@@ -463,8 +502,17 @@ export const api = {
     await raw('POST', '/auth/logout', {}).catch(() => undefined)
     signedOut(true)
   },
+  /** Ends every session of the account, on every phone and computer, then signs out here too. */
+  async signOutEverywhere() {
+    await request<void>('POST', '/me/sign-out-everywhere')
+    signedOut(true)
+  },
+  /** A copy of everything the shop holds about the customer, as JSON. */
+  exportData: () => request<Record<string, unknown>>('GET', '/me/export'),
 
   checkPincode: (pincode: string) => request<DeliveryCheck>('GET', `/delivery/check${qs({ pincode })}`),
+  products: () => request<{ items: ProductListing[] }>('GET', '/products'),
+  policy: () => request<ShopPolicy>('GET', '/policy'),
   catalogue: (pincode: string, date: string | null) => request<Catalogue>('GET', `/catalogue${qs({ pincode, delivery_date: date })}`),
   slots: (pincode: string, date: string) =>
     request<{ deliveryDate: string; slots: SlotOnDate[] }>('GET', `/delivery/slots${qs({ pincode, delivery_date: date })}`),
@@ -478,6 +526,10 @@ export const api = {
   orders: () => request<OrderSummary[]>('GET', '/orders'),
   order: (orderId: string) => request<Order>('GET', `/orders/${id(orderId)}`),
   cancel: (orderId: string) => request<void>('POST', `/orders/${id(orderId)}/cancel`),
+  /** Asks the API for the payment state; a minute after checkout it also checks with Razorpay (throttled). */
+  paymentStatus: (orderId: string) => request<PaymentState>('GET', `/orders/${id(orderId)}/payment-status`),
+  /** Hands what Razorpay Checkout returned to the API, which verifies it and confirms the order at once. */
+  verifyPayment: (orderId: string, reply: CheckoutReply) => request<PaymentState>('POST', `/orders/${id(orderId)}/verify-payment`, reply),
   reschedule: (orderId: string, deliveryDate: string, slotId: string | null) =>
     request<void>('POST', `/orders/${id(orderId)}/reschedule`, { deliveryDate, slotId }),
   rate: (orderId: string, stars: number, comment: string | null) => request<void>('PUT', `/orders/${id(orderId)}/rating`, { stars, comment }),

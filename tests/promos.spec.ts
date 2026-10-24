@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures'
+import { expect, test, navLinkAnyState } from './fixtures'
 import { mockApi } from './mock-api'
 
 // Promo codes (manager only) and gift orders on the order page, pack list and rider run.
@@ -34,7 +34,7 @@ test('a manager makes a promo code and turns one off', async ({ page }) => {
 test('promo codes are a manager-only screen', async ({ page }) => {
   await mockApi(page, { signedIn: true, role: 'OPERATOR' })
   await page.goto('/today')
-  await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Promos' })).toHaveCount(0)
+  await expect(navLinkAnyState(page, 'Promos')).toHaveCount(0)
   await page.goto('/promos')
   await expect(page.getByRole('heading', { name: 'Not available for your role' })).toBeVisible()
 })

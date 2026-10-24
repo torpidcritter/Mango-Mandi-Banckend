@@ -301,7 +301,11 @@ describe('ORD-4: retries', () => {
     assert.equal((await api.post(`/admin/v1/orders/${id}/dispatch`, {}, { token: admin })).status, 204)
     return id
   }
-  const fail = (id, extra = {}) => api.post(`/admin/v1/orders/${id}/delivery`, { outcome: 'FAILED', reason: 'NOT_HOME', ...extra }, { token: admin })
+  const currentAttempt = async (id) => (await api.get(`/admin/v1/orders/${id}`, { token: admin })).body.attempt
+  const fail = async (id, extra = {}) =>
+    api.post(`/admin/v1/orders/${id}/delivery`, { outcome: 'FAILED', reason: 'NOT_HOME', attempt: await currentAttempt(id), ...extra }, { token: admin })
+  // A missed order goes out again on a later day, not the same one (OPS-01).
+  const nextDay = (i) => setNow(new Date(Date.parse(T0) + i * 86_400_000).toISOString())
 
   test('a missed delivery retries on the next day with room', async () => {
     const id = await outForDelivery()
@@ -315,6 +319,7 @@ describe('ORD-4: retries', () => {
     const manifest = await api.get('/admin/v1/manifest?date=2026-10-16', { token: admin })
     assert.equal(manifest.body.runs[0].stops[0].orders[0].attempt, 1)
     assert.equal((await fail(id, { attempt: 1 })).status, 200)
+    nextDay(1)
     assert.equal((await api.post(`/admin/v1/orders/${id}/dispatch`, {}, { token: admin })).status, 204)
     const resent = await fail(id, { attempt: 1 })
     assert.equal(resent.status, 409)
@@ -326,9 +331,13 @@ describe('ORD-4: retries', () => {
   test('after the last attempt, only a manager sends it out again', async () => {
     const id = await outForDelivery()
     for (let i = 0; i < 3; i++) {
-      if (i) assert.equal((await api.post(`/admin/v1/orders/${id}/dispatch`, {}, { token: admin })).status, 204)
+      if (i) {
+        nextDay(i)
+        assert.equal((await api.post(`/admin/v1/orders/${id}/dispatch`, {}, { token: admin })).status, 204)
+      }
       assert.equal((await fail(id)).status, 200)
     }
+    nextDay(3)
     const again = await api.post(`/admin/v1/orders/${id}/dispatch`, {}, { token: ops })
     assert.equal(again.status, 409)
     assert.equal(again.body.error.code, 'ATTEMPTS_USED_UP')

@@ -3,14 +3,15 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { api } from '../api'
 import { RIPENESS_LABEL, date, istDate } from '../format'
-import { MANAGER_ONLY_HINT, can } from '../permissions'
+import { can } from '../permissions'
 import { useSession } from '../session'
 import type { BulkMoveResult, CalendarDay, DeliverySlot, Ripeness, Rules, StageWindow } from '../types'
-import { Badge, Dialog, EmptyState, FormError, GatedButton, QueryError, Spinner, scrollRegion, useToast } from '../ui'
+import { Badge, ConfirmDialog, Dialog, EmptyState, FormError, GatedButton, ManagerOnlyNote, QueryError, Spinner, scrollRegion, useToast, usePageTitle } from '../ui'
 
 const STAGES: Ripeness[] = ['RAW', 'SEMI_RIPE', 'RIPE']
 
 export default function Planning() {
+  usePageTitle('Planning')
   return (
     <>
       <div className="topbar">
@@ -48,10 +49,10 @@ function Coverage() {
           const skus = [...new Set(day.stock.map((s) => s.sku))]
           const qty = (sku: string, stage: Ripeness) => day.stock.find((s) => s.sku === sku && s.stage === stage)?.qty ?? 0
           return (
-            <div key={day.date} style={{ marginTop: '1rem' }}>
+            <div key={day.date} className="mt-4">
               <h3>{date(day.date)}</h3>
               {day.slots && day.slots.length > 0 && (
-                <p className="muted small" style={{ marginTop: 0 }}>
+                <p className="muted small mt-0">
                   Booked:{' '}
                   {day.slots
                     .map((sl) => `${sl.label} ${sl.booked}${sl.maxBoxes == null ? '' : ` of ${sl.maxBoxes}`} boxes`)
@@ -112,6 +113,7 @@ function Calendar() {
   const q = useQuery({ queryKey: ['calendar'], queryFn: api.calendar })
   const [editing, setEditing] = useState<CalendarDay | null>(null)
   const [moving, setMoving] = useState(false)
+  const [resetting, setResetting] = useState<CalendarDay | null>(null)
   const canMove = can(me?.role, 'moveDay')
 
   const refresh = () => {
@@ -122,15 +124,15 @@ function Calendar() {
     mutationFn: (d: string) => api.clearCalendarDay(d),
     onSuccess: (_r, d) => {
       toast.success(`${date(d)} is back to normal`)
+      setResetting(null)
       refresh()
     },
-    onError: (err) => toast.error(err),
   })
 
   return (
     <section className="card">
-      <div className="topbar" style={{ marginBottom: '0.5rem' }}>
-        <h2 style={{ margin: 0 }}>Delivery calendar</h2>
+      <div className="topbar section-head">
+        <h2>Delivery calendar</h2>
         <span className="spacer" />
         <GatedButton allowed={canMove} className="btn" onClick={() => setMoving(true)}>
           Move a day's orders
@@ -138,7 +140,7 @@ function Calendar() {
         <button
           type="button"
           className="btn"
-          onClick={() => setEditing({ date: istDate(1), isOpen: false, maxBoxes: null, note: null })}
+          onClick={() => setEditing({ date: istDate(1), isOpen: true, maxBoxes: null, note: null })}
         >
           Change a day
         </button>
@@ -182,7 +184,10 @@ function Calendar() {
                         type="button"
                         className="btn btn-small"
                         disabled={clear.isPending}
-                        onClick={() => clear.mutate(d.date)}
+                        onClick={() => {
+                          clear.reset()
+                          setResetting(d)
+                        }}
                       >
                         Reset<span className="sr-only"> {date(d.date)}</span>
                       </button>
@@ -194,9 +199,24 @@ function Calendar() {
           </table>
         </div>
       )}
-      {!canMove && <p className="hint">Moving a day's orders: {MANAGER_ONLY_HINT.toLowerCase()}.</p>}
+      {!canMove && <ManagerOnlyNote what="Moving a day's orders" />}
       {editing && <DayDialog day={editing} onClose={() => setEditing(null)} onDone={refresh} />}
       {moving && <MoveDayDialog onClose={() => setMoving(false)} />}
+      {resetting && (
+        <ConfirmDialog
+          title={`Reset ${date(resetting.date)}?`}
+          confirmLabel="Reset day"
+          busy={clear.isPending}
+          error={clear.error}
+          onClose={() => setResetting(null)}
+          onConfirm={() => clear.mutate(resetting.date)}
+        >
+          <p>
+            {resetting.isOpen ? 'Its box limit' : 'Its closure'}
+            {resetting.note ? ` ("${resetting.note}")` : ''} is removed: the day goes back to open, with no box limit, and customers can book it.
+          </p>
+        </ConfirmDialog>
+      )}
     </section>
   )
 }
@@ -456,6 +476,7 @@ function Slots() {
   const queryClient = useQueryClient()
   const q = useQuery({ queryKey: ['slots'], queryFn: api.slots })
   const [editing, setEditing] = useState<DeliverySlot | 'new' | null>(null)
+  const [switchingOff, setSwitchingOff] = useState<DeliverySlot | null>(null)
   const allowed = can(me?.role, 'editRules')
 
   const refresh = () => {
@@ -466,15 +487,18 @@ function Slots() {
     mutationFn: (s: DeliverySlot) => api.updateSlot(s.id, { active: !s.active }),
     onSuccess: (_r, s) => {
       toast.success(s.active ? `${s.label} switched off` : `${s.label} switched on`)
+      setSwitchingOff(null)
       refresh()
     },
-    onError: (err) => toast.error(err),
+    onError: (err, s) => {
+      if (!s.active) toast.error(err)
+    },
   })
 
   return (
     <section className="card">
-      <div className="topbar" style={{ marginBottom: '0.5rem' }}>
-        <h2 style={{ margin: 0 }}>Delivery slots</h2>
+      <div className="topbar section-head">
+        <h2>Delivery slots</h2>
         <span className="spacer" />
         <GatedButton allowed={allowed} className="btn" onClick={() => setEditing('new')}>
           Add slot
@@ -521,7 +545,13 @@ function Slots() {
                         allowed={allowed}
                         className="btn btn-small"
                         disabled={toggle.isPending}
-                        onClick={() => toggle.mutate(s)}
+                        onClick={() => {
+                          // Switching on is safe; switching off takes the slot away from checkout, so it asks first.
+                          if (s.active) {
+                            toggle.reset()
+                            setSwitchingOff(s)
+                          } else toggle.mutate(s)
+                        }}
                       >
                         {s.active ? 'Switch off' : 'Switch on'}
                         <span className="sr-only"> {s.label}</span>
@@ -534,7 +564,22 @@ function Slots() {
           </table>
         </div>
       )}
-      {!allowed && <p className="hint">Changing slots: {MANAGER_ONLY_HINT.toLowerCase()}.</p>}
+      {!allowed && <ManagerOnlyNote what="Changing slots" />}
+      {switchingOff && (
+        <ConfirmDialog
+          title={`Switch off ${switchingOff.label}?`}
+          confirmLabel="Switch off"
+          tone="danger"
+          busy={toggle.isPending}
+          error={toggle.error}
+          onClose={() => setSwitchingOff(null)}
+          onConfirm={() => toggle.mutate(switchingOff)}
+        >
+          <p>
+            Customers can no longer pick {switchingOff.label} ({slotTime(switchingOff)}) at checkout. Orders already booked in it keep their slot.
+          </p>
+        </ConfirmDialog>
+      )}
       {editing && (
         <SlotDialog slot={editing === 'new' ? null : editing} onClose={() => setEditing(null)} onDone={refresh} />
       )}
@@ -617,8 +662,15 @@ const RULE_FIELDS: { key: keyof Rules; label: string; hint: string }[] = [
   { key: 'retireAge', label: 'Retire batches at age (days)', hint: 'Must be more than the oldest age sold.' },
   { key: 'maxDaysAhead', label: 'Days customers can book ahead', hint: 'Counted from the earliest delivery date.' },
   { key: 'holdMinutes', label: 'Checkout hold (minutes)', hint: 'Unpaid orders are cancelled after this.' },
+  { key: 'maxUnpaidOrders', label: 'Unpaid orders per customer', hint: 'A customer must pay or cancel before placing another.' },
+  { key: 'maxHeldBoxes', label: 'Unpaid boxes per customer', hint: 'Most boxes one customer can hold while not yet paid.' },
   { key: 'lowStockThreshold', label: 'Low stock alert (boxes)', hint: 'Shown on Today at or below this.' },
+  { key: 'outForDeliveryAlertHours', label: 'Out for delivery alert (hours)', hint: 'An order out for delivery longer than this shows as overdue.' },
+  { key: 'maxPreorderMoves', label: 'Preorder moves before review', hint: 'A preorder moved forward more weeks than this waits for a manager.' },
 ]
+
+/** What the API uses for rules an older rules version doesn't have yet. */
+const RULE_DEFAULTS: Partial<Record<keyof Rules, number>> = { outForDeliveryAlertHours: 8, maxPreorderMoves: 3 }
 
 function RulesCard() {
   const { me } = useSession()
@@ -628,8 +680,8 @@ function RulesCard() {
 
   return (
     <section className="card">
-      <div className="topbar" style={{ marginBottom: '0.5rem' }}>
-        <h2 style={{ margin: 0 }}>Selling rules</h2>
+      <div className="topbar section-head">
+        <h2>Selling rules</h2>
         {q.data && <span className="muted small">Version {q.data.version}</span>}
         <span className="spacer" />
         <GatedButton allowed={allowed} className="btn" onClick={() => setEditing(true)}>
@@ -644,13 +696,17 @@ function RulesCard() {
         <>
           <dl className="kv">
             {RULE_FIELDS.map((f) => (
-              <div key={f.key} style={{ display: 'contents' }}>
+              <div key={f.key} className="contents">
                 <dt>{f.label}</dt>
-                <dd>{String(q.data.rules[f.key])}</dd>
+                <dd>{String(q.data.rules[f.key] ?? RULE_DEFAULTS[f.key] ?? '—')}</dd>
               </div>
             ))}
+            <div className="contents">
+              <dt>Season ends</dt>
+              <dd>{q.data.rules.seasonEndsOn ? date(q.data.rules.seasonEndsOn) : 'Not set'}</dd>
+            </div>
           </dl>
-          <h3 style={{ marginTop: '1.25rem' }}>Ripeness by age on the delivery date</h3>
+          <h3 className="mt-5">Ripeness by age on the delivery date</h3>
           <p className="muted small">
             The latest QC reading can move a batch up to {q.data.rules.maxQcShift} day either way.
           </p>
@@ -677,7 +733,7 @@ function RulesCard() {
               </tbody>
             </table>
           </div>
-          {!allowed && <p className="hint">Changing rules: {MANAGER_ONLY_HINT.toLowerCase()}.</p>}
+          {!allowed && <ManagerOnlyNote what="Changing rules" />}
         </>
       )}
       {editing && q.data && <RulesDialog rules={q.data.rules} onClose={() => setEditing(false)} />}
@@ -691,8 +747,9 @@ function RulesDialog({ rules, onClose }: { rules: Rules; onClose: () => void }) 
   const toast = useToast()
   const queryClient = useQueryClient()
   const [values, setValues] = useState(() =>
-    Object.fromEntries(RULE_FIELDS.map((f) => [f.key, String(rules[f.key])])) as Record<string, string>,
+    Object.fromEntries(RULE_FIELDS.map((f) => [f.key, String(rules[f.key] ?? RULE_DEFAULTS[f.key] ?? '')])) as Record<string, string>,
   )
+  const [seasonEndsOn, setSeasonEndsOn] = useState(rules.seasonEndsOn ?? '')
   const [windows, setWindows] = useState(() =>
     rules.stageProfiles.default.map((w) => ({ stage: w.stage, minAge: String(w.minAge), maxAge: String(w.maxAge) })),
   )
@@ -716,6 +773,7 @@ function RulesDialog({ rules, onClose }: { rules: Rules; onClose: () => void }) 
     const next: Rules = {
       ...rules,
       ...Object.fromEntries(Object.entries(values).map(([k, v]) => [k, Number(v)])),
+      seasonEndsOn: seasonEndsOn || null,
       stageProfiles: {
         ...rules.stageProfiles,
         default: windows.map((w) => ({ stage: w.stage, minAge: Number(w.minAge), maxAge: Number(w.maxAge) })),
@@ -752,10 +810,15 @@ function RulesDialog({ rules, onClose }: { rules: Rules; onClose: () => void }) 
             <p className="hint">{f.hint}</p>
           </div>
         ))}
+        <div className="field">
+          <label htmlFor="rule-seasonEndsOn">Season ends (optional)</label>
+          <input id="rule-seasonEndsOn" type="date" value={seasonEndsOn} onChange={(e) => setSeasonEndsOn(e.target.value)} />
+          <p className="hint">Preorders booked for a week after this day wait for a manager to keep or refund them.</p>
+        </div>
         <fieldset>
           <legend>Ripeness by age, all varieties</legend>
           {windows.map((w, i) => (
-            <div className="btn-row" key={w.stage} style={{ alignItems: 'flex-end' }}>
+            <div className="btn-row align-end" key={w.stage}>
               <div className="field">
                 <label htmlFor={`win-${w.stage}-min`}>{RIPENESS_LABEL[w.stage]} from day</label>
                 <input

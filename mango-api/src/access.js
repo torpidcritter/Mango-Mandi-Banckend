@@ -32,6 +32,7 @@ const COMMON = [
   route('POST', '/me/two-step/setup'),
   route('POST', '/me/two-step/enable'),
   route('POST', '/me/two-step/disable'),
+  route('POST', '/me/password'),
 ]
 
 const DELIVERY = [
@@ -62,7 +63,11 @@ export const OPERATOR_ROUTES = [
   route('POST', '/orders/:id/cancel'), // a paid order needs a manager (orders.js cancelOrder)
   route('POST', '/orders/:id/rebalance'),
   route('POST', '/orders/:id/reschedule'),
+  route('POST', '/orders/:id/returned-stock'), // boxes back from a cancelled or returned order (INV-F)
   route('GET', '/pack-list'),
+  // Giving stops to riders (SEC-02): riders see only their own.
+  route('GET', '/riders'),
+  route('POST', '/manifest/assign'),
   route('GET', '/delivery-reviews'),
   route('POST', '/delivery-reviews/:id'),
   route('GET', '/analytics'),
@@ -138,7 +143,13 @@ export function limitByRole(req, _res, next) {
 
 /** Orders a rider may touch: on the road or ready to go. */
 const RIDER_STATUSES = ['PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERY_FAILED', 'DELIVERED']
-const ORDER_PATH = /^\/orders\/([^/]+)\//
+/** Unassigned orders a rider may take by sending them out (POST /orders/:id/dispatch). */
+export const RIDER_TAKES = ['PACKED', 'SHIPPED', 'DELIVERY_FAILED']
+const DISPATCH_PATH = /^\/orders\/[^/]+\/dispatch$/
+/** Orders a packer may open: being packed or on the road. Not delivered ones (SEC-02). */
+const PACKER_ORDER_STATUSES = ['CONFIRMED', 'PROCESSING', 'PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERY_FAILED']
+const ORDER_PATH = /^\/orders\/([^/]+)(?:\/|$)/
+const DATED_LISTS = ['/manifest', '/pack-list']
 
 /** A rider's run is yesterday (late finishes), today or tomorrow, IST. */
 const riderDates = () => {
@@ -147,25 +158,35 @@ const riderDates = () => {
 }
 
 /**
- * Object-level checks for riders: limitByRole lets them reach the delivery
- * routes, this keeps those routes to orders on their run. Any other order id
- * (an old one, or one not packed yet) answers 404, as if it didn't exist,
- * and the manifest only opens for the run's dates, so a rider can't page
- * through every customer's address and phone number.
+ * Object-level checks for riders and packers: limitByRole lets them reach the
+ * delivery and packing routes, this keeps those routes to orders on the run
+ * (yesterday for late finishes, today, tomorrow). Any other order id answers
+ * 404, as if it didn't exist, and the manifest and pack list only open for
+ * those dates, so neither role can page through every customer's address and
+ * phone number. Packers also never see delivered orders (SEC-02), and their
+ * views leave out phone numbers and addresses (see redactForPacker).
+ *
+ * Riders (SEC-02, 23 Oct): only their own stops, the orders whose rider_id is
+ * theirs (staff assign them on the Deliveries page, or the rider takes an
+ * unassigned packed order by sending it out). Another rider's stop answers
+ * 404, and a delivered stop from before today is gone from their view.
  */
 export async function riderScope(req, _res, next) {
-  if (req.admin?.role !== 'RIDER') return next()
+  const role = req.admin?.role
+  if (role !== 'RIDER' && role !== 'PACKER') return next()
   try {
     const dates = riderDates()
     const date = req.method === 'GET' ? req.query.date : req.body?.date
-    if (req.path.startsWith('/manifest') && date !== undefined && !dates.includes(String(date))) {
-      return next(forbidden('Riders can only open the run for today or tomorrow'))
+    if (DATED_LISTS.some((p) => req.path.startsWith(p)) && date !== undefined && !dates.includes(String(date))) {
+      return next(forbidden(`${role === 'RIDER' ? 'Riders' : 'Packers'} can only open the run for today or tomorrow`))
     }
     const m = ORDER_PATH.exec(req.path)
     if (m) {
-      const { rows } = await query('SELECT status, delivery_date FROM orders WHERE id = $1', [m[1]])
+      const { rows } = await query('SELECT status, delivery_date, rider_id FROM orders WHERE id = $1', [m[1]])
       const o = rows[0]
-      if (!o || !RIDER_STATUSES.includes(o.status) || !dates.includes(o.delivery_date)) return next(notFound('Order not found'))
+      const statuses = role === 'RIDER' ? RIDER_STATUSES : PACKER_ORDER_STATUSES
+      if (!o || !statuses.includes(o.status) || !dates.includes(o.delivery_date)) return next(notFound('Order not found'))
+      if (role === 'RIDER' && !riderMaySee(req.admin.id, o, req)) return next(notFound('Order not found'))
     }
     next()
   } catch (err) {
@@ -173,14 +194,48 @@ export async function riderScope(req, _res, next) {
   }
 }
 
+/**
+ * A rider's own stop, or an unassigned packed one they are sending out (which
+ * takes it: see dispatchOrder). Delivered stops only on or after today.
+ */
+function riderMaySee(riderId, o, req) {
+  if (o.status === 'DELIVERED' && o.delivery_date < todayIST()) return false
+  if (o.rider_id === riderId) return true
+  return o.rider_id === null && RIDER_TAKES.includes(o.status) && req.method === 'POST' && DISPATCH_PATH.test(req.path)
+}
+
+/**
+ * What a packer needs is boxes, not people: SKU, ripeness, quantity, the slot
+ * and the area. Phone numbers, addresses, payments and messages are left out.
+ */
+export const isPacker = (req) => req.admin?.role === 'PACKER'
+export function redactForPacker(order) {
+  return {
+    ...order,
+    phone: null,
+    deliveryAddress: null,
+    ...(order.gift ? { gift: { ...order.gift, recipientPhone: null } } : {}),
+    ...('payment' in order ? { payment: null } : {}),
+    ...('notifications' in order ? { notifications: [] } : {}),
+    ...('deliveryAttempts' in order ? { deliveryAttempts: order.deliveryAttempts.map((a) => ({ ...a, lat: null, lng: null })) } : {}),
+  }
+}
+
 // The customer's delivery code is a secret too.
 const SECRET_KEYS = /password|token|secret|^code$|setupcode/i
+// SEC-R3: where the rider stood and who took the box are the customer's data. They are
+// kept in delivery_attempts (erased with the account, anonymised after PII_RETENTION_MONTHS),
+// not copied into the audit trail. A delivery note stays (staff read it there) and is
+// removed from the order's audit rows with the rest (ORDER_AUDIT_PERSONAL_KEYS).
+const PERSONAL_KEYS = /^(lat|lng|receivedBy)$/
+/** Keys taken out of an order's audit rows when its customer details go (privacy.js, retention.js). */
+export const ORDER_AUDIT_PERSONAL_KEYS = ['lat', 'lng', 'receivedBy', 'note']
 
 function clean(body) {
   if (Buffer.isBuffer(body)) return body.length ? { bytes: body.length } : null
   if (!body || typeof body !== 'object' || !Object.keys(body).length) return null
   const out = {}
-  for (const [k, v] of Object.entries(body)) out[k] = SECRET_KEYS.test(k) ? '[removed]' : v
+  for (const [k, v] of Object.entries(body)) out[k] = SECRET_KEYS.test(k) || PERSONAL_KEYS.test(k) ? '[removed]' : v
   const json = JSON.stringify(out)
   return json.length > 4000 ? { truncated: json.slice(0, 4000) } : out
 }
@@ -204,7 +259,8 @@ export async function audit(admin, action, { target = null, detail = null, reque
 export function auditStaffChanges(req, res, next) {
   if (req.method === 'GET' || req.method === 'HEAD') return next()
   res.on('finish', () => {
-    if (res.statusCode >= 400 || !req.admin || !req.route) return
+    // req.audited: the route wrote its own, fuller row inside its transaction (product changes).
+    if (res.statusCode >= 400 || !req.admin || !req.route || req.audited) return
     const p = req.params ?? {}
     const target = p.lineId ? `${p.id}/${p.lineId}` : p.weekStart ? `${p.weekStart}/${p.sku}` : (p.id ?? p.pincode ?? p.date ?? p.code ?? p.sku ?? null)
     background(audit(req.admin, `${req.method} ${req.route.path}`, { target, detail: clean(req.body), requestId: req.id }))

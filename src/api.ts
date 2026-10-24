@@ -4,15 +4,18 @@
 // never logged. The refresh token is the httpOnly `mango_admin_rt` cookie,
 // invisible to JS, so auth calls send credentials and let the browser carry it.
 
+import { ApiError, errorFrom, parseAnswer } from './apiAnswer'
 import type {
-  ApiErrorBody,
   BatchDetail,
   Analytics,
   Attention,
+  LedgerRepairPlan,
+  LineCounters,
   AuditPage,
   BulkMoveResult,
   ShortArrivalResult,
   Manifest,
+  Rider,
   BatchListItem,
   BatchStatus,
   Claim,
@@ -20,6 +23,7 @@ import type {
   ClaimStatus,
   Condition,
   LedgerEntry,
+  AdjustReason,
   Me,
   SignInResult,
   Promo,
@@ -57,34 +61,13 @@ const BASE = `${API_URL}/admin/v1`
 
 export const SIGNOUT_EVENT = 'admin:signout'
 
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    public code: string,
-    message: string,
-    public requestId?: string,
-  ) {
-    super(message)
-    this.name = 'ApiError'
-  }
-}
+export { ApiError }
 
 let accessToken: string | null = null
 let refreshPromise: Promise<'ok' | 'refused' | 'unavailable'> | null = null
 
 async function toApiError(res: Response): Promise<ApiError> {
-  let body: ApiErrorBody | null = null
-  try {
-    body = (await res.json()) as ApiErrorBody
-  } catch {
-    // Not JSON (proxy error page, empty body). Fall back to the status line.
-  }
-  return new ApiError(
-    res.status,
-    body?.error?.code ?? `HTTP_${res.status}`,
-    body?.error?.message ?? (res.statusText || 'Request failed'),
-    body?.error?.requestId,
-  )
+  return errorFrom(res.status, res.statusText, await res.text().catch(() => ''))
 }
 
 /**
@@ -148,8 +131,7 @@ async function send(method: string, path: string, body?: unknown, retried = fals
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await send(method, path, body)
   if (res.status === 204) return undefined as T
-  const text = await res.text()
-  return (text ? JSON.parse(text) : undefined) as T
+  return parseAnswer<T>(res.status, await res.text())
 }
 
 function qs(params: Record<string, string | number | undefined | null>): string {
@@ -224,6 +206,11 @@ export const api = {
     return r.recoveryCodes
   },
   twoStepDisable: (code: string) => request<void>('POST', '/me/two-step/disable', { code }),
+  /** Changes your own password. Your other sessions end; this one carries on with a new token. */
+  async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    const r = await request<{ accessToken: string }>('POST', '/me/password', { currentPassword, newPassword })
+    accessToken = r.accessToken
+  },
   me: () => request<Me>('GET', '/auth/me'),
   /** Clears someone's two-step sign-in. Returns the setup code they need to set it up again (shown once). */
   resetTwoStep: (staffId: string) => request<{ setupCode: string }>('POST', `/staff/${id(staffId)}/two-step/reset`),
@@ -248,13 +235,28 @@ export const api = {
   summary: () => request<Summary>('GET', '/summary'),
   attention: () => request<Attention>('GET', '/attention'),
   retryMessage: (notificationId: string) => request<void>('POST', `/notifications/${id(notificationId)}/retry`),
+  // Manager ways out of Needs attention items. Each needs a reason and is written to the staff activity.
+  ledgerRepairPlan: (batchId: string, lineId: string) => request<LedgerRepairPlan>('GET', `/batches/${id(batchId)}/lines/${id(lineId)}/repair`),
+  repairLedger: (batchId: string, lineId: string, reason: string, expected: LineCounters) =>
+    request<LedgerRepairPlan>('POST', `/batches/${id(batchId)}/lines/${id(lineId)}/repair`, { reason, expected }),
+  resolveWebhookFailure: (failureId: string, note: string) => request<unknown>('POST', `/webhook-failures/${id(failureId)}/resolve`, { note }),
+  refundUnmatchedPayment: (failureId: string, reason: string) =>
+    request<{ paymentId: string; queued: boolean }>('POST', `/webhook-failures/${id(failureId)}/refund`, { reason }),
+  keepPreorder: (preorderId: string, reason: string) => request<unknown>('POST', `/preorders/${id(preorderId)}/keep`, { reason }),
+  refundPaidAnotherWay: (type: 'order' | 'preorder' | 'payment', refundId: string, reference: string, reason: string) =>
+    request<{ id: string; refundId: string }>('POST', `/refunds/${id(refundId)}/paid-another-way`, { type, reference, reason }),
+  signOutAllStaff: (reason: string, keepMe = true) => request<{ signedOut: number; keptMe: boolean }>('POST', '/staff/sign-out-all', { reason, keepMe }),
   /** Signs off a photo delivery, or flags it as doubtful (with a note) for a call to the customer. */
   reviewDelivery: (attemptId: string, ok: boolean, note?: string) => request<void>('POST', `/delivery-reviews/${id(attemptId)}`, { ok, note }),
   products: () => request<Product[]>('GET', '/products'),
   addProduct: (p: ProductInput & { sku: string }) => request<Product>('POST', '/products', p),
-  updateProduct: (sku: string, patch: Partial<ProductInput> & { active?: boolean }) => request<Product>('PATCH', `/products/${id(sku)}`, patch),
+  /** `reason`: why (optional), kept in the staff activity with the values before the change (ADM-2). */
+  updateProduct: (sku: string, patch: Partial<ProductInput> & { active?: boolean; reason?: string }) => request<Product>('PATCH', `/products/${id(sku)}`, patch),
   /** Deletes a product never stocked or sold; otherwise takes it off sale and keeps it. */
   removeProduct: (sku: string) => request<{ sku: string; outcome: 'deleted' | 'hidden' }>('DELETE', `/products/${id(sku)}`),
+  /** Sets the product's shop photo (replacing any earlier one). */
+  setProductPhoto: (sku: string, photo: Blob) => request<Product>('PUT', `/products/${id(sku)}/photo`, photo),
+  removeProductPhoto: (sku: string) => request<Product>('DELETE', `/products/${id(sku)}/photo`),
 
   batches: (status?: BatchStatus | null) =>
     request<BatchListItem[]>('GET', `/batches${qs({ status })}`),
@@ -281,13 +283,13 @@ export const api = {
   adjustLine: (
     batchId: string,
     lineId: string,
-    input: { onHand?: number; reserveBuffer?: number; reason: string },
+    input: { onHand?: number; reserveBuffer?: number; reason: string; reasonCode?: AdjustReason },
   ) => request<void>('PATCH', `/batches/${id(batchId)}/lines/${id(lineId)}`, input),
   /**
    * Fewer boxes arrived than were already promised: lowers on hand, takes boxes
    * back from the youngest orders and re-fills them or moves them to the next date with stock.
    */
-  shortArrival: (batchId: string, lineId: string, input: { onHand: number; reason: string }) =>
+  shortArrival: (batchId: string, lineId: string, input: { onHand: number; reason: string; reasonCode?: AdjustReason }) =>
     request<ShortArrivalResult>('POST', `/batches/${id(batchId)}/lines/${id(lineId)}/short-arrival`, input),
 
   orders: (f: { status?: string | null; from?: string | null; to?: string | null; q?: string | null; page?: number }) =>
@@ -303,6 +305,9 @@ export const api = {
   /** A paid order can only be cancelled by a manager, with a full refund (refund: true). */
   cancelOrder: (orderId: string, reason: string, refund = false) =>
     request<void>('POST', `/orders/${id(orderId)}/cancel`, { reason, refund }),
+  /** Boxes back from an order cancelled or returned after dispatch: back on the shelf, or written off with a reason. */
+  bookReturnedStock: (orderId: string, input: { action: 'RESTOCK' | 'WRITE_OFF'; reasonCode?: 'DAMAGED' | 'THEFT_LOSS' | 'OTHER'; reason: string }) =>
+    request<{ boxes: number }>('POST', `/orders/${id(orderId)}/returned-stock`, input),
   /** Moves a confirmed order to another bookable date that has stock (409 if it doesn't), optionally into a slot. */
   rescheduleOrder: (orderId: string, deliveryDate: string, slotId?: string | null) =>
     request<void>('POST', `/orders/${id(orderId)}/reschedule`, slotId ? { deliveryDate, slotId } : { deliveryDate }),
@@ -324,6 +329,13 @@ export const api = {
   dispatchRun: (date: string, slotId: string | null) =>
     request<{ dispatched: string[]; skipped: { number: string; reason: string }[] }>('POST', '/manifest/dispatch', { date, slotId }),
   dispatch: (orderId: string) => request<void>('POST', `/orders/${id(orderId)}/dispatch`),
+  /** A rider takes every packed stop on the date that nobody has yet, and sends them out with their own. */
+  takeRun: (date: string) =>
+    request<{ dispatched: string[]; skipped: { number: string; reason: string }[] }>('POST', '/manifest/dispatch', { date }),
+  riders: () => request<Rider[]>('GET', '/riders'),
+  /** Gives stops to a rider (null: to nobody): the listed orders, or every order still to deliver in a slot. */
+  assignRiders: (input: { date: string; riderId: string | null; orderIds?: string[]; slotId?: string | null }) =>
+    request<{ assigned: string[] }>('POST', '/manifest/assign', input),
   uploadDeliveryPhoto: (orderId: string, photo: Blob) => request<{ id: string }>('POST', `/orders/${id(orderId)}/delivery-photos`, photo),
   /** An object URL for a delivery photo (the image needs the staff sign-in, so it is fetched, not linked). */
   async deliveryPhotoUrl(orderId: string, photoId: string): Promise<string> {
@@ -372,8 +384,9 @@ export const api = {
   reviewInsights: (days = 90) => request<ReviewInsights>('GET', `/reviews/insights${qs({ days })}`),
   reviewClaim: (claimId: string) => request<void>('POST', `/claims/${id(claimId)}/review`),
   /** MandiMangoes doesn't refund: a claim is resolved by a replacement or rejected. */
-  resolveClaim: (claimId: string, resolution: Exclude<ClaimResolution, 'REFUND_APPROVED'>) =>
-    request<void>('POST', `/claims/${id(claimId)}/resolve`, { resolution }),
+  /** A rejection needs `reason` (5+ characters), which the customer sees. */
+  resolveClaim: (claimId: string, resolution: Exclude<ClaimResolution, 'REFUND_APPROVED'>, reason?: string) =>
+    request<void>('POST', `/claims/${id(claimId)}/resolve`, reason ? { resolution, reason } : { resolution }),
 
   promos: () => request<Promo[]>('GET', '/promos'),
   addPromo: (p: NewPromo) => request<Promo>('POST', '/promos', p),

@@ -101,7 +101,10 @@ test('deliver an order, review it with a photo, publish it in the panel, see it 
   await panel.getByLabel('Work email').fill('manager@mandimangoes.test')
   await panel.getByLabel('Password').fill('manager123')
   await panel.getByRole('button', { name: 'Sign in' }).click()
-  await panel.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Reviews' }).click()
+  // Reviews sits in the Customers group on desktop, and in the Menu on a phone.
+  const nav = panel.getByRole('navigation', { name: 'Main' })
+  await (info.project.name === 'phone' ? panel.getByRole('button', { name: 'Menu' }) : nav.getByRole('button', { name: 'Customers' })).click()
+  await nav.getByRole('link', { name: 'Reviews', exact: true }).click()
   await panel.getByRole('button', { name: `Open review from ${first} K.` }).click()
   const drawer = panel.getByRole('dialog', { name: `Review from ${first} K.` })
   await expect(drawer).toContainText('Ripe on day two')

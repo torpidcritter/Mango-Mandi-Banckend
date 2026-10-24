@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ApiError } from './api'
 import App from './App'
 import { ErrorBoundary, ToastProvider } from './ui'
+import '../design/tokens.css'
 import './styles.css'
 
 const queryClient = new QueryClient({
@@ -20,7 +21,8 @@ const queryClient = new QueryClient({
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <BrowserRouter>
+    {/* Navigation updates render at once, as with React Router 6 (7 defaults to transitions). */}
+    <BrowserRouter useTransitions={false}>
       <QueryClientProvider client={queryClient}>
         <ToastProvider>
           <ErrorBoundary>

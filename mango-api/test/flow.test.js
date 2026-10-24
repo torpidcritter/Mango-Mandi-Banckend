@@ -27,8 +27,15 @@ const at = (iso) => setNow(iso)
 const order = async (id) => (await api.get(`/admin/v1/orders/${id}`, { token: admin })).body
 const pay = (orderId, outcome = 'captured') => api.post('/v1/dev/pay', { orderId, outcome })
 // DELIVERED from the panel is a manager's override with a reason (ORD-3).
-const move = (id, status) =>
-  api.patch(`/admin/v1/orders/${id}/status`, status === 'DELIVERED' ? { status, override: true, reason: 'Customer confirmed by phone' } : { status }, { token: admin })
+// A missed delivery is a report with its reason and attempt (OPS-01/02), not a bare status.
+const move = async (id, status) => {
+  if (status === 'DELIVERY_FAILED') {
+    const attempt = (await order(id)).attempt
+    const r = await api.post(`/admin/v1/orders/${id}/delivery`, { outcome: 'FAILED', reason: 'NOT_HOME', attempt }, { token: admin })
+    return { ...r, status: r.status === 200 ? 204 : r.status }
+  }
+  return api.patch(`/admin/v1/orders/${id}/status`, status === 'DELIVERED' ? { status, override: true, reason: 'Customer confirmed by phone' } : { status }, { token: admin })
+}
 const noDrift = async () => assert.deepEqual(await tx((c) => auditLedger(c)), [])
 
 // Today is 2026-10-15 (10:00 IST); the earliest delivery is 2026-10-16.

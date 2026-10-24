@@ -1,0 +1,39 @@
+# OPS-31: weekly dependency update pull requests. Each one runs the full CI
+# (API suite twice, N-1, e2e) like any other pull request; merge only when green.
+# Minor and patch updates are grouped per folder so the queue stays short;
+# major versions come one per pull request, to be read before merging.
+# The shop (customer-app/) has no package.json of its own: it builds from the
+# root one, so the root entry covers the panel and the shop together.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    groups:
+      web-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /mango-api
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    groups:
+      api-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Kolkata
+    groups:
+      actions:
+        patterns: ['*']

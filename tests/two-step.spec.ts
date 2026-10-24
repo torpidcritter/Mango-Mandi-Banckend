@@ -1,5 +1,5 @@
 import AxeBuilder from '@axe-core/playwright'
-import { expect, test } from './fixtures'
+import { expect, test, openAccount } from './fixtures'
 import { mockApi } from './mock-api'
 
 // Two-step sign-in: the code after the password, set-up when a role requires it, and a manager's reset.
@@ -86,12 +86,12 @@ test('anyone can turn it on from the menu; a manager resets someone who lost the
   await expect(page.getByRole('dialog', { name: 'Setup code for ops@mandimangoes.test' })).toContainText('abcd-2345')
   await page.getByRole('dialog').getByRole('button', { name: 'Done' }).click()
 
-  await page.getByRole('link', { name: 'Two-step sign-in (off)' }).click()
+  await (await openAccount(page)).getByRole('link', { name: 'Two-step sign-in (off)' }).click()
   await expect(page.getByRole('heading', { name: 'Two-step sign-in' })).toBeVisible()
   await page.getByRole('button', { name: 'Set up two-step sign-in' }).click()
   await page.getByLabel('6-digit code').fill('123456')
   await page.getByRole('button', { name: 'Turn on' }).click()
   await page.getByRole('button', { name: "I've saved them" }).click()
   await expect(page.getByText(/^On\./)).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Two-step sign-in', exact: true })).toBeVisible()
+  await expect((await openAccount(page)).getByRole('link', { name: 'Two-step sign-in', exact: true })).toBeVisible()
 })

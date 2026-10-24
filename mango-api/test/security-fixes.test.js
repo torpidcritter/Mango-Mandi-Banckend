@@ -290,7 +290,13 @@ describe('SEC-11: login codes stay out of the logs', () => {
         new Response('rejected: "771204 is your code"', { status: 400 }),
       )
       await assert.rejects(send('+919876512345', '771204'))
-      assert.ok(log.lines.length > 0)
+      // Also when Jio answers 200 without the accepted status and echoes the text.
+      const echo = jioSender(
+        { url: 'https://jio.example/sms', apiKey: 'k', senderId: 'MANDIM', templateId: 't', entityId: 'e', text: '{code} is your code', successPath: 'state', successValues: ['OK'] },
+        async () => new Response('{"state":"DLT_MISMATCH","text":"771204 is your code"}', { status: 200 }),
+      )
+      await assert.rejects(echo('+919876512345', '771204'))
+      assert.ok(log.lines.length > 1)
       assert.ok(!log.lines.join().includes('771204'))
     } finally {
       log.restore()

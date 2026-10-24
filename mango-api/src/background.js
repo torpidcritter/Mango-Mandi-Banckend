@@ -6,8 +6,13 @@ import { waitUntil } from '@vercel/functions'
 import { onVercel } from './env.js'
 import { logger } from './logger.js'
 
+/** Tasks still running, so tests (and a clean shutdown) can wait for them. */
+const pending = new Set()
+
 export function background(promise) {
   const p = Promise.resolve(promise).catch((err) => logger.error({ err }, 'background task failed'))
+  pending.add(p)
+  p.finally(() => pending.delete(p))
   if (onVercel) {
     try {
       waitUntil(p)
@@ -15,4 +20,9 @@ export function background(promise) {
       // Outside a request: nothing to keep alive.
     }
   }
+}
+
+/** Waits until every background task started so far (and any they start) has settled. */
+export async function drainBackground() {
+  while (pending.size) await Promise.allSettled([...pending])
 }

@@ -14,7 +14,7 @@ export function useGoogleKeys(k) {
 
 export const googleOn = () => Boolean(env.GOOGLE_CLIENT_ID)
 
-/** Returns { sub, email, name } from a verified Google ID token. */
+/** Returns { sub, email, name, hd } from a verified Google ID token (hd: the Workspace domain, or null). */
 export async function verifyGoogleCredential(credential) {
   if (!googleOn()) throw new HttpError(503, 'GOOGLE_OFF', 'Sign in with Google is not set up.')
   let payload
@@ -30,5 +30,5 @@ export async function verifyGoogleCredential(credential) {
   if (!payload.sub || !payload.email || payload.email_verified !== true) {
     throw unauthorized('Your Google account email is not verified.', 'GOOGLE_UNVERIFIED')
   }
-  return { sub: String(payload.sub), email: String(payload.email).toLowerCase(), name: payload.name ? String(payload.name).slice(0, 80) : null }
+  return { sub: String(payload.sub), email: String(payload.email).toLowerCase(), name: payload.name ? String(payload.name).slice(0, 80) : null, hd: payload.hd ? String(payload.hd).toLowerCase() : null }
 }

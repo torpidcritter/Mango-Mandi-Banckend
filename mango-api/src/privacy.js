@@ -4,6 +4,20 @@
 import { now } from './clock.js'
 import { conflict, notFound } from './errors.js'
 import { scrubCustomerReviews } from './reviews.js'
+import { ORDER_AUDIT_PERSONAL_KEYS } from './access.js'
+
+/**
+ * SEC-R3: the staff audit rows of these orders lose the delivery details they
+ * may hold (where the rider stood, who took the box, the rider's note).
+ * `orders` is a SELECT of order ids with its parameters.
+ */
+export async function scrubOrderAudit(c, orders, params) {
+  const n = params.length + 1
+  await c.query(
+    `UPDATE staff_audit SET detail = detail - $${n}::text[] WHERE target IN (${orders}) AND detail ?| $${n}::text[]`,
+    [...params, ORDER_AUDIT_PERSONAL_KEYS],
+  )
+}
 
 /**
  * Anything still in progress for the customer: an open order or booking, or
@@ -49,6 +63,7 @@ export async function eraseCustomer(c, customerId, { force = false, deletedAt = 
       WHERE order_id IN (SELECT id FROM orders WHERE customer_id = $1)`,
     [me.id],
   )
+  await scrubOrderAudit(c, `SELECT id FROM orders WHERE customer_id = $1`, [me.id])
   const deliveryPics = await c.query(
     `SELECT blob_path FROM delivery_photos WHERE order_id IN (SELECT id FROM orders WHERE customer_id = $1) AND removed_at IS NULL FOR UPDATE`,
     [me.id],

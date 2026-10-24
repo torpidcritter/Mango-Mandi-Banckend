@@ -31,7 +31,8 @@ export default defineConfig({
       url: `http://localhost:${port}`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
-      env: { VITE_API_URL: process.env.VITE_API_URL ?? 'http://localhost:3000' },
+      // A made-up help number for the tests (UX-1); the real shop's comes from its build settings.
+      env: { VITE_API_URL: process.env.VITE_API_URL ?? 'http://localhost:3000', VITE_SUPPORT_WHATSAPP: process.env.VITE_SUPPORT_WHATSAPP ?? '910000000000' },
     },
     // The staff panel, for the reviews journey (a manager publishes the review).
     {

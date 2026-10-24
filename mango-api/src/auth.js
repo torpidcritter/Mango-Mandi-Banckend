@@ -45,7 +45,7 @@ export async function rotateRefresh(token, userType) {
     throw invalid()
   }
   if (claims.typ !== `${userType}_refresh` || !claims.jti) throw invalid()
-  return tx(async (c) => {
+  return await tx(async (c) => {
     const { rows } = await c.query('SELECT * FROM refresh_sessions WHERE jti = $1 FOR UPDATE', [claims.jti])
     const s = rows[0]
     if (!s || s.user_type !== userType || s.expires_at <= now()) throw invalid()
@@ -143,7 +143,7 @@ async function staffRow(id) {
   return row
 }
 
-export async function requireAdmin(req, _res, next) {
+export async function requireAdmin(req, res, next) {
   try {
     const c = bearer(req, 'admin')
     const current = (row) => row && row.role === c.role && row.session_version === (c.sv ?? 0)
@@ -156,6 +156,8 @@ export async function requireAdmin(req, _res, next) {
     if (!current(row)) {
       throw unauthorized('Your access has changed. Please sign in again.', 'INVALID_TOKEN')
     }
+    // SEC-06: signed-in answers carry personal data; no browser or proxy may keep them. Photos set their own (private) caching.
+    res.set('Cache-Control', 'no-store')
     req.admin = { id: c.sub, email: c.email, role: c.role, setup: Boolean(c.setup) }
     req.actor = { type: 'admin', id: c.sub, label: c.email }
     next()
@@ -168,9 +170,35 @@ export function requireManager(req, _res, next) {
   next(req.admin?.role === 'MANAGER' ? undefined : forbidden())
 }
 
-export function requireCustomer(req, _res, next) {
+// SEC-01: a token outlives an account deletion by up to its lifetime, so the
+// account is checked too. Live accounts are remembered briefly per instance;
+// deleting an account forgets it here at once (forgetCustomer).
+const customerCache = new Map()
+const CUSTOMER_CACHE_MS = 30_000
+
+export function forgetCustomer(id) {
+  customerCache.delete(id)
+}
+
+/** The live account's session version, or null when the account is gone. */
+async function customerLive(id) {
+  const hit = customerCache.get(id)
+  if (hit && Date.now() - hit.at < CUSTOMER_CACHE_MS) return hit.sv
+  const { rows } = await query('SELECT session_version FROM customers WHERE id = $1 AND deleted_at IS NULL', [id])
+  if (!rows.length) return null
+  customerCache.set(id, { at: Date.now(), sv: rows[0].session_version })
+  if (customerCache.size > 5000) customerCache.delete(customerCache.keys().next().value)
+  return rows[0].session_version
+}
+
+export async function requireCustomer(req, res, next) {
   try {
     const c = bearer(req, 'customer')
+    const sv = await customerLive(c.sub)
+    if (sv === null) throw unauthorized('This account no longer exists. Please sign in again.', 'INVALID_TOKEN')
+    // "Sign out everywhere" raised the version: tokens from before it end (other instances within 30 s).
+    if ((c.sv ?? 0) !== sv) throw unauthorized('You signed out on every device. Please sign in again.', 'INVALID_TOKEN')
+    res.set('Cache-Control', 'no-store')
     req.customer = { id: c.sub, phone: c.phone }
     req.actor = { type: 'customer', id: c.sub, label: 'customer' }
     next()

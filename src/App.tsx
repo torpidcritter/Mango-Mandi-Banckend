@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { Suspense, lazy, useEffect, useState, type ReactNode } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { API_URL, SIGNOUT_EVENT, api } from './api'
@@ -6,25 +6,28 @@ import { SessionContext } from './session'
 import type { Me } from './types'
 import { ApiBaseBanner, OfflineBanner, Spinner } from './ui'
 import Layout from './Layout'
+// Sign-in and Today come with the first load; every other screen is its own
+// chunk, fetched the first time someone opens it (Layout shows a spinner meanwhile).
 import Login from './pages/Login'
 import Today from './pages/Today'
-import Batches from './pages/Batches'
-import BatchDetail from './pages/BatchDetail'
-import Orders from './pages/Orders'
-import OrderDetail from './pages/OrderDetail'
-import PackList from './pages/PackList'
-import Analytics from './pages/Analytics'
-import Deliveries from './pages/Deliveries'
-import Claims from './pages/Claims'
-import Pincodes from './pages/Pincodes'
-import Planning from './pages/Planning'
-import Preorders from './pages/Preorders'
 import NotFound from './pages/NotFound'
-import Staff from './pages/Staff'
-import Products from './pages/Products'
-import Promos from './pages/Promos'
-import Reviews from './pages/Reviews'
-import TwoStepPage, { TwoStepGate } from './pages/TwoStep'
+const Batches = lazy(() => import('./pages/Batches'))
+const BatchDetail = lazy(() => import('./pages/BatchDetail'))
+const Orders = lazy(() => import('./pages/Orders'))
+const OrderDetail = lazy(() => import('./pages/OrderDetail'))
+const PackList = lazy(() => import('./pages/PackList'))
+const Analytics = lazy(() => import('./pages/Analytics'))
+const Deliveries = lazy(() => import('./pages/Deliveries'))
+const Claims = lazy(() => import('./pages/Claims'))
+const Pincodes = lazy(() => import('./pages/Pincodes'))
+const Planning = lazy(() => import('./pages/Planning'))
+const Preorders = lazy(() => import('./pages/Preorders'))
+const Staff = lazy(() => import('./pages/Staff'))
+const Products = lazy(() => import('./pages/Products'))
+const Promos = lazy(() => import('./pages/Promos'))
+const Reviews = lazy(() => import('./pages/Reviews'))
+const TwoStepPage = lazy(() => import('./pages/TwoStep'))
+const TwoStepGate = lazy(() => import('./pages/TwoStep').then((m) => ({ default: m.TwoStepGate })))
 import { canSee, homeFor, type Screen } from './permissions'
 import { useSession } from './session'
 
@@ -92,36 +95,40 @@ export default function App() {
       {booting ? (
         <Spinner label="Restoring session" />
       ) : (
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route
-            element={
-              <RequireAuth me={me}>
-                <Layout />
-              </RequireAuth>
-            }
-          >
-            <Route path="/" element={<Home />} />
-            <Route path="/today" element={<Only screen="today"><Today /></Only>} />
-            <Route path="/batches" element={<Only screen="batches"><Batches /></Only>} />
-            <Route path="/batches/:id" element={<Only screen="batches"><BatchDetail /></Only>} />
-            <Route path="/orders" element={<Only screen="orders"><Orders /></Only>} />
-            <Route path="/orders/:id" element={<Only screen="orderDetail"><OrderDetail /></Only>} />
-            <Route path="/pack-list" element={<Only screen="packList"><PackList /></Only>} />
-            <Route path="/deliveries" element={<Only screen="deliveries"><Deliveries /></Only>} />
-            <Route path="/analytics" element={<Only screen="analytics"><Analytics /></Only>} />
-            <Route path="/claims" element={<Only screen="claims"><Claims /></Only>} />
-            <Route path="/reviews" element={<Only screen="reviews"><Reviews /></Only>} />
-            <Route path="/pincodes" element={<Only screen="pincodes"><Pincodes /></Only>} />
-            <Route path="/planning" element={<Only screen="planning"><Planning /></Only>} />
-            <Route path="/preorders" element={<Only screen="preorders"><Preorders /></Only>} />
-            <Route path="/staff" element={<Only screen="staff"><Staff /></Only>} />
-            <Route path="/products" element={<Only screen="products"><Products /></Only>} />
-            <Route path="/promos" element={<Only screen="promos"><Promos /></Only>} />
-            <Route path="/two-step" element={<TwoStepPage />} />
-            <Route path="*" element={<NotFound />} />
-          </Route>
-        </Routes>
+        // Layout has its own boundary around the screen, so the menu stays while a
+        // screen loads; this one covers the two-step gate, which renders outside it.
+        <Suspense fallback={<Spinner />}>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route
+              element={
+                <RequireAuth me={me}>
+                  <Layout />
+                </RequireAuth>
+              }
+            >
+              <Route path="/" element={<Home />} />
+              <Route path="/today" element={<Only screen="today"><Today /></Only>} />
+              <Route path="/batches" element={<Only screen="batches"><Batches /></Only>} />
+              <Route path="/batches/:id" element={<Only screen="batches"><BatchDetail /></Only>} />
+              <Route path="/orders" element={<Only screen="orders"><Orders /></Only>} />
+              <Route path="/orders/:id" element={<Only screen="orderDetail"><OrderDetail /></Only>} />
+              <Route path="/pack-list" element={<Only screen="packList"><PackList /></Only>} />
+              <Route path="/deliveries" element={<Only screen="deliveries"><Deliveries /></Only>} />
+              <Route path="/analytics" element={<Only screen="analytics"><Analytics /></Only>} />
+              <Route path="/claims" element={<Only screen="claims"><Claims /></Only>} />
+              <Route path="/reviews" element={<Only screen="reviews"><Reviews /></Only>} />
+              <Route path="/pincodes" element={<Only screen="pincodes"><Pincodes /></Only>} />
+              <Route path="/planning" element={<Only screen="planning"><Planning /></Only>} />
+              <Route path="/preorders" element={<Only screen="preorders"><Preorders /></Only>} />
+              <Route path="/staff" element={<Only screen="staff"><Staff /></Only>} />
+              <Route path="/products" element={<Only screen="products"><Products /></Only>} />
+              <Route path="/promos" element={<Only screen="promos"><Promos /></Only>} />
+              <Route path="/two-step" element={<TwoStepPage />} />
+              <Route path="*" element={<NotFound />} />
+            </Route>
+          </Routes>
+        </Suspense>
       )}
     </SessionContext.Provider>
   )

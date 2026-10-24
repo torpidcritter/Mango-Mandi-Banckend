@@ -15,6 +15,7 @@
 import { dropPhoto } from './photos.js'
 import { addDays, todayIST } from './clock.js'
 import { getConfig, loadConfig } from './config.js'
+import { env } from './env.js'
 import { randomUUID } from 'node:crypto'
 import { outOfTime, withBudget, withSlice } from './budget.js'
 import { query, tx } from './db.js'
@@ -22,15 +23,16 @@ import { auditLedger } from './inventory.js'
 import { logger } from './logger.js'
 import { metrics } from './metrics.js'
 import { allocatePreorders, expirePreorderHolds, promoteWaitlist, reconcilePreorderPayments, retryMissingLinks } from './preorders.js'
-import { OPEN_STATUSES, rebalanceOrder, SYSTEM, sweepExpiredHolds, takeBatchOutOfService } from './orders.js'
+import { lockBatchOrders, OPEN_STATUSES, rebalanceOrder, SYSTEM, sweepExpiredHolds, takeBatchOutOfService } from './orders.js'
 import { sendDueNotifications } from './notify.js'
 import { sendReorderReminders, sendStockAlerts } from './engagement.js'
-import { processDueRefunds, reconcilePendingPayments, refundDuplicatePayments } from './payments.js'
+import { processDueRefunds, reconcilePendingPayments, reconcileRefunds, refundDuplicatePayments } from './payments.js'
 import { cronCheckIn, reportError, reportProblem } from './sentry.js'
 import { cleanupReviewPhotos, enqueueReviewRequests } from './review-jobs.js'
-import { pruneNotifications } from './retention.js'
+import { anonymiseOldOrders, pruneNotifications } from './retention.js'
 import { auditReviewStats } from './reviews.js'
 import { now } from './clock.js'
+import { overdueOrders } from './stock-watch.js'
 
 /** The run's time budget, under Vercel's 60-second limit. */
 export const RUN_BUDGET_MS = 45_000
@@ -124,7 +126,10 @@ export async function cleanupExpired(at = now()) {
   await query('DELETE FROM idempotency_keys WHERE created_at < $1', [new Date(at.getTime() - 7 * day)])
   await query('DELETE FROM processed_webhooks WHERE created_at < $1', [new Date(at.getTime() - 30 * day)])
   await query('DELETE FROM wa_inbound WHERE received_at < $1', [new Date(at.getTime() - 7 * day)])
-  await query('DELETE FROM webhook_failures WHERE created_at < $1', [new Date(at.getTime() - 30 * day)])
+  // Payment problems stay until a manager resolves them: often the only record of customer money (DB-04).
+  await query(`DELETE FROM webhook_failures WHERE created_at < $1 AND (resolved_at IS NOT NULL OR source <> 'razorpay')`, [
+    new Date(at.getTime() - 30 * day),
+  ])
   await query('DELETE FROM refresh_sessions WHERE expires_at < $1', [new Date(at.getTime() - day)])
   await query('DELETE FROM rate_limits WHERE reset_at < $1', [new Date(at.getTime() - HOURLY_MS)])
   await query('DELETE FROM job_leases WHERE expires_at < $1', [new Date(at.getTime() - day)])
@@ -143,6 +148,7 @@ export async function retireBatches() {
   const { rows } = await query(`SELECT id FROM batches WHERE status NOT IN ('EXHAUSTED', 'CONDEMNED') AND plucked_on <= $1`, [cutoff])
   for (const { id } of rows) {
     await tx(async (c) => {
+      await lockBatchOrders(c, [id]) // orders before the batch (INV-03)
       const { rows: b } = await c.query('SELECT status FROM batches WHERE id = $1 FOR UPDATE', [id])
       if (['EXHAUSTED', 'CONDEMNED'].includes(b[0].status)) return
       await c.query(`UPDATE batches SET status = 'EXHAUSTED' WHERE id = $1`, [id])
@@ -188,10 +194,22 @@ export async function rebalanceAllOpen({ atRiskOnly = false } = {}) {
   return touched
 }
 
-export async function runAudit() {
+/**
+ * The hourly stock audit. Drift pages through Sentry (OPS-25): on Vercel
+ * there is no Prometheus to see the ledgerDrift gauge. At most hourly, like
+ * the checkHealth alerts.
+ */
+export async function runAudit(at = now()) {
   const drift = await tx((c) => auditLedger(c))
   metrics.ledgerDrift.set(drift.length)
-  if (drift.length) logger.error({ drift: drift.slice(0, 20) }, 'ledger audit: counters disagree with their sources')
+  if (drift.length) {
+    logger.error({ drift: drift.slice(0, 20) }, 'ledger audit: counters disagree with their sources')
+    const last = (await lastRuns())['alert-ledger-drift'] ?? 0
+    if (at.getTime() - last >= HOURLY_MS) {
+      reportProblem('Stock counters disagree with the ledger: stop and investigate before selling more', { lines: drift.length, sample: drift.slice(0, 5) })
+      await markRun('alert-ledger-drift')
+    }
+  }
   return drift
 }
 
@@ -212,7 +230,7 @@ export async function runPreorderJobs() {
  * lease. `budgetMs` is the time the run may take (tests shorten it).
  */
 export async function runMaintenance({ forceAll = false, budgetMs = RUN_BUDGET_MS } = {}) {
-  return withBudget(budgetMs, async () => {
+  return await withBudget(budgetMs, async () => {
     await step('config', loadConfig) // every instance keeps its rules fresh
     const holder = await takeLease('maintenance')
     if (!holder) return { skipped: true }
@@ -246,19 +264,22 @@ async function steps(forceAll) {
   const t = now().getTime()
   const last = await lastRuns()
   if (forceAll || t - (last.audit ?? 0) > HOURLY_MS) {
-    out.drift = (await step('audit', runAudit))?.length ?? null
+    out.drift = (await step('audit', () => runAudit()))?.length ?? null
   }
   if (forceAll || t - (last['review-stats'] ?? 0) > HOURLY_MS) {
     out.reviewStatsDrift = (await step('review-stats', () => tx((c) => auditReviewStats(c))))?.length ?? null
   }
   out.refunded = await step('refunds', processDueRefunds, { sliceMs: SLICE.refunds })
   out.duplicates = await step('duplicate-payments', refundDuplicatePayments, { sliceMs: SLICE.duplicates })
+  out.refundChecks = await step('refund-checks', () => reconcileRefunds(), { sliceMs: SLICE.duplicates })
   out.alerts = await step('stock-alerts', () => sendStockAlerts(), { sliceMs: SLICE.alerts })
   out.reminders = await step('reminders', () => sendReorderReminders(), { sliceMs: SLICE.alerts })
   out.reviewRequests = await step('review-requests', () => enqueueReviewRequests())
   out.notified = await step('notifications', () => sendDueNotifications(), { sliceMs: SLICE.notifications })
   out.preorders = await step('preorders', runPreorderJobs, { sliceMs: SLICE.preorders })
   await step('cleanup', () => cleanupExpired())
+  // SEC-05: customer details leave orders finished over PII_RETENTION_MONTHS ago (bounded per run).
+  if (forceAll || t - (last.retention ?? 0) > DAILY_MS) out.anonymised = await step('retention', () => anonymiseOldOrders())
   const lastFull = last['rebalance-all'] ?? 0
   if (forceAll || (last['rebalance-requested'] ?? 0) > lastFull || t - lastFull > DAILY_MS) {
     out.rebalanced = await step('rebalance-all', () => rebalanceAllOpen())
@@ -288,7 +309,7 @@ export async function checkHealth(out = {}, at = now()) {
             (SELECT COUNT(*)::int FROM orders WHERE refund_requested_at < $2 AND refunded_at IS NULL)
           + (SELECT COUNT(*)::int FROM preorders WHERE refund_requested_at < $2 AND refunded_at IS NULL)
           + (SELECT COUNT(*)::int FROM duplicate_payments WHERE found_at < $2 AND refunded_at IS NULL) AS refunds,
-            (SELECT COUNT(*)::int FROM webhook_failures WHERE source = 'razorpay' AND created_at > $3) AS webhooks,
+            (SELECT COUNT(*)::int FROM webhook_failures WHERE source = 'razorpay' AND created_at > $3 AND resolved_at IS NULL) AS webhooks,
             (SELECT COUNT(*)::int FROM notifications WHERE status = 'FAILED' AND created_at > $4) AS failed,
             (SELECT COUNT(*)::int FROM notifications WHERE status IN ('SENT', 'FAILED') AND created_at > $4) AS done`,
     [new Date(at.getTime() - 15 * 60_000), new Date(at.getTime() - 30 * 60_000), new Date(at.getTime() - HOURLY_MS), new Date(at.getTime() - DAILY_MS)],
@@ -300,6 +321,15 @@ export async function checkHealth(out = {}, at = now()) {
   if (h.webhooks >= 3) problems.push(['webhooks', 'Razorpay payments could not be matched or were rejected: see Needs attention', { lastHour: h.webhooks }])
   if (out.reconciled > 0) problems.push(['polled', 'Payments were confirmed by polling: Razorpay webhooks may not be arriving', { reconciled: out.reconciled }])
   if (h.done >= 20 && h.failed / h.done > 0.05) problems.push(['failing', 'WhatsApp messages failing: check the Meta token, template status and number quality', { failed: h.failed, done: h.done }])
+  // INV-G: a paid order past its date (or out for delivery too long) is a customer waiting with nobody told.
+  const late = await overdueOrders({ query }, at)
+  if (late.length) {
+    problems.push(['overdue', 'Orders are past their delivery date or stuck out for delivery: see Needs attention', { overdue: late.length, orders: late.slice(0, 10).map((o) => o.number) }])
+  }
+  const backup = await backupStatus(at)
+  if (backup?.stale) {
+    problems.push(['backup', 'No backup in the last 26 hours: check the Backup workflow in GitHub Actions, or the Docker backup service (docker compose logs backup)', { lastBackupAt: backup.lastOkAt }])
+  }
   const last = await lastRuns()
   for (const [key, message, extra] of problems) {
     const name = `alert-${key}`
@@ -309,6 +339,25 @@ export async function checkHealth(out = {}, at = now()) {
     await markRun(name)
   }
   return problems.map(([key]) => key)
+}
+
+/** A nightly backup older than this is missed (a day plus slack for a slow run). */
+export const BACKUP_STALE_MS = 26 * HOURLY_MS
+
+/**
+ * Each backup is recorded as the step 'backup': by the Docker backup service
+ * (ops/backup.sh), or on Vercel by the GitHub backup workflow's last step
+ * (ops/backup-heartbeat.sh). Checked when the deploy says backups record here
+ * (BACKUP_HEARTBEAT_EXPECTED=true, on either path), or once any backup has
+ * been recorded; null otherwise, so an install that records none shows no
+ * false alarm.
+ */
+export async function backupStatus(at = now()) {
+  const { rows } = await query(`SELECT last_ok_at, last_err_at, last_error FROM maintenance_runs WHERE step = 'backup'`)
+  const row = rows[0]
+  if (!row && !env.BACKUP_HEARTBEAT_EXPECTED) return null
+  const lastOkAt = row?.last_ok_at ?? null
+  return { lastOkAt, stale: !lastOkAt || at.getTime() - lastOkAt.getTime() > BACKUP_STALE_MS }
 }
 
 /** How long ago the last full run finished, in seconds (null = never). Used by /ready. */

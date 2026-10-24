@@ -17,6 +17,8 @@ git checkout --quiet --detach "$ref"
 echo "Deploying $(git rev-parse --short HEAD) (was $previous)"
 
 cd deploy
+# Made here, not by Docker, so they belong to this user (the backup key goes in backup-config).
+mkdir -p backups backup-config
 docker compose build --pull
 docker compose up -d --wait db
 echo "Go-live checks:"

@@ -35,6 +35,8 @@ services:
       COOKIE_SECURE: 'true'
       TRUST_PROXY: '1'
       SEED_DEMO_DATA: 'false'
+      # The backup service below records each backup; Needs attention warns after 26 hours without one.
+      BACKUP_HEARTBEAT_EXPECTED: 'true'
     logging: &logs
       driver: json-file
       options: { max-size: 20m, max-file: '5' }
@@ -45,6 +47,8 @@ services:
       dockerfile: deploy/web.Dockerfile
       args:
         VITE_API_URL: https://${API_DOMAIN:?set API_DOMAIN}
+        # UX-1: the shop build fails without the help number (deploy/.env).
+        VITE_SUPPORT_WHATSAPP: ${VITE_SUPPORT_WHATSAPP:?set VITE_SUPPORT_WHATSAPP in deploy/.env}
     restart: unless-stopped
     depends_on: [api]
     ports: ['80:80', '443:443', '443:443/udp']
@@ -61,13 +65,27 @@ services:
     restart: unless-stopped
     depends_on:
       db: { condition: service_healthy }
+      # The API creates the table each backup is recorded in (maintenance_runs). On a
+      # brand-new server the first run can beat it; that run fails and retries in an hour.
+      api: { condition: service_started }
+    # Only what the backup needs: not deploy/.env, which holds every other secret.
     environment:
       DATABASE_URL: *db-url
       BACKUP_DIR: /backups
       RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-14}
-    volumes: ['../mango-api/ops:/ops:ro', './backups:/backups']
-    # One backup at start, then every 24 hours. Copy deploy/backups off this server too.
-    entrypoint: ['/bin/bash', '-c', 'while true; do /ops/backup.sh || echo "backup FAILED"; sleep 86400; done']
+      # Encrypted to this public key, or no backup at all (deploy/README.md, Backups).
+      BACKUP_GPG_PUBLIC_KEY_FILE: /backup-config/backup-public-key.asc
+      BACKUP_GPG_RECIPIENT: ${BACKUP_GPG_RECIPIENT:-}
+      BACKUP_ALLOW_PLAINTEXT: 'false'
+      # Copies each encrypted backup off this server; a run without it fails.
+      BACKUP_UPLOAD_CMD: ${BACKUP_UPLOAD_CMD:-}
+      BACKUP_REQUIRE_UPLOAD: 'true'
+      BACKUP_HEARTBEAT: 'true'
+    volumes: ['../mango-api/ops:/ops:ro', './backups:/backups', './backup-config:/backup-config:ro']
+    # One backup at start, then every 24 hours; after a failure, again in an hour.
+    # Each outcome is recorded in the database, and the staff panel's Needs
+    # attention warns when no backup has succeeded for 26 hours.
+    entrypoint: ['/bin/bash', '-c', 'while true; do if /ops/backup.sh; then sleep 86400; else sleep 3600; fi; done']
     logging: *logs
 
 volumes:

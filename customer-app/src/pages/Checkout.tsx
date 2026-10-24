@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { Navigate, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ApiError, api, errorMessage, signedInPhone, type Confirmed, type Quote } from '../api'
 import { STAGE_LABEL, day, rupees, slotText } from '../format'
 import { openRazorpay } from '../payment'
 import { useStore, type CartLine } from '../store'
-import { ErrorNote, Spinner } from '../ui'
+import { AddressPicker, DayChips, Field, SlotPicker } from '../forms'
+import { DocTitle, ErrorNote, Spinner } from '../ui'
 import { AddPhoneCard } from '../auth-ui'
+import { UnpaidOrderBanner } from '../unpaid'
 
 function loadAddress() {
   try {
@@ -37,6 +39,30 @@ export async function syncCart(cart: CartLine[]) {
   }
 }
 
+/** Where a form problem shows: under its field. */
+type At = 'slot' | 'gift-name' | 'gift-phone' | 'address' | 'promo'
+/** The fields in page order, so the first one with a problem gets focus. */
+const FIELD_ORDER: At[] = ['slot', 'gift-name', 'gift-phone', 'address', 'promo']
+
+/** Moves focus to a field: a text box by its id, the delivery times to the first one that can be picked. */
+function focusField(at: At) {
+  const el =
+    at === 'slot'
+      ? document.querySelector<HTMLInputElement>('input[name="slot"]:checked, input[name="slot"]:not(:disabled)')
+      : at === 'address' && document.getElementById('address')?.closest('[hidden]')
+        ? document.querySelector<HTMLInputElement>('input[name="saved-address"]:checked')
+        : document.getElementById(at)
+  el?.focus()
+}
+
+/** A refusal from the API that belongs to one field. */
+function problemAt(err: unknown): At | null {
+  if (!(err instanceof ApiError)) return null
+  if (err.code === 'SLOT_FULL') return 'slot'
+  if (err.code.startsWith('PROMO_')) return 'promo'
+  return null
+}
+
 /** A short pause, for retrying a confirm whose first try is still starting the payment. */
 const pause = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -50,6 +76,8 @@ export default function Checkout() {
 function CheckoutForm() {
   const { pincode, date, cart, clearCart, setQty, setWhere } = useStore()
   const navigate = useNavigate()
+  const location = useLocation()
+  const [params] = useSearchParams()
   const saved = useRef(loadAddress())
   const [name, setName] = useState(saved.current.name ?? '')
   const [address, setAddress] = useState(saved.current.address ?? '')
@@ -57,7 +85,7 @@ function CheckoutForm() {
   const [promoCode, setPromoCode] = useState('')
   const [isGift, setIsGift] = useState(false)
   const [gift, setGift] = useState({ recipientName: '', recipientPhone: '', message: '' })
-  const [formError, setFormError] = useState<string | null>(null)
+  const [problems, setProblems] = useState<Partial<Record<At, string>>>({})
   const [quote, setQuote] = useState<Quote | null>(null)
   const idemKey = useRef<string | null>(null)
   // After the gateway failed to start a payment, the quote is spent: the next Pay quotes again with a new key.
@@ -86,6 +114,8 @@ function CheckoutForm() {
     if (a?.name) setName(a.name)
   }
 
+  // The delivery day is chosen here, at checkout.
+  const days = useQuery({ queryKey: ['delivery-days', pincode], queryFn: () => api.checkPincode(pincode!), enabled: Boolean(pincode) })
   const slots = useQuery({
     queryKey: ['slots', pincode, date],
     queryFn: () => api.slots(pincode!, date ?? ''),
@@ -113,9 +143,45 @@ function CheckoutForm() {
       idemKey.current = crypto.randomUUID()
       quoteSpent.current = false
       setQuote(q)
+      // The review is its own step in the history, so the browser's Back returns to this form.
+      navigate({ search: '?step=review' }, { state: { fromForm: true } })
     },
-    onError: dropUnsold,
+    onError: (err) => {
+      dropUnsold(err)
+      const at = problemAt(err)
+      // A time that just filled up shows as Full.
+      if (at === 'slot') void slots.refetch()
+      if (at) {
+        setProblems({ [at]: quoteProblem(err, cart) })
+        // Wait for the error to render, so the field reads it out with focus.
+        requestAnimationFrame(() => focusField(at))
+      }
+    },
   })
+  // The review shows only at ?step=review; without a quote (a reload) the form shows instead.
+  const reviewing = Boolean(quote) && params.get('step') === 'review'
+  const backToForm = () => {
+    if ((location.state as { fromForm?: boolean } | null)?.fromForm) navigate(-1)
+    else navigate({ search: '' }, { replace: true })
+  }
+  // Each step starts at the top, with focus on its heading.
+  const heading = useRef<HTMLHeadingElement>(null)
+  const firstStep = useRef(true)
+  useEffect(() => {
+    if (firstStep.current) {
+      firstStep.current = false
+      return
+    }
+    window.scrollTo(0, 0)
+    heading.current?.focus()
+    // Back on the form, the details may change: the next Review order quotes again.
+    if (!reviewing) setQuote(null)
+  }, [reviewing])
+  // ?step=review with nothing to review (a reload, or Forward after changing details): stay on the form.
+  const orphanStep = params.get('step') === 'review' && !quote
+  useEffect(() => {
+    if (orphanStep) navigate({ search: '' }, { replace: true })
+  }, [orphanStep, navigate])
   const pay = useMutation({
     mutationFn: async () => {
       let q = quote!
@@ -143,7 +209,8 @@ function CheckoutForm() {
             await pause(2000)
             continue
           }
-          if (err instanceof ApiError && err.code === 'PAYMENT_GATEWAY_ERROR') quoteSpent.current = true
+          // The next Pay quotes again: after a gateway error, or (PAY-B10) a box taken off sale since the review.
+          if (err instanceof ApiError && (err.code === 'PAYMENT_GATEWAY_ERROR' || err.code === 'PRODUCT_UNAVAILABLE')) quoteSpent.current = true
           throw err
         }
       }
@@ -152,28 +219,36 @@ function CheckoutForm() {
       let sheetError: string | null = null
       if (c.razorpayKeyId && c.razorpayOrderId) {
         try {
-          await openRazorpay({ key: c.razorpayKeyId, rzp: c.razorpayOrderId, total: c.total, number: c.number, holdExpiresAt: c.holdExpiresAt }, signedInPhone())
+          await openRazorpay({ orderId: c.orderId, key: c.razorpayKeyId, rzp: c.razorpayOrderId, total: c.total, number: c.number, holdExpiresAt: c.holdExpiresAt }, signedInPhone())
         } catch (err) {
           sheetError = errorMessage(err)
         }
       }
       return { c, sheetError }
     },
-    onSuccess: ({ c, sheetError }) => navigate(`/orders/${c.orderId}`, { replace: true, state: sheetError ? { payError: sheetError } : null }),
+    onSuccess: ({ c, sheetError }) => navigate(`/orders/${c.orderId}`, { replace: true, state: { placed: true, ...(sheetError && { payError: sheetError }) } }),
     onError: dropUnsold,
   })
 
+  // PAY-B10: a box taken off sale between the review and Pay is named here, even when it was the only one.
+  const unsold = pay.error instanceof ApiError && pay.error.code === 'PRODUCT_UNAVAILABLE' ? pay.error : null
   if (!pincode) return <Navigate to="/" replace />
-  if (!cart.length && !pay.isPending && !pay.isSuccess) return <Navigate to="/cart" replace />
+  if (!cart.length && !pay.isPending && !pay.isSuccess && !unsold) return <Navigate to="/cart" replace />
 
   function submit(e: FormEvent) {
     e.preventDefault()
-    setFormError(null)
-    if (address.trim().length < 10) return setFormError('Enter the full delivery address, with house number and landmark.')
-    if (slots.data?.slots.length && !slotId) return setFormError('Choose a delivery time.')
-    if (isGift && !gift.recipientName.trim()) return setFormError("Enter the name of the person you're sending it to.")
+    const found: Partial<Record<At, string>> = {}
+    if (slots.data?.slots.length && !slotId) found.slot = 'Choose a delivery time.'
+    if (isGift && !gift.recipientName.trim()) found['gift-name'] = "Enter the name of the person you're sending it to."
     if (isGift && !/^(\+?91|0)?[6-9]\d{9}$/.test(gift.recipientPhone.replace(/[\s-]/g, ''))) {
-      return setFormError("Enter their 10-digit mobile number, so the rider can reach them.")
+      found['gift-phone'] = 'Enter their 10-digit mobile number, so the rider can reach them.'
+    }
+    if (address.trim().length < 10) found.address = 'Enter the full delivery address, with house number and landmark.'
+    setProblems(found)
+    const first = FIELD_ORDER.find((at) => found[at])
+    if (first) {
+      requestAnimationFrame(() => focusField(first))
+      return
     }
     try {
       localStorage.setItem('mm.address', JSON.stringify({ name: name.trim(), address: address.trim() }))
@@ -183,7 +258,7 @@ function CheckoutForm() {
     review.mutate()
   }
 
-  if (quote) {
+  if (quote && reviewing) {
     // The cart shows the price seen when the box was added; the quote is today's.
     const wasPrice = (l: Quote['lines'][number]) => {
       const seen = cart.find((c) => c.sku === l.sku && c.stage === l.stage)?.price
@@ -191,8 +266,13 @@ function CheckoutForm() {
     }
     const changed = quote.lines.filter((l) => wasPrice(l) != null)
     return (
-      <section className="card">
-        <h1>Review and pay</h1>
+      <section className="card checkout-review">
+        <DocTitle title="Review and pay" />
+        <h1 ref={heading} tabIndex={-1}>
+          Review and pay
+        </h1>
+        {/* UX-8: say so before Pay, not only when Pay is refused. */}
+        <UnpaidOrderBanner />
         <dl className="facts">
           <div>
             <dt>Arrives</dt>
@@ -260,166 +340,237 @@ function CheckoutForm() {
             </div>
           </>
         )}
+        {/* UX-3: the whole cost before Pay. Delivery is always free. */}
+        <div className="sum-row">
+          <span>Delivery</span>
+          <span>Free</span>
+        </div>
         <div className="total-row">
           <span>Total</span>
           <strong>{rupees(quote.total)}</strong>
         </div>
         <p className="muted small">
-          Your boxes are held for a few minutes while you pay. You can cancel for a full refund any time before your order is packed.
+          Your boxes are held for {quote.holdMinutes ? `${quote.holdMinutes} minutes` : 'a few minutes'} while you pay. You can cancel for a full
+          refund any time before your order is packed.
         </p>
-        <ErrorNote error={pay.error ? quoteProblem(pay.error) : null} />
-        <button type="button" className="btn btn-primary btn-block" disabled={pay.isPending} onClick={() => pay.mutate()}>
-          {pay.isPending ? 'Opening payment…' : `Pay ${rupees(quote.total)}`}
-        </button>
-        <button type="button" className="btn btn-block btn-quiet" disabled={pay.isPending} onClick={() => setQuote(null)}>
+        <ErrorNote
+          error={
+            unsold
+              ? `${unsold.message}, so we took it out of your cart. Nothing was charged.${cart.length ? ' Tap Pay to see the new total.' : ''}`
+              : pay.error
+                ? quoteProblem(pay.error)
+                : null
+          }
+        />
+        {pay.error instanceof ApiError && pay.error.code === 'UNPAID_ORDER_EXISTS' && typeof pay.error.detail.orderId === 'string' && (
+          <Link to={`/orders/${pay.error.detail.orderId}`} className="btn btn-block">
+            Open your unpaid order
+          </Link>
+        )}
+        {unsold && !cart.length ? (
+          <Link to="/" className="btn btn-primary btn-block">
+            Choose other mangoes
+          </Link>
+        ) : (
+          <button type="button" className="btn btn-primary btn-block" disabled={pay.isPending} onClick={() => pay.mutate()} aria-describedby="pay-trust">
+            {pay.isPending ? 'Opening payment…' : `Pay ${rupees(quote.total)}`}
+          </button>
+        )}
+        {/* UX-3: who takes the money and how, at the moment of paying. */}
+        <p className="small center pay-trust" id="pay-trust">
+          Secure payment by Razorpay. UPI, cards, netbanking. No cash on delivery.{' '}
+          <span className="muted">
+            See our <Link to="/terms">terms of sale</Link> and <Link to="/help">help</Link>.
+          </span>
+        </p>
+        <button type="button" className="btn btn-block btn-quiet" disabled={pay.isPending} onClick={backToForm}>
           Change details
         </button>
       </section>
     )
   }
 
+  // A saved address hides the address box: a problem with it then shows above the button.
+  const addressShown = isGift || picked === null
+  const errorAt = (at: At) => (at !== 'address' || addressShown ? problems[at] ?? null : null)
+  // A field's problem from the API is shown at the field, not again above the button.
+  const reviewError = review.error && !(problemAt(review.error) && problems[problemAt(review.error)!]) ? quoteProblem(review.error, cart) : null
   return (
-    <section className="card">
-      <h1>Delivery details</h1>
-      <form onSubmit={submit} noValidate>
-        {slots.isPending ? (
-          <Spinner label="Loading delivery times" />
-        ) : slots.isError ? (
-          <ErrorNote error={slots.error} onRetry={() => slots.refetch()} />
-        ) : (
-          <>
-            <p>
-              Arrives <strong>{day(slots.data.deliveryDate)}</strong>
-            </p>
-            {slots.data.slots.length > 0 && (
+    <div className="checkout-layout">
+      <section className="card">
+        <DocTitle title="Delivery details" />
+        <h1 ref={heading} tabIndex={-1}>
+          Delivery details
+        </h1>
+        <UnpaidOrderBanner />
+        <form onSubmit={submit} noValidate>
+          {slots.isPending ? (
+            <Spinner label="Loading delivery times" />
+          ) : slots.isError ? (
+            <ErrorNote error={slots.error} onRetry={() => slots.refetch()} />
+          ) : (
+            <>
               <fieldset className="field">
-                <legend>Delivery time</legend>
-                <div className="options">
-                  {slots.data.slots.map((s) => (
-                    <label key={s.id} className={`option${s.available ? '' : ' option-off'}`}>
-                      <input type="radio" name="slot" value={s.id} checked={slotId === s.id} disabled={!s.available} onChange={() => setSlotId(s.id)} />
-                      <span>
-                        {slotText(s)}
-                        {!s.available && <span className="muted small"> · Full</span>}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-            )}
-          </>
-        )}
-        <label className="option gift-toggle">
-          <input
-            type="checkbox"
-            checked={isGift}
-            onChange={(e) => {
-              setIsGift(e.target.checked)
-              // A gift goes to their address, not one of ours.
-              if (e.target.checked && picked !== null) {
-                typedOwn.current = true
-                setPicked(null)
-                setAddress('')
-              }
-            }}
-          />
-          <span>This is a gift for someone else</span>
-        </label>
-        {isGift && (
-          <fieldset className="field gift-fields">
-            <legend>Who is it for?</legend>
-            <div className="field">
-              <label htmlFor="gift-name">Their name</label>
-              <input id="gift-name" maxLength={80} value={gift.recipientName} onChange={(e) => setGift({ ...gift, recipientName: e.target.value })} />
-            </div>
-            <div className="field">
-              <label htmlFor="gift-phone">Their mobile number</label>
-              <div className="prefixed">
-                <span aria-hidden="true">+91</span>
-                <input
-                  id="gift-phone"
-                  type="tel"
-                  inputMode="numeric"
-                  maxLength={14}
-                  value={gift.recipientPhone}
-                  onChange={(e) => setGift({ ...gift, recipientPhone: e.target.value })}
-                  aria-describedby="gift-phone-hint"
+                <legend>When should it arrive?</legend>
+                <DayChips
+                  label="When should it arrive?"
+                  days={days.data?.deliveryDates ?? [slots.data.deliveryDate]}
+                  value={slots.data.deliveryDate}
+                  format={day}
+                  onChange={(d) => {
+                    if (d === slots.data.deliveryDate) return
+                    setSlotId(null)
+                    setWhere(pincode, d)
+                  }}
                 />
-              </div>
-              <p id="gift-phone-hint" className="muted small">
-                The rider calls them. Your order updates and the delivery code still come to you, so pass the code on.
-              </p>
-            </div>
-            <div className="field">
-              <label htmlFor="gift-note">A note in the box (optional)</label>
-              <textarea id="gift-note" rows={2} maxLength={200} value={gift.message} onChange={(e) => setGift({ ...gift, message: e.target.value })} />
-            </div>
-          </fieldset>
-        )}
-        <div className="field">
-          <label htmlFor="name">Your name</label>
-          <input id="name" autoComplete="name" maxLength={80} value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        {!isGift && savedHere.length > 0 && (
-          <fieldset className="field">
-            <legend>Deliver to</legend>
-            <div className="options">
-              {savedHere.map((a) => (
-                <label key={a.id} className="option">
-                  <input type="radio" name="saved-address" checked={picked === a.id} onChange={() => choose(a.id)} />
-                  <span className="option-text">
-                    {a.name && <strong>{a.name}</strong>}
-                    <span>{a.address}</span>
-                  </span>
-                </label>
-              ))}
-              <label className="option">
-                <input type="radio" name="saved-address" checked={picked === null} onChange={() => choose(null)} />
-                <span>A new address</span>
-              </label>
-            </div>
-          </fieldset>
-        )}
-        <div className="field" hidden={!isGift && picked !== null}>
-          <label htmlFor="address">Delivery address</label>
-          <textarea
+                {days.data?.cutoffTime && <p className="muted small">Orders for the next day close at {days.data.cutoffTime.replace(' IST', '')} (India time).</p>}
+              </fieldset>
+              <SlotPicker
+                name="slot"
+                slots={slots.data.slots}
+                value={slotId}
+                onChange={(id) => {
+                  setSlotId(id)
+                  if (problems.slot) setProblems({ ...problems, slot: undefined })
+                }}
+                error={errorAt('slot')}
+              />
+            </>
+          )}
+          <label className="option gift-toggle">
+            <input
+              type="checkbox"
+              checked={isGift}
+              onChange={(e) => {
+                setIsGift(e.target.checked)
+                // A gift goes to their address, not one of ours.
+                if (e.target.checked && picked !== null) {
+                  typedOwn.current = true
+                  setPicked(null)
+                  setAddress('')
+                }
+              }}
+            />
+            <span>This is a gift for someone else</span>
+          </label>
+          {isGift && (
+            <fieldset className="field gift-fields">
+              <legend>Who is it for?</legend>
+              <Field id="gift-name" label="Their name" error={errorAt('gift-name')}>
+                <input maxLength={80} value={gift.recipientName} onChange={(e) => setGift({ ...gift, recipientName: e.target.value })} />
+              </Field>
+              <Field
+                id="gift-phone"
+                label="Their mobile number"
+                hint="The rider calls them. Your order updates and the delivery code still come to you, so pass the code on."
+                error={errorAt('gift-phone')}
+              >
+                {(control) => (
+                  <div className="prefixed">
+                    <span aria-hidden="true">+91</span>
+                    <input
+                      {...control}
+                      type="tel"
+                      inputMode="numeric"
+                      maxLength={14}
+                      value={gift.recipientPhone}
+                      onChange={(e) => setGift({ ...gift, recipientPhone: e.target.value })}
+                    />
+                  </div>
+                )}
+              </Field>
+              <Field id="gift-note" label="A note in the box (optional)">
+                <textarea rows={2} maxLength={200} value={gift.message} onChange={(e) => setGift({ ...gift, message: e.target.value })} />
+              </Field>
+            </fieldset>
+          )}
+          <Field id="name" label="Your name">
+            <input autoComplete="name" maxLength={80} value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+          {!isGift && <AddressPicker addresses={savedHere} value={picked} onChange={choose} />}
+          <Field
             id="address"
-            autoComplete="street-address"
-            rows={3}
-            maxLength={500}
-            value={address}
-            onChange={(e) => {
-              typedOwn.current = true
-              setAddress(e.target.value)
-            }}
-            aria-describedby="address-hint"
-          />
-          <p id="address-hint" className="muted small">
-            {isGift ? 'Their address: house' : 'House'} or flat number, street, area and a landmark. Pincode {pincode}.
-          </p>
-        </div>
-        <div className="field">
-          <label htmlFor="promo">Promo code (optional)</label>
-          <input
-            id="promo"
-            autoComplete="off"
-            autoCapitalize="characters"
-            maxLength={20}
-            value={promoCode}
-            onChange={(e) => setPromoCode(e.target.value.toUpperCase())}
-          />
-        </div>
-        {formError && (
-          <p className="field-error" role="alert">
-            {formError}
-          </p>
-        )}
-        <ErrorNote error={review.error ? quoteProblem(review.error, cart) : null} />
-        <button type="submit" className="btn btn-primary btn-block" disabled={review.isPending || slots.isPending}>
-          {review.isPending ? 'Checking stock…' : 'Review order'}
-        </button>
-      </form>
-    </section>
+            label="Delivery address"
+            hint={`${isGift ? 'Their address: house' : 'House'} or flat number, street, area and a landmark. Pincode ${pincode}.`}
+            error={errorAt('address')}
+            hidden={!addressShown}
+          >
+            <textarea
+              autoComplete="street-address"
+              rows={3}
+              maxLength={500}
+              value={address}
+              onChange={(e) => {
+                typedOwn.current = true
+                setAddress(e.target.value)
+              }}
+            />
+          </Field>
+          <Field id="promo" label="Promo code (optional)" error={errorAt('promo')}>
+            <input
+              autoComplete="off"
+              autoCapitalize="characters"
+              maxLength={20}
+              value={promoCode}
+              onChange={(e) => {
+                setPromoCode(e.target.value.toUpperCase())
+                if (problems.promo) setProblems({ ...problems, promo: undefined })
+              }}
+            />
+          </Field>
+          {problems.address && !addressShown && (
+            <p className="field-error" role="alert">
+              {problems.address}
+            </p>
+          )}
+          <ErrorNote error={reviewError} />
+          <button type="submit" className="btn btn-primary btn-block" disabled={review.isPending || slots.isPending}>
+            {review.isPending ? 'Checking stock…' : 'Review order'}
+          </button>
+        </form>
+      </section>
+      <CartSummary cart={cart} />
+    </div>
+  )
+}
+
+/**
+ * The boxes in the cart beside the form, sticky on a desktop (hidden on a phone, where the form is
+ * the whole screen and the review step lists them). Prices are the cart's; the review step shows today's.
+ */
+function CartSummary({ cart }: { cart: CartLine[] }) {
+  const boxes = cart.reduce((n, l) => n + l.qty, 0)
+  return (
+    <aside className="card order-summary" aria-labelledby="summary-title">
+      <h2 id="summary-title">Your order</h2>
+      <ul className="lines">
+        {cart.map((l) => (
+          <li key={`${l.sku}-${l.stage}`} className="line">
+            <div>
+              <strong>
+                {l.qty} × {l.name}
+              </strong>
+              <span className="muted small">{STAGE_LABEL[l.stage]}</span>
+            </div>
+            <span className="line-price">{rupees(l.price * l.qty)}</span>
+          </li>
+        ))}
+      </ul>
+      <div className="sum-row">
+        <span>Delivery</span>
+        <span>Free</span>
+      </div>
+      <div className="total-row">
+        <span>
+          {boxes} {boxes === 1 ? 'box' : 'boxes'}
+        </span>
+        <strong>{rupees(cart.reduce((s, l) => s + l.price * l.qty, 0))}</strong>
+      </div>
+      <p className="muted small">Stock and price are checked for your day when you review the order.</p>
+      <Link to="/cart" className="link-btn">
+        Change the boxes
+      </Link>
+    </aside>
   )
 }
 

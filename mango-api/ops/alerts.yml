@@ -1,5 +1,13 @@
-# Prometheus alert rules for mango-api. Scrape GET /metrics on every instance
-# (protect it with METRICS_TOKEN) and route these to the on-call phone.
+# Prometheus alert rules for mango-api. DOCKER PATH ONLY (deploy/README.md):
+# a long-running server where Prometheus can scrape GET /metrics on every
+# instance (protect it with METRICS_TOKEN). Route these to the on-call phone.
+#
+# On Vercel nothing evaluates this file: /metrics answers 404 there and each
+# function instance is short-lived. The Vercel path alerts through Sentry
+# instead (deploy/VERCEL.md, "Watch it"): the maintenance cron monitor, the
+# uptime monitor on /ready, and reportProblem/reportError from the job, which
+# covers the same ground (failing steps, overdue messages and refunds,
+# webhook failures, ledger drift, missed backups).
 groups:
   - name: mango-api
     rules:

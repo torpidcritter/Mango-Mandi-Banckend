@@ -30,6 +30,16 @@ describe('maintenance on a schedule', () => {
     assert.equal(r.status, 200, JSON.stringify(r.body))
     assert.notEqual(r.body.skipped, true)
     assert.ok(await lastOk('tick'))
+    // External schedulers may POST instead; same secret rule.
+    assert.equal((await api.post('/internal/maintenance', undefined)).status, 401)
+    assert.equal((await api.post('/internal/maintenance', undefined, cron)).status, 200)
+  })
+
+  test('vercel.json asks Vercel only for a daily backstop, which every plan allows', async () => {
+    const { readFile } = await import('node:fs/promises')
+    const cfg = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url), 'utf8'))
+    const [min, hour] = cfg.crons[0].schedule.split(' ')
+    assert.ok(/^\d+$/.test(min) && /^\d+$/.test(hour), `daily schedule expected, got ${cfg.crons[0].schedule}`)
   })
 
   test('two runs at once: one works, the other skips', async () => {

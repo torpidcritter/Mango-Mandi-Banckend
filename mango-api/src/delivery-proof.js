@@ -11,7 +11,8 @@ import { now } from './clock.js'
 import { badRequest, conflict, HttpError, notFound } from './errors.js'
 import { newId } from './ids.js'
 import { addEvent, setOrderStatus } from './orders.js'
-import { checkPhoto, MAX_PHOTO_BYTES, storePhoto } from './photos.js'
+import { query, tx } from './db.js'
+import { checkPhoto, cleanImage, dropPhoto, MAX_PHOTO_BYTES, storePhoto } from './photos.js'
 
 export const FAIL_REASONS = ['NOT_HOME', 'WRONG_ADDRESS', 'REFUSED', 'UNREACHABLE', 'OTHER']
 export const FAIL_LABEL = {
@@ -47,16 +48,36 @@ export async function dispatchOrder(c, orderId, actor, opts = {}) {
   return true
 }
 
-/** Stores a delivery photo for an order that is out for delivery. Returns its id. */
-export async function savePhoto(c, orderId, bytes, actor) {
-  const { mime, ext } = checkPhoto(bytes)
-  const o = await lockOrder(c, orderId)
-  if (o.status !== 'OUT_FOR_DELIVERY') throw badRequest('Photos are taken while the order is out for delivery', 'INVALID_TRANSITION')
+const notOut = () => badRequest('Photos are taken while the order is out for delivery', 'INVALID_TRANSITION')
+
+/**
+ * Stores a delivery photo for an order that is out for delivery. Returns its id.
+ * OPS-26: the upload (Blob, no transaction) happens before the transaction
+ * that locks the order, so a slow upload never holds the order lock or a
+ * pooled connection. The short transaction re-checks the order and inserts
+ * the row; if it fails, the uploaded file is deleted again.
+ */
+export async function savePhoto(orderId, bytes, actor) {
+  checkPhoto(bytes)
+  // SEC-13: re-encoded, so the phone's EXIF (GPS, device) and anything hidden in the file stay behind.
+  const { bytes: clean, mime, ext } = await cleanImage(bytes)
+  const { rows } = await query('SELECT number, status FROM orders WHERE id = $1', [orderId])
+  if (!rows.length) throw notFound('Order not found')
+  if (rows[0].status !== 'OUT_FOR_DELIVERY') throw notOut()
   const id = newId('dph')
-  const stored = await storePhoto(`delivery/${o.number}`, id, bytes, ext, mime)
-  await c.query('INSERT INTO delivery_photos (id, order_id, mime, bytes, blob_path, taken_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)', [
-    id, orderId, mime, stored.bytes, stored.blobPath, actor.label ?? actor.id, now(),
-  ])
+  const stored = await storePhoto(`delivery/${rows[0].number}`, id, clean, ext, mime)
+  try {
+    await tx(async (c) => {
+      const o = await lockOrder(c, orderId)
+      if (o.status !== 'OUT_FOR_DELIVERY') throw notOut()
+      await c.query('INSERT INTO delivery_photos (id, order_id, mime, bytes, blob_path, taken_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)', [
+        id, orderId, mime, stored.bytes, stored.blobPath, actor.label ?? actor.id, now(),
+      ])
+    })
+  } catch (err) {
+    if (stored.blobPath) await dropPhoto({ blob_path: stored.blobPath })
+    throw err
+  }
   return id
 }
 

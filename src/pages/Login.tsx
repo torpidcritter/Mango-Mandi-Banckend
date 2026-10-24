@@ -3,10 +3,11 @@ import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-route
 import { ApiError, api } from '../api'
 import { useSession } from '../session'
 import type { Me, SignInResult } from '../types'
-import { FormError } from '../ui'
+import { FormError, usePageTitle } from '../ui'
 import { GoogleSignIn } from '../google'
 
 export default function Login() {
+  usePageTitle('Sign in')
   const { me, setMe } = useSession()
   const navigate = useNavigate()
   const location = useLocation()
@@ -17,7 +18,9 @@ export default function Login() {
   const [error, setError] = useState<unknown>(null)
   const [ticket, setTicket] = useState<string | null>(null)
 
-  const from = (location.state as { from?: string } | null)?.from ?? '/'
+  // Only a path on this site (SEC-11): "//host" and "/\host" would be another site.
+  const asked = (location.state as { from?: string } | null)?.from
+  const from = asked && /^\/(?![/\\])/.test(asked) ? asked : '/'
   if (me) return <Navigate to={from} replace />
 
   function done(signedIn: Me) {
@@ -47,6 +50,7 @@ export default function Login() {
   return (
     <main className="login-wrap">
       <div className="card login-card">
+        <img src="/brand/logo-320.webp" srcSet="/brand/logo-320.webp 1x, /brand/logo-640.webp 2x" width="112" height="112" alt="MandiMangoes" className="login-logo" />
         <h1>Mango Ops</h1>
         {ticket ? (
           <CodeStep

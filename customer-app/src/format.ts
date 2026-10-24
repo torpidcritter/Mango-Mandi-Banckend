@@ -1,4 +1,5 @@
 import type { OrderStatus, PreorderStatus, Stage } from './api'
+import { supportDigits } from './support'
 
 const rupeeFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
 /** Paise to "₹1,899"; paise show only when there are any. */
@@ -33,7 +34,7 @@ export const STAGE_HINT: Record<Stage, string> = {
 export const STATUS_LABEL: Record<OrderStatus, string> = {
   PAYMENT_PENDING: 'Waiting for payment',
   CONFIRMED: 'Confirmed',
-  PROCESSING: 'Being packed',
+  PROCESSING: 'Preparing',
   PACKED: 'Packed',
   SHIPPED: 'On its way',
   OUT_FOR_DELIVERY: 'Out for delivery',
@@ -61,4 +62,31 @@ export const PREORDER_LABEL: Record<PreorderStatus, string> = {
   WAITLISTED: 'On the waitlist',
   CONVERTED: 'Delivery day set',
   CANCELLED: 'Cancelled',
+}
+
+/**
+ * The help chat link (wa.me) when the shop's WhatsApp number is set, else null. Production builds
+ * always have it (support.ts); dev and test builds may not, and link to /help instead.
+ */
+export function helpLink(text?: string): string | null {
+  const n = supportDigits(import.meta.env.VITE_SUPPORT_WHATSAPP)
+  if (!n) return null
+  return `https://wa.me/${n}${text ? `?text=${encodeURIComponent(text)}` : ''}`
+}
+
+/** The help number for reading out, "+91 98765 43210", or null when it is not set. */
+export function helpNumber(): string | null {
+  const n = supportDigits(import.meta.env.VITE_SUPPORT_WHATSAPP)
+  if (!n) return null
+  return n.startsWith('91') && n.length === 12 ? `+91 ${n.slice(2, 7)} ${n.slice(7)}` : `+${n}`
+}
+
+/** What is in the box, when the shop team has filled it in: "About 12 mangoes, around 250 g each". */
+export function boxContents(p: { fruitsPerBox?: number | null; fruitWeightG?: number | null }): string | null {
+  const count = p.fruitsPerBox ? `About ${p.fruitsPerBox} ${p.fruitsPerBox === 1 ? 'mango' : 'mangoes'}` : null
+  const weight = p.fruitWeightG ? `around ${p.fruitWeightG} g each` : null
+  if (count && weight) return `${count}, ${weight}`
+  if (count) return count
+  if (weight) return `Mangoes of ${weight}`
+  return null
 }

@@ -26,8 +26,15 @@ beforeEach(async () => {
 
 const pay = (orderId) => api.post('/v1/dev/pay', { orderId, outcome: 'captured' })
 // DELIVERED from the panel is a manager's override with a reason (ORD-3).
-const move = (id, status) =>
-  api.patch(`/admin/v1/orders/${id}/status`, status === 'DELIVERED' ? { status, override: true, reason: 'Customer confirmed by phone' } : { status }, { token: admin })
+const move = async (id, status) => {
+  // A failed delivery is reported with a reason and the attempt (OPS-01/02).
+  if (status === 'DELIVERY_FAILED') {
+    const { attempt } = (await api.get(`/admin/v1/orders/${id}`, { token: admin })).body
+    const r = await api.post(`/admin/v1/orders/${id}/delivery`, { outcome: 'FAILED', reason: 'NOT_HOME', attempt }, { token: admin })
+    return { ...r, status: r.status === 200 ? 204 : r.status }
+  }
+  return api.patch(`/admin/v1/orders/${id}/status`, status === 'DELIVERED' ? { status, override: true, reason: 'Customer confirmed by phone' } : { status }, { token: admin })
+}
 const addSlot = async (body) => {
   const r = await api.post('/admin/v1/slots', body, { token: admin })
   assert.equal(r.status, 201, JSON.stringify(r.body))
@@ -44,6 +51,8 @@ describe('delivery slots', () => {
     const plain = await checkout(api, cust.accessToken, [{ sku: 'ALP-3', stage: 'RIPE', qty: 1 }])
     assert.equal(plain.status, 201)
     assert.equal(plain.body.slotId, null)
+    // One unpaid order at a time (INV-02): this one is done with.
+    assert.equal((await api.post(`/v1/orders/${plain.body.orderId}/cancel`, undefined, { token: cust.accessToken })).status, 204)
 
     const morning = await addSlot({ label: 'Morning', startsAt: '07:00', endsAt: '11:00', maxBoxes: 3, sort: 1 })
     const evening = await addSlot({ label: 'Evening', startsAt: '16:00', endsAt: '20:00', sort: 2 })

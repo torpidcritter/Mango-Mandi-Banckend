@@ -6,7 +6,8 @@
   "buildCommand": "npm run vercel-build",
   "functions": {
     "api/index.js": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "includeFiles": "src/data/**"
     }
   },
   "rewrites": [
@@ -18,7 +19,7 @@
   "crons": [
     {
       "path": "/internal/maintenance",
-      "schedule": "* * * * *"
+      "schedule": "30 21 * * *"
     }
   ],
   "outputDirectory": "public"

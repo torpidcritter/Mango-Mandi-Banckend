@@ -13,10 +13,10 @@ import { env } from './env.js'
 import { HttpError } from './errors.js'
 import { newId } from './ids.js'
 import { availability } from './inventory.js'
-import { logger } from './logger.js'
+import { logger, maskPhone } from './logger.js'
 import { dateWords, recordDeliveryStatus, rupees, timeWords, weekWords } from './notify.js'
-import { createOrder, customerCancel, eatByFor, processPayment, SYSTEM } from './orders.js'
-import { applyCapture, createPaymentLink, refundOrder } from './payments.js'
+import { checkUnpaidLimit, createOrder, customerCancel, eatByFor, processPayment, SYSTEM } from './orders.js'
+import { applyCapture, createPaymentLink, recordWebhookFailure, refundOrder } from './payments.js'
 import { bookPreorder, cancelPreorder, ensurePaymentLink, openWeeks, refundPreorder } from './preorders.js'
 import { findProduct, sellable, shopProducts } from './products.js'
 import { STAGES } from './stage.js'
@@ -24,7 +24,7 @@ import { chatMessenger } from './whatsapp.js'
 
 const STAGE_WORDS = { RAW: 'Raw', SEMI_RIPE: 'Semi-ripe', RIPE: 'Ripe' }
 const STATUS_WORDS = {
-  PAYMENT_PENDING: 'Waiting for payment', CONFIRMED: 'Confirmed', PROCESSING: 'Being packed', PACKED: 'Packed',
+  PAYMENT_PENDING: 'Waiting for payment', CONFIRMED: 'Confirmed', PROCESSING: 'Preparing', PACKED: 'Packed',
   SHIPPED: 'Shipped', OUT_FOR_DELIVERY: 'Out for delivery', DELIVERED: 'Delivered', DELIVERY_FAILED: 'Delivery missed, retrying',
   CANCELLED: 'Cancelled', RTO: 'Returned',
 }
@@ -205,10 +205,12 @@ async function addToCart(c, s, qty) {
 /** Books the order (a 10-minute hold, as in app checkout); payment goes out after commit. */
 async function placeOrder(c, s, cust) {
   if (s.data.orderId) {
-    const { rows } = await c.query('SELECT status, payment_link_url FROM orders WHERE id = $1', [s.data.orderId])
+    const { rows } = await c.query('SELECT status, payment_link_url, hold_expires_at FROM orders WHERE id = $1', [s.data.orderId])
     const o = rows[0]
-    if (o?.status === 'PAYMENT_PENDING') return { replies: [], after: { pay: s.data.orderId } }
-    if (o && o.status !== 'CANCELLED') return { replies: [text('This order is already paid. Send *my orders* to see it.')] }
+    // An order whose hold ran out is cancelled by the next checkout or the sweep; book afresh.
+    const expired = o?.status === 'PAYMENT_PENDING' && o.hold_expires_at < now()
+    if (o?.status === 'PAYMENT_PENDING' && !expired) return { replies: [], after: { pay: s.data.orderId } }
+    if (o && !expired && o.status !== 'CANCELLED') return { replies: [text('This order is already paid. Send *my orders* to see it.')] }
     delete s.data.orderId
   }
   if (!s.data.cart?.length || !s.data.address) return { replies: [MENU] }
@@ -223,8 +225,9 @@ async function placeOrder(c, s, cust) {
     s.data.cart = []
     return { replies: [text('Sorry, one of those boxes is no longer sold. Please pick again.'), ...(await catalogue(c, s))] }
   }
-  const r = await attempt(c, () =>
-    createOrder(
+  const r = await attempt(c, async () => {
+    await checkUnpaidLimit(c, s.customerId, s.data.cart.reduce((t, l) => t + l.qty, 0))
+    return createOrder(
       c,
       {
         customerId: s.customerId, customerName: cust.name, phone: s.phone, pincode: s.data.pincode, address: s.data.address,
@@ -234,10 +237,13 @@ async function placeOrder(c, s, cust) {
         lines: s.data.cart.map((l) => ({ sku: l.sku, stage: l.stage, qty: l.qty, unitPrice: findProduct(l.sku).price })),
       },
       { type: 'customer', id: s.customerId, label: 'whatsapp' },
-    ),
-  )
+    )
+  })
   if (!r.ok) {
     const code = r.error.code
+    if (code === 'UNPAID_ORDER_EXISTS') {
+      return { replies: [text(`You already have an unpaid order, ${r.error.extra.number}. Pay for it with the link we sent, or send *my orders* to cancel it. Then you can order again.`)] }
+    }
     if (code === 'SLOT_FULL' || code === 'SLOT_INVALID') return { replies: [text('That delivery slot just filled up.'), ...(await askSlot(c, s))] }
     if (code === 'STOCK_INSUFFICIENT') {
       s.data.cart = []
@@ -355,6 +361,9 @@ async function placePreorder(c, s, cust) {
   if (!r.ok) {
     if (r.error.code === 'PREORDER_FULL') return { replies: [text('Sorry, that week just filled up.'), ...(await bookSummary(c, s))] }
     if (r.error.code === 'INVALID_WEEK') return { replies: [text('Sorry, that week is no longer open for booking.'), ...(await bookWeeks(c, s))] }
+    if (r.error.code === 'UNPAID_PREORDER_EXISTS') {
+      return { replies: [text(`You already have an unpaid booking, ${r.error.extra.number}. Pay for it with the link we sent, or send *my orders* to cancel it. Then you can book again.`), MENU] }
+    }
     return { replies: [text(`Sorry, we couldn't book that: ${r.error.message}`), MENU] }
   }
   const booked = r.value
@@ -643,7 +652,7 @@ async function deliver(send, phone, replies) {
     try {
       await send(phone, r)
     } catch (err) {
-      logger.error({ err, phone }, 'WhatsApp chat reply failed')
+      logger.error({ err, phone: maskPhone(phone) }, 'WhatsApp chat reply failed')
     }
   }
 }
@@ -683,6 +692,13 @@ export async function handleWhatsAppWebhook(body, opts = {}) {
             const pay = { id: st.payment.transaction?.id ?? null, amount: st.payment.amount?.value ?? null, currency: st.payment.currency ?? null, method: st.payment.transaction?.method?.type ?? 'whatsapp' }
             await tx((c) => applyCapture(c, 'orders', rows[0].id, pay))
             handled++
+          } else {
+            // PAY-B7: money taken for an order we can't find: staff must see it.
+            await recordWebhookFailure(
+              'whatsapp',
+              `WhatsApp payment ${st.payment.transaction?.id ?? '(no id)'} captured for reference ${String(st.payment.reference_id).slice(0, 60)}, which matches no order`,
+              st.id ?? st.payment.transaction?.id ?? null,
+            )
           }
         }
       }

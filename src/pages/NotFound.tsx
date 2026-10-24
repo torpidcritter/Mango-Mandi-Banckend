@@ -1,8 +1,10 @@
 import { Link } from 'react-router-dom'
 import { homeFor } from '../permissions'
 import { useSession } from '../session'
+import { usePageTitle } from '../ui'
 
 export default function NotFound({ notAllowed = false }: { notAllowed?: boolean }) {
+  usePageTitle(notAllowed ? 'Not available for your role' : 'Page not found')
   const { me } = useSession()
   return (
     <div className="card">

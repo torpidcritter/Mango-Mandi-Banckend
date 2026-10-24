@@ -1,6 +1,7 @@
 # Nightly encrypted copy of the production database, kept outside Neon.
-# Neon's own history covers the last 7 days; this covers Neon itself being
-# unavailable, or a mistake noticed after the history window.
+# Neon's own history covers its restore window (1 day by default on paid
+# plans; deploy/VERCEL.md step 1.5 raises it to 7); this covers Neon itself
+# being unavailable, or a mistake noticed after the history window.
 #
 # Needs two repository secrets (Settings > Secrets and variables > Actions):
 #   BACKUP_DATABASE_URL     Neon main, direct (no -pooler) connection, read-only role
@@ -8,6 +9,15 @@
 # Without them the job fails (BACKUP_DISABLED=true as a repository variable
 # skips it on purpose). Each dump is kept 30 days as a workflow
 # artifact. Decrypt with: gpg --decrypt mango-....dump.gpg > mango.dump
+#
+# OPS-23: a third secret makes the app notice a missed backup:
+#   BACKUP_HEARTBEAT_DATABASE_URL  Neon main, logged in as a role that can only
+#                                  write the 'backup' heartbeat (grants in
+#                                  mango-api/ops/backup-heartbeat.sh)
+# The last step records the outcome; with BACKUP_HEARTBEAT_EXPECTED=true on
+# the API, Needs attention and Sentry warn after 26 hours without a backup,
+# including when GitHub stops running this schedule (it pauses scheduled
+# workflows in a repository with no activity for 60 days).
 name: Backup
 
 on:
@@ -25,6 +35,7 @@ jobs:
     env:
       BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
       BACKUP_GPG_PUBLIC_KEY: ${{ secrets.BACKUP_GPG_PUBLIC_KEY }}
+      HEARTBEAT_DATABASE_URL: ${{ secrets.BACKUP_HEARTBEAT_DATABASE_URL }}
     steps:
       # A missing secret fails the run (red in Actions, an email to the repo
       # owner): a green run must mean a backup was taken. A fork or a copy
@@ -66,3 +77,15 @@ jobs:
           path: backups/*.gpg
           retention-days: 30
           if-no-files-found: error
+      # Last: tell the app a backup was taken, so it can warn when they stop.
+      - name: Record the backup in the app
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          if [ -z "$HEARTBEAT_DATABASE_URL" ]; then
+            echo "::warning::Backup taken but not recorded in the app: set the BACKUP_HEARTBEAT_DATABASE_URL secret (see mango-api/ops/backup-heartbeat.sh)."
+            exit 0
+          fi
+          ./mango-api/ops/backup-heartbeat.sh ok
+      - name: Record the failed backup in the app
+        if: failure() && steps.check.outputs.ready == 'true' && env.HEARTBEAT_DATABASE_URL != ''
+        run: ./mango-api/ops/backup-heartbeat.sh error "backup failed in the GitHub backup workflow"

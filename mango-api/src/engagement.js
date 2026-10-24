@@ -9,7 +9,6 @@ import { newId } from './ids.js'
 import { availabilityByDate } from './inventory.js'
 import { enqueue, enqueueAlert } from './notify.js'
 import { findProduct, sellable } from './products.js'
-import { readyOnFor, storageTip } from './ripeness.js'
 import { STAGES } from './stage.js'
 
 export const MAX_OPEN_ALERTS = 10

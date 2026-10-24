@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures'
+import { expect, openNavTo, test } from './fixtures'
 
 // The §10 acceptance script against a real, seeded mango-api.
 // Skips unless E2E_EMAIL / E2E_PASSWORD are set. CI runs it against mango-api.
@@ -19,7 +19,7 @@ test('a day in the life of the warehouse', async ({ page }, testInfo) => {
   await expect(page.getByRole('heading', { name: 'Today' })).toBeVisible()
 
   // 2. Receive an Alphonso batch; it shows "No QC" until QC is logged.
-  await page.getByRole('link', { name: 'Batches' }).click()
+  await (await openNavTo(page, 'Batches')).click()
   await page.getByRole('button', { name: 'Receive batch' }).click()
   const dialog = page.getByRole('dialog', { name: 'Receive batch' })
   await dialog.getByLabel('Variety').selectOption('Alphonso')
@@ -27,12 +27,16 @@ test('a day in the life of the warehouse', async ({ page }, testInfo) => {
   await dialog.getByRole('button', { name: 'Receive batch' }).click()
   await expect(page).toHaveURL(/\/batches\/[^/?]+\?focusQC=1/)
   const batchUrl = page.url().split('?')[0]
-  await page.getByRole('link', { name: 'Batches' }).click()
+  // The new batch page moves focus to its QC form once it loads; wait for that, or it would close
+  // a menu opened a moment before (phone).
+  await expect.poll(() => page.evaluate(() => document.activeElement?.closest('form') != null)).toBe(true)
+  await (await openNavTo(page, 'Batches')).click()
   await expect(page.getByText('No QC: not sellable yet').first()).toBeVisible()
 
   // 3. Advance the batch to Selling and log QC Ripe/Good.
   await page.goto(batchUrl)
   await page.getByRole('button', { name: 'Skip to Selling' }).click()
+  await page.getByRole('dialog', { name: 'Skip to Selling?' }).getByRole('button', { name: 'Move to Selling' }).click()
   await expect(page.getByText('Batch moved to Selling')).toBeVisible()
   await page.getByLabel('Ripe', { exact: true }).check()
   await page.getByLabel('Good').check()
@@ -76,7 +80,7 @@ test('a day in the life of the warehouse', async ({ page }, testInfo) => {
   await page.goto(`/orders/${placed.orderId}`)
   await expect(page.getByRole('heading', { name: `Order ${placed.number}` })).toBeVisible()
   await page.getByRole('button', { name: 'Start processing' }).click()
-  await page.getByRole('button', { name: 'Allocate and pack' }).click()
+  await page.getByRole('button', { name: 'Allocate stock' }).click()
   await expect(page.getByText('Stock allocated. Pick list is ready.')).toBeVisible()
   for (const label of ['Mark packed', 'Mark shipped', 'Out for delivery']) {
     await page.getByRole('button', { name: label, exact: true }).click()
@@ -92,9 +96,10 @@ test('a day in the life of the warehouse', async ({ page }, testInfo) => {
 
   // 10–12. The customer claims damage; ops approve a free replacement (MandiMangoes never refunds).
   await call('POST', '/v1/claims', { orderId: placed.orderId, issueType: 'DAMAGED', description: 'Box arrived crushed', itemSkus: [pick.sku] }, cust)
-  await page.getByRole('link', { name: 'Claims' }).click()
+  await (await openNavTo(page, 'Claims')).click()
   await page.getByRole('button', { name: `Start review for ${placed.number}` }).click()
   await page.getByRole('button', { name: `Resolve ${placed.number}` }).click()
+  await page.getByRole('dialog').getByLabel(/Replacement/).check()
   await page.getByRole('dialog').getByRole('button', { name: 'Approve replacement' }).click()
   await page.getByRole('button', { name: 'Resolved', exact: true }).click()
   // Both viewports run at once against one API, so pick this run's claim card.
@@ -105,7 +110,7 @@ test('a day in the life of the warehouse', async ({ page }, testInfo) => {
   await expect(page.getByText(`Free replacement for order ${placed.number}`)).toBeVisible()
 
   // 13. Planning reads live coverage, the calendar and the selling rules.
-  await page.getByRole('link', { name: 'Planning' }).click()
+  await (await openNavTo(page, 'Planning')).click()
   await expect(page.getByRole('heading', { name: 'Stock by delivery date' })).toBeVisible()
   await expect(page.getByRole('region', { name: /^Stock for/ }).first()).toBeVisible()
   await expect(page.getByText(/^Version \d+$/)).toBeVisible()

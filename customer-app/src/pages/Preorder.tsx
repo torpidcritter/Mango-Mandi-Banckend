@@ -1,13 +1,14 @@
 // Booking ahead: a box for a delivery week before the fruit is in, at today's
 // price, paid in full by a Razorpay payment link. We pick the day in that week
 // once the fruit is in, and the booking becomes a normal order.
-import { useMemo, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ApiError, api, errorMessage, type Preorder, type PreorderStatus, type PreorderWeek, type Stage } from '../api'
+import { ApiError, api, errorMessage, type Preorder, type PreorderStatus, type PreorderWeek, type SavedAddress, type Stage } from '../api'
 import { PREORDER_LABEL, STAGE_HINT, STAGE_LABEL, rupees, week, when } from '../format'
 import { useStore } from '../store'
-import { Dialog, ErrorNote, Spinner } from '../ui'
+import { AddressPicker, DayChips, Field, Stepper } from '../forms'
+import { ConfirmDialog, DocTitle, ErrorNote, PageHeader, Spinner } from '../ui'
 import { AddPhoneCard } from '../auth-ui'
 
 const STAGES: Stage[] = ['RAW', 'SEMI_RIPE', 'RIPE']
@@ -20,27 +21,35 @@ function loadAddress() {
   }
 }
 
+/** What a signed-out visitor filled in, kept for this tab while they sign in, then put back. */
+interface Draft {
+  weekStart: string
+  sku: string
+  stage: Stage
+  qty: number
+  name: string
+  address: string
+  pincode: string
+}
+const DRAFT_KEY = 'mm.bookDraft'
+function readDraft(): Draft | null {
+  try {
+    const raw = sessionStorage.getItem(DRAFT_KEY)
+    return raw ? (JSON.parse(raw) as Draft) : null
+  } catch {
+    return null
+  }
+}
+function keepDraft(d: Draft) {
+  try {
+    sessionStorage.setItem(DRAFT_KEY, JSON.stringify(d))
+  } catch {
+    // ignore: the form starts empty after sign-in
+  }
+}
+
 /** The dev API hands out fake payment links; those are paid with test buttons instead. */
 const isDevLink = (url: string | null) => Boolean(url?.includes('plink_dev_'))
-
-/** Shop home: shown while any week is open for booking. */
-export function BookAheadCard() {
-  const q = useQuery({ queryKey: ['preorder-weeks'], queryFn: api.preorderWeeks, staleTime: 60_000 })
-  const weeks = [...new Set(q.data?.weeks.map((w) => w.weekStart) ?? [])]
-  if (!weeks.length) return null
-  return (
-    <section className="card book-ahead" aria-labelledby="book-ahead">
-      <h2 id="book-ahead">Book ahead</h2>
-      <p>
-        Lock in today's price for the week of {week(weeks[0])}
-        {weeks.length > 1 && ' or later'}. We pick your delivery day that week once the fruit is in.
-      </p>
-      <Link to="/preorder" className="btn btn-primary">
-        Book a box ahead
-      </Link>
-    </section>
-  )
-}
 
 export default function BookAhead() {
   const { profile } = useStore()
@@ -65,26 +74,68 @@ export default function BookAhead() {
 function BookForm({ weeks, cancelPolicy, onStale }: { weeks: PreorderWeek[]; cancelPolicy: string; onStale: () => void }) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { pincode: shopPincode } = useStore()
+  const { pincode: shopPincode, profile } = useStore()
   const saved = useRef(loadAddress())
   const starts = useMemo(() => [...new Set(weeks.map((w) => w.weekStart))], [weeks])
-  const [weekStart, setWeekStart] = useState(starts[0])
+  // Back from signing in: the visitor's choices, if their week is still open.
+  const [d] = useState(() => {
+    const draft = readDraft()
+    return draft && starts.includes(draft.weekStart) ? draft : null
+  })
+  // Used once: read during render, removed after.
+  useEffect(() => {
+    try {
+      sessionStorage.removeItem(DRAFT_KEY)
+    } catch {
+      // ignore
+    }
+  }, [])
+  const [weekStart, setWeekStart] = useState(d?.weekStart ?? starts[0])
   const inWeek = weeks.filter((w) => w.weekStart === weekStart)
-  const [sku, setSku] = useState(inWeek[0]?.sku ?? '')
+  const [sku, setSku] = useState(d && inWeek.some((w) => w.sku === d.sku) ? d.sku : (inWeek[0]?.sku ?? ''))
   const pick = inWeek.find((w) => w.sku === sku) ?? inWeek[0]
-  const [stage, setStage] = useState<Stage>('SEMI_RIPE')
-  const [qty, setQty] = useState(1)
-  const [name, setName] = useState(saved.current.name ?? '')
-  const [address, setAddress] = useState(saved.current.address ?? '')
-  const [pincode, setPincode] = useState(shopPincode ?? '')
-  const [formError, setFormError] = useState<string | null>(null)
+  const [stage, setStage] = useState<Stage>(d?.stage ?? 'SEMI_RIPE')
+  const [qty, setQty] = useState(d?.qty ?? 1)
+  const [name, setName] = useState(d?.name ?? saved.current.name ?? '')
+  const [address, setAddress] = useState(d?.address ?? saved.current.address ?? '')
+  const [pincode, setPincode] = useState(d?.pincode ?? shopPincode ?? '')
+  const [formError, setFormError] = useState<{ at: 'pincode' | 'address'; message: string } | null>(null)
+
+  // The addresses this account ordered to before, as at checkout. Picking one fills in its pincode too.
+  const book = useQuery({ queryKey: ['addresses'], queryFn: api.addresses, staleTime: 60_000, enabled: Boolean(profile) })
+  const addresses = book.data ?? []
+  const [picked, setPicked] = useState<string | null>(null)
+  const typedOwn = useRef(Boolean(d))
+  const squash = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim()
+  if (!typedOwn.current && picked === null && addresses.length) {
+    // Start from the address used last time (or the most recent saved one).
+    const here = addresses.filter((a) => !/^\d{6}$/.test(pincode) || a.pincode === pincode)
+    const match = address.trim() ? here.find((a) => squash(a.address) === squash(address)) : here[0]
+    typedOwn.current = true
+    if (match) fillFrom(match)
+  }
+  function fillFrom(a: SavedAddress) {
+    setPicked(a.id)
+    setAddress(a.address)
+    setPincode(a.pincode)
+    if (a.name && !name) setName(a.name)
+  }
+  const chooseAddress = (id: string | null) => {
+    typedOwn.current = true
+    const a = addresses.find((x) => x.id === id)
+    if (a) return fillFrom(a)
+    setPicked(null)
+    setAddress('')
+  }
+  // The picker names the pincode, since saved addresses can be in different places.
+  const shownAddresses = addresses.map((a) => ({ ...a, address: `${a.address}, ${a.pincode}` }))
   const idemKey = useRef(crypto.randomUUID())
 
   const waitlist = pick.remaining === 0
   const max = waitlist ? 20 : Math.min(20, pick.remaining)
   const boxes = Math.min(qty, max)
 
-  const book = useMutation({
+  const bookIt = useMutation({
     mutationFn: () =>
       api.bookPreorder(
         { sku: pick.sku, stage, qty: boxes, weekStart, pincode, address: address.trim(), name: name.trim() || undefined, waitlist },
@@ -125,9 +176,20 @@ function BookForm({ weeks, cancelPolicy, onStale }: { weeks: PreorderWeek[]; can
   function submit(e: FormEvent) {
     e.preventDefault()
     setFormError(null)
-    if (!/^\d{6}$/.test(pincode)) return setFormError('Enter your 6-digit pincode.')
-    if (address.trim().length < 10) return setFormError('Enter the full delivery address, with house number and landmark.')
-    book.mutate()
+    if (address.trim().length < 10) {
+      setFormError({ at: 'address', message: 'Enter the full delivery address, with house number and landmark.' })
+      return requestAnimationFrame(() => document.getElementById('pre-address')?.focus())
+    }
+    if (!/^\d{6}$/.test(pincode)) {
+      setFormError({ at: 'pincode', message: 'Enter your 6-digit pincode.' })
+      return requestAnimationFrame(() => document.getElementById('pre-pincode')?.focus())
+    }
+    if (!profile) {
+      // Signing in comes only now, when booking: keep what was filled in for the way back.
+      keepDraft({ weekStart, sku: pick.sku, stage, qty: boxes, name: name.trim(), address: address.trim(), pincode })
+      return navigate(`/sign-in?next=${encodeURIComponent('/preorder')}`)
+    }
+    bookIt.mutate()
   }
 
   return (
@@ -137,13 +199,7 @@ function BookForm({ weeks, cancelPolicy, onStale }: { weeks: PreorderWeek[]; can
       <form onSubmit={submit} noValidate>
         <fieldset className="field">
           <legend>Delivery week</legend>
-          <div className="chips" role="radiogroup" aria-label="Delivery week">
-            {starts.map((w) => (
-              <button key={w} type="button" role="radio" aria-checked={w === weekStart} className="chip" onClick={() => choose({ weekStart: w })}>
-                {week(w)}
-              </button>
-            ))}
-          </div>
+          <DayChips label="Delivery week" days={starts} value={weekStart} format={week} onChange={(w) => choose({ weekStart: w })} />
         </fieldset>
 
         <fieldset className="field">
@@ -183,39 +239,34 @@ function BookForm({ weeks, cancelPolicy, onStale }: { weeks: PreorderWeek[]; can
         </fieldset>
 
         <div className="field">
-          <span className="label" id="qty-label">
-            Boxes
-          </span>
-          <div className="stepper" role="group" aria-labelledby="qty-label">
-            <button type="button" onClick={() => setQty(Math.max(1, boxes - 1))} disabled={boxes <= 1} aria-label="One box less">
-              −
-            </button>
-            <span aria-live="polite">{boxes}</span>
-            <button type="button" onClick={() => setQty(Math.min(max, boxes + 1))} disabled={boxes >= max} aria-label="One box more">
-              +
-            </button>
-          </div>
+          <Stepper label="Boxes" showLabel value={boxes} min={1} max={max} onChange={setQty} lessLabel="One box less" moreLabel="One box more" />
         </div>
 
-        <div className="field">
-          <label htmlFor="pre-name">Your name</label>
-          <input id="pre-name" autoComplete="name" maxLength={80} value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        <div className="field">
-          <label htmlFor="pre-address">Delivery address</label>
-          <textarea id="pre-address" autoComplete="street-address" rows={3} maxLength={500} value={address} onChange={(e) => setAddress(e.target.value)} />
-        </div>
-        <div className="field">
-          <label htmlFor="pre-pincode">Pincode</label>
-          <input
-            id="pre-pincode"
-            inputMode="numeric"
-            autoComplete="postal-code"
-            maxLength={6}
-            value={pincode}
-            onChange={(e) => setPincode(e.target.value.replace(/\D/g, ''))}
+        <Field id="pre-name" label="Your name">
+          <input autoComplete="name" maxLength={80} value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
+        <AddressPicker addresses={shownAddresses} value={picked} onChange={chooseAddress} />
+        <Field
+          id="pre-address"
+          label="Delivery address"
+          hint="House or flat number, street, area and a landmark."
+          error={formError?.at === 'address' ? formError.message : null}
+          hidden={picked !== null}
+        >
+          <textarea
+            autoComplete="street-address"
+            rows={3}
+            maxLength={500}
+            value={address}
+            onChange={(e) => {
+              typedOwn.current = true
+              setAddress(e.target.value)
+            }}
           />
-        </div>
+        </Field>
+        <Field id="pre-pincode" label="Pincode" error={formError?.at === 'pincode' ? formError.message : null} hidden={picked !== null}>
+          <input inputMode="numeric" autoComplete="postal-code" maxLength={6} value={pincode} onChange={(e) => setPincode(e.target.value.replace(/\D/g, ''))} />
+        </Field>
 
         <div className="total-row">
           <span>
@@ -228,14 +279,28 @@ function BookForm({ weeks, cancelPolicy, onStale }: { weeks: PreorderWeek[]; can
         ) : (
           <p className="muted small">{cancelPolicy}</p>
         )}
-        {(formError || book.error) && (
+        {bookIt.error && (
           <p className="field-error" role="alert">
-            {formError ?? errorMessage(book.error)}
+            {errorMessage(bookIt.error)}
           </p>
         )}
-        <button type="submit" className="btn btn-primary btn-block" disabled={book.isPending}>
-          {book.isPending ? 'Booking…' : waitlist ? 'Join the waitlist' : `Book and pay ${rupees(pick.price * boxes)}`}
+        {bookIt.error instanceof ApiError && bookIt.error.code === 'UNPAID_PREORDER_EXISTS' && typeof bookIt.error.detail.preorderId === 'string' && (
+          <Link to={`/preorders/${bookIt.error.detail.preorderId}`} className="btn btn-block">
+            Open your unpaid booking
+          </Link>
+        )}
+        <button type="submit" className="btn btn-primary btn-block" disabled={bookIt.isPending}>
+          {!profile
+            ? waitlist
+              ? 'Sign in to join the waitlist'
+              : 'Sign in to book'
+            : bookIt.isPending
+              ? 'Booking…'
+              : waitlist
+                ? 'Join the waitlist'
+                : `Book and pay ${rupees(pick.price * boxes)}`}
         </button>
+        {!profile && <p className="muted small center">You sign in with your mobile number, then come back here to book and pay.</p>}
       </form>
     </section>
   )
@@ -259,6 +324,7 @@ export function PreorderPage() {
     if (q.error instanceof ApiError && q.error.status === 404) {
       return (
         <section className="card">
+          <DocTitle title="Booking not found" />
           <h1>Booking not found</h1>
           <Link to="/orders">See my orders</Link>
         </section>
@@ -290,10 +356,10 @@ function PreorderView({ pre }: { pre: Preorder }) {
 
   return (
     <>
-      <div className="title-row">
-        <h1>Booking {pre.number}</h1>
+      <DocTitle title={`Booking ${pre.number}`} />
+      <PageHeader title={`Booking ${pre.number}`}>
         <PreorderPill status={pre.status} />
-      </div>
+      </PageHeader>
 
       {pre.status === 'PAYMENT_PENDING' && (
         <section className="card note-card" aria-live="polite">
@@ -359,7 +425,7 @@ function PreorderView({ pre }: { pre: Preorder }) {
               ? `Your refund of ${rupees(pre.total)} has been sent. Banks take up to 5 to 7 days to show it.`
               : pre.refund
                 ? `Your full refund of ${rupees(pre.total)} is on its way.`
-                : 'Nothing was charged.'}
+                : 'We have no payment for this booking. If money has left your account, a late payment is still matched to this booking, or refunded in full if you cancelled it.'}
           </p>
         </section>
       )}
@@ -405,23 +471,24 @@ function PreorderView({ pre }: { pre: Preorder }) {
       </Link>
 
       {cancelling && (
-        <Dialog
+        <ConfirmDialog
           title={`Cancel booking ${pre.number}?`}
+          keepLabel="Keep booking"
+          confirmLabel="Cancel booking"
+          busyLabel="Cancelling…"
+          busy={cancel.isPending}
+          error={cancel.error}
+          onConfirm={() => cancel.mutate()}
           onClose={() => setCancelling(false)}
-          footer={
-            <>
-              <button type="button" className="btn" data-autofocus onClick={() => setCancelling(false)}>
-                Keep booking
-              </button>
-              <button type="button" className="btn btn-danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}>
-                {cancel.isPending ? 'Cancelling…' : 'Cancel booking'}
-              </button>
-            </>
-          }
         >
-          <p>{paid ? `You'll get a full refund of ${rupees(pre.total)} to the way you paid.` : 'Nothing has been charged for this booking.'}</p>
-          {cancel.error && <p className="field-error">{errorMessage(cancel.error)}</p>}
-        </Dialog>
+          <p>
+            {paid
+              ? `You'll get a full refund of ${rupees(pre.total)} to the way you paid.`
+              : pre.status === 'WAITLISTED'
+                ? 'Nothing is charged while you are on the waitlist.'
+                : 'No payment has reached us for this booking. If you have just paid, cancelling refunds it in full.'}
+          </p>
+        </ConfirmDialog>
       )}
     </>
   )

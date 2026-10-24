@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { PROFILE_EVENT, SIGNOUT_EVENT, signedInProfile, type Profile, type Stage } from './api'
 
 export interface CartLine {
@@ -61,20 +61,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // Stable setters and a value that only changes when its parts do, so a change to one part
+  // (say the cart) does not hand every reader of the store a new object for nothing.
   const setWhere = useCallback((pincode: string | null, date: string | null) => setWhereState({ pincode, date }), [])
-  const store: Store = {
-    pincode: where.pincode,
-    date: where.date,
-    setWhere,
-    cart,
-    setQty: (line, qty) =>
+  const setQty = useCallback(
+    (line: Omit<CartLine, 'qty'>, qty: number) =>
       setCart((c) => {
         const rest = c.filter((l) => !(l.sku === line.sku && l.stage === line.stage))
         return qty > 0 ? [...rest, { ...line, qty }].sort((a, b) => a.name.localeCompare(b.name) || a.stage.localeCompare(b.stage)) : rest
       }),
-    clearCart: () => setCart([]),
-    profile,
-  }
+    [],
+  )
+  const clearCart = useCallback(() => setCart([]), [])
+  const store = useMemo<Store>(
+    () => ({ pincode: where.pincode, date: where.date, setWhere, cart, setQty, clearCart, profile }),
+    [where, setWhere, cart, setQty, clearCart, profile],
+  )
   return <Ctx.Provider value={store}>{children}</Ctx.Provider>
 }
 

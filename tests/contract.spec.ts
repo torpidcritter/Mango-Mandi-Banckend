@@ -29,10 +29,15 @@ function mergeSamples(items: Json[]): Json {
   return merged
 }
 
-/** Where the real value does not match the mock's shape. */
-export function drift(real: unknown, mock: unknown, at = '$', out: string[] = []): string[] {
+/**
+ * Where the real value does not match the mock's shape. A null from the API is
+ * allowed (the field may be null); a null in the mock pins no type, so when the
+ * API sends a value there the path goes into `unchecked`, to be reported.
+ */
+export function drift(real: unknown, mock: unknown, at = '$', out: string[] = [], unchecked: string[] = []): string[] {
   const r = kind(real)
   const m = kind(mock)
+  if (m === 'null' && r !== 'null') unchecked.push(at)
   if (r === 'null' || m === 'null') return out
   if (r !== m) {
     out.push(`${at}: the API sends ${r}, the mock ${m}`)
@@ -40,7 +45,7 @@ export function drift(real: unknown, mock: unknown, at = '$', out: string[] = []
   }
   if (m === 'array') {
     const sample = mergeSamples(mock as Json[])
-    if (sample !== null) for (const [i, item] of (real as unknown[]).entries()) drift(item, sample, `${at}[${i}]`, out)
+    if (sample !== null) for (const [i, item] of (real as unknown[]).entries()) drift(item, sample, `${at}[${i}]`, out, unchecked)
     return out
   }
   if (m === 'object') {
@@ -50,7 +55,7 @@ export function drift(real: unknown, mock: unknown, at = '$', out: string[] = []
         // Mock maps keyed by data (status counts, dates) need not have every key on the server.
         if (KEYED_BY_DATA.some((re) => re.test(`${at}.${k}`))) continue
         out.push(`${at}.${k}: missing from the API`)
-      } else drift(ro[k], v, `${at}.${k}`, out)
+      } else drift(ro[k], v, `${at}.${k}`, out, unchecked)
     }
   }
   return out
@@ -105,13 +110,19 @@ test('the mock answers in the shapes the real API sends', async ({ request }) =>
 
   const problems: string[] = []
   const empty: string[] = []
+  const nullInMock = new Set<string>()
   for (const [path, sample] of reads) {
     const real = await get(path)
     if (Array.isArray(real) && !real.length) empty.push(path)
-    for (const p of drift(real, sample)) problems.push(`GET ${path} ${p}`)
+    const unchecked: string[] = []
+    for (const p of drift(real, sample, '$', [], unchecked)) problems.push(`GET ${path} ${p}`)
+    // One entry per field, not per list item.
+    for (const u of unchecked) nullInMock.add(`GET ${path} ${u.replace(/\[\d+\]/g, '[]')}`)
   }
   // An empty list proves nothing about its items: say which ones went unchecked.
   if (empty.length) test.info().annotations.push({ type: 'unchecked (empty on the server)', description: empty.join(', ') })
+  // Nor does a null in the mock where the API sends a value: give the mock a value there to check it.
+  if (nullInMock.size) test.info().annotations.push({ type: 'unchecked (null in the mock)', description: [...nullInMock].join(', ') })
   expect(problems).toEqual([])
 })
 
@@ -121,4 +132,8 @@ test('drift() catches a renamed, missing or retyped field', () => {
   expect(drift({ a: '1' }, { a: 1 })).toEqual(['$.a: the API sends string, the mock number'])
   expect(drift([{ a: 1 }, { a: null }], [{ a: 2 }])).toEqual([])
   expect(drift({ list: [{ a: { b: 1 } }] }, { list: [{ a: { b: true } }] })).toEqual(['$.list[0].a.b: the API sends number, the mock boolean'])
+  // A null in the mock checks nothing, and says so.
+  const unchecked: string[] = []
+  expect(drift({ a: { b: 1 }, c: null }, { a: null, c: null }, '$', [], unchecked)).toEqual([])
+  expect(unchecked).toEqual(['$.a'])
 })

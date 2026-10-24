@@ -41,7 +41,7 @@ describe('deleting an account', () => {
     assert.equal(order.delivery_address, null)
     assert.ok(order.total > 0)
     assert.equal((await query('SELECT COUNT(*)::int AS n FROM carts WHERE customer_id = $1', [cust.customer.id])).rows[0].n, 0)
-    assert.equal((await api.get('/v1/me', { token: cust.accessToken })).status, 404)
+    assert.equal((await api.get('/v1/me', { token: cust.accessToken })).status, 401)
 
     // The same number can make a new, empty account.
     const again = await customerToken(api, '9876501234')

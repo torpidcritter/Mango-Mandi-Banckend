@@ -1,6 +1,7 @@
 import './setup-env.js'
 import { createHmac } from 'node:crypto'
 import { createApp } from '../src/app.js'
+import { drainBackground } from '../src/background.js'
 import { addDays, now, setNow, todayIST } from '../src/clock.js'
 import { loadConfig } from '../src/config.js'
 import { pool, query } from '../src/db.js'
@@ -14,6 +15,8 @@ import { seed } from '../src/seed.js'
 export const T0 = '2026-10-15T04:30:00Z'
 
 export async function resetDb() {
+  // Work a test left running after a response (refunds after a webhook) must not race the schema reset.
+  await drainBackground()
   setNow(T0)
   await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
   await runMigrations()

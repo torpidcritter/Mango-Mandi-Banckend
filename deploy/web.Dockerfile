@@ -7,6 +7,9 @@ COPY . .
 ARG VITE_API_URL
 RUN test -n "$VITE_API_URL" || (echo "VITE_API_URL build arg is required" && exit 1)
 ENV VITE_API_URL=$VITE_API_URL
+# The shop's help WhatsApp number; the shop build stops with a clear message without it.
+ARG VITE_SUPPORT_WHATSAPP
+ENV VITE_SUPPORT_WHATSAPP=$VITE_SUPPORT_WHATSAPP
 RUN npm run build && npm run shop:build
 
 FROM caddy:2.8-alpine

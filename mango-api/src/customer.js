@@ -3,29 +3,30 @@
 import { createHash, randomInt, timingSafeEqual } from 'node:crypto'
 import express from 'express'
 import { z } from 'zod'
-import { ACCESS_TTL_S, issueRefresh, refreshLimiter, requireCustomer, revokeRefresh, rotateRefresh, sameSiteOnly, signAccess } from './auth.js'
+import { ACCESS_TTL_S, forgetCustomer, issueRefresh, refreshLimiter, requireCustomer, revokeRefresh, rotateRefresh, sameSiteOnly, signAccess } from './auth.js'
 import { isDate, now, todayIST } from './clock.js'
 import { getConfig } from './config.js'
 import { query, tx } from './db.js'
 import { customerDelivery, customerPhoto } from './delivery-proof.js'
-import { activeSlots, earliestDeliveryDate, orderableDates, slotsForDate, slotView } from './delivery.js'
+import { activeSlots, checkCapacity, earliestDeliveryDate, orderableDates, slotsForDate, slotView } from './delivery.js'
 import { env, isProd } from './env.js'
 import { asyncHandler, badRequest, conflict, HttpError, notFound, parse, StockError, unauthorized } from './errors.js'
 import { newId } from './ids.js'
 import { availability, availabilityByDate } from './inventory.js'
 import { logger } from './logger.js'
 import { metrics } from './metrics.js'
-import { createOrder, customerCancel, eatByFor, moveOrderToDate, processPayment, SYSTEM } from './orders.js'
-import { createGatewayOrder, devGateway, reconcilePendingPayments, refundDuplicatePayments, refundOrder } from './payments.js'
+import { checkUnpaidLimit, createOrder, HOLD_EXPIRED_REASON, customerCancel, MAX_DELIVERY_ATTEMPTS, eatByFor, moveOrderToDate, processPayment, SYSTEM } from './orders.js'
+import { enqueue } from './notify.js'
+import { createGatewayOrder, devGateway, reconcileOrderNow, reconcilePendingPayments, refundsFor, sendDueRefunds, verifyCheckoutSignature } from './payments.js'
 import { findProduct, sellable, shopProducts } from './products.js'
-import { bookPreorder, cancelPreorder, ensurePaymentLink, openWeeks, preorderView, processPreorderPayment, refundPreorder } from './preorders.js'
-import { hit, sharedLimiter } from './ratelimit.js'
+import { bookPreorder, cancelPreorder, ensurePaymentLink, openWeeks, preorderView, processPreorderPayment } from './preorders.js'
+import { hit, OTP_IP_WINDOW_MS, otpIpLimit, sharedLimiter } from './ratelimit.js'
 import { reportProblem } from './sentry.js'
 import { sendOtp } from './sms.js'
 import { googleOn, verifyGoogleCredential } from './google.js'
 import { STAGES } from './stage.js'
 import { applyPromo, recordRedemption } from './promos.js'
-import { checkPhoto, dropPhoto, isOwnPhotoUrl, MAX_PHOTO_BYTES, sendPhoto, storePhoto } from './photos.js'
+import { checkPhoto, cleanImage, dropPhoto, isOwnPhotoUrl, MAX_PHOTO_BYTES, photoWidth, sendPhoto, sendPublicPhoto, storePhoto } from './photos.js'
 import { customerReviews } from './review-routes.js'
 import { eraseCustomer } from './privacy.js'
 import { requireHuman } from './turnstile.js'
@@ -35,8 +36,8 @@ import { readyOnFor } from './ripeness.js'
 export const router = express.Router()
 
 // Per address, counted in Postgres so every serverless instance shares it.
-// Outside production it is loose, so test runs don't trip it.
-const otpLimiter = sharedLimiter('otp-ip', { windowMs: 15 * 60_000, limit: isProd ? 30 : 300 })
+// High enough for a carrier NAT address at a launch spike (ratelimit.js otpIpLimit).
+const otpLimiter = sharedLimiter('otp-ip', { windowMs: OTP_IP_WINDOW_MS, limit: otpIpLimit() })
 
 /** Claims a customer can raise in 30 days from the app. */
 const MAX_CLAIMS_PER_MONTH = 3
@@ -74,6 +75,10 @@ async function checkOtpBudget(phone, ip) {
     throw new HttpError(429, 'OTP_LIMIT', 'Too many codes for this number today. Sign in with Google, or try again tomorrow.')
   }
   const known = (await query('SELECT 1 FROM customers WHERE phone = $1 AND deleted_at IS NULL', [phone])).rowCount > 0
+  // SEC-07, a known trade-off: while new numbers are paused, the 503 below tells a watcher
+  // that a number has no account. Answering everyone alike would lock existing customers out
+  // during an SMS-pumping attack, or claim a code was sent when it wasn't. It lasts only while
+  // the budget is spent (Sentry is told). See README "Security and privacy notes".
   if (!known) {
     const share = Math.ceil(env.OTP_DAILY_LIMIT * env.OTP_NEW_NUMBER_SHARE)
     const fresh = await hit(`otp-day-new:${day}`, DAY_MS)
@@ -100,7 +105,15 @@ const phoneSchema = z
 
 const otpRequest = z.object({ phone: phoneSchema, channel: z.enum(['sms', 'whatsapp']).optional(), captchaToken: z.string().max(2048).optional() })
 
-const hashOtp = (phone, code) => createHash('sha256').update(`${env.JWT_SECRET}:${phone}:${code}`).digest()
+// SEC-13: OTP_PEPPER keeps login-code hashes apart from the token key. Codes are checked against
+// JWT_SECRET too, so setting OTP_PEPPER doesn't break codes sent in the five minutes before.
+const peppers = () => [...new Set([env.OTP_PEPPER, env.JWT_SECRET].filter(Boolean))]
+const hashOtp = (phone, code, pepper = peppers()[0]) => createHash('sha256').update(`${pepper}:${phone}:${code}`).digest()
+const otpMatches = (stored, phone, code) => {
+  const want = Buffer.from(stored, 'hex')
+  // Every pepper is tried (no early exit), so the time taken doesn't say which one matched.
+  return peppers().map((p) => want.length === 32 && timingSafeEqual(want, hashOtp(phone, code, p))).some(Boolean)
+}
 
 // ---------------------------------------------------------------- auth
 
@@ -118,7 +131,8 @@ async function issueCode(phone, channel, ip) {
     [phone, hashOtp(phone, code).toString('hex'), new Date(at.getTime() + OTP_TTL_MS), at],
   )
   const via = await sendOtp(phone, code, channel)
-  return isProd ? { sent: true, channel: via } : { sent: true, channel: via, devCode: code }
+  // SEC-01: never in production, and not when the shop is on a public link (start-local --phone).
+  return isProd || !env.OTP_CODE_IN_RESPONSE ? { sent: true, channel: via } : { sent: true, channel: via, devCode: code }
 }
 
 /** Checks a code inside a transaction. Returns an error to throw after commit (so wrong tries count), or null. */
@@ -127,7 +141,7 @@ async function consumeCode(c, phone, code) {
   const otp = rows[0]
   if (!otp || otp.expires_at <= now()) return unauthorized('This code has expired. Request a new one.', 'OTP_EXPIRED')
   if (otp.attempts >= OTP_MAX_ATTEMPTS) return unauthorized('Too many wrong codes. Request a new one.', 'OTP_LOCKED')
-  if (!timingSafeEqual(Buffer.from(otp.code, 'hex'), hashOtp(phone, code))) {
+  if (!otpMatches(otp.code, phone, code)) {
     await c.query('UPDATE otps SET attempts = attempts + 1 WHERE phone = $1', [phone])
     return unauthorized('Incorrect code', 'OTP_INVALID')
   }
@@ -140,7 +154,8 @@ router.post(
   otpLimiter,
   asyncHandler(async (req, res) => {
     const { phone, channel, captchaToken } = parse(otpRequest, req.body)
-    await requireHuman(captchaToken, req.ip)
+    const known = (await query('SELECT 1 FROM customers WHERE phone = $1', [phone])).rowCount > 0
+    await requireHuman(captchaToken, req.ip, { known })
     res.json(await issueCode(phone, channel, req.ip))
   }),
 )
@@ -154,9 +169,13 @@ const cookieMode = (req) => req.get('x-session') === 'cookie'
 
 const profile = (cu) => ({ id: cu.id, phone: cu.phone ?? null, name: cu.name ?? null, email: cu.email ?? null })
 
+/** The customer's session version: "sign out everywhere" raises it, ending access tokens already issued. */
+const sessionVersion = async (id) => (await query('SELECT session_version FROM customers WHERE id = $1', [id])).rows[0]?.session_version ?? 0
+const customerAccess = async (cu) => signAccess({ sub: cu.id, phone: cu.phone ?? null, typ: 'customer', sv: await sessionVersion(cu.id) })
+
 async function sendTokens(req, res, customer) {
   const refresh = await issueRefresh(customer.id, 'customer')
-  const body = { accessToken: signAccess({ sub: customer.id, phone: customer.phone ?? null, typ: 'customer' }), expiresIn: ACCESS_TTL_S, customer: profile(customer) }
+  const body = { accessToken: await customerAccess(customer), expiresIn: ACCESS_TTL_S, customer: profile(customer) }
   if (cookieMode(req)) {
     res.cookie(RT_COOKIE, refresh.token, { ...rtCookie(), expires: refresh.expiresAt })
     return res.json(body)
@@ -222,7 +241,7 @@ router.post(
     const { userId, refresh } = await rotateRefresh(token, 'customer')
     const { rows } = await query('SELECT id, phone, name, email FROM customers WHERE id = $1', [userId])
     if (!rows.length) throw unauthorized('Session expired. Please sign in again.', 'INVALID_TOKEN')
-    const body = { accessToken: signAccess({ sub: rows[0].id, phone: rows[0].phone, typ: 'customer' }), expiresIn: ACCESS_TTL_S, customer: profile(rows[0]) }
+    const body = { accessToken: await customerAccess(rows[0]), expiresIn: ACCESS_TTL_S, customer: profile(rows[0]) }
     if (cookieMode(req)) {
       if (refresh) res.cookie(RT_COOKIE, refresh.token, { ...rtCookie(), expires: refresh.expiresAt })
       return res.json(body)
@@ -304,12 +323,55 @@ router.get(
         const key = `${p.sku}|${stage}`
         const qty = pool.get(key) ?? 0
         return {
-          sku: p.sku, name: p.name, variety: p.variety, boxSize: p.boxSize, price: p.price, description: p.description ?? '', stage,
+          sku: p.sku, name: p.name, variety: p.variety, boxSize: p.boxSize, price: p.price, description: p.description ?? '', photoUrl: p.photoUrl, stage,
+          fruitsPerBox: p.fruitsPerBox, fruitWeightG: p.fruitWeightG,
           qty, eatBy: eatByFor(stage, date), nextAvailableDate: qty > 0 ? null : (later.find(([, lp]) => lp.get(key) > 0)?.[0] ?? null),
         }
       }),
     )
     res.json({ serviceable: true, deliveryDate: date, deliveryDates: dates, cutoffTime: cutoffLabel(), items })
+  }),
+)
+
+/**
+ * UX-3: the live rules the shop's help and terms pages quote, so they never drift from what the
+ * API enforces: how long boxes are held at Pay, the order cutoff, how far ahead a day can be
+ * booked and how long after delivery a problem can be reported.
+ */
+router.get('/policy', (_req, res) => {
+  const cfg = getConfig()
+  res.json({ holdMinutes: cfg.holdMinutes, cutoffTime: cutoffLabel(), maxDaysAhead: cfg.maxDaysAhead, claimWindowHours: cfg.claimWindowHours })
+})
+
+/**
+ * UX-5: every box on sale with its price, before a pincode is known, so a first visit
+ * (or a visitor from outside the delivery area) sees the varieties and prices. Stock and
+ * ripeness depend on the delivery day, so they stay on /catalogue, which needs a pincode.
+ */
+router.get('/products', (_req, res) =>
+  res.json({
+    items: shopProducts().map((p) => ({
+      sku: p.sku, name: p.name, variety: p.variety, boxSize: p.boxSize, price: p.price, description: p.description ?? '', photoUrl: p.photoUrl,
+      fruitsPerBox: p.fruitsPerBox, fruitWeightG: p.fruitWeightG,
+    })),
+  }),
+)
+
+/**
+ * A product's photo, for the shop's tiles and product page. Public: product
+ * photos are not private. Each new photo has a new ?v=, so it can be cached for a year.
+ * ?w= (one of PHOTO_WIDTHS) sends it resized to that width, for tiles and srcset.
+ */
+router.get(
+  '/products/:sku/photo',
+  asyncHandler(async (req, res) => {
+    const width = photoWidth(req.query.w)
+    const { rows } = await query('SELECT mime, bytes, blob_path, version, updated_at FROM product_photos WHERE sku = $1', [req.params.sku])
+    if (!rows.length) throw notFound('Photo not found')
+    const current = String(rows[0].version) === String(req.query.v ?? '')
+    // The version starts again at 1 after a photo is removed, so the resize cache also keys on when it was set.
+    const key = `product:${req.params.sku}:${rows[0].version}:${new Date(rows[0].updated_at).getTime()}`
+    await sendPublicPhoto(res, rows[0], { key, width, cache: current ? 'public, max-age=31536000, immutable' : 'public, max-age=60' })
   }),
 )
 
@@ -428,10 +490,64 @@ router.delete(
   '/me',
   asyncHandler(async (req, res) => {
     const photos = await tx((c) => eraseCustomer(c, req.customer.id))
+    forgetCustomer(req.customer.id)
     for (const p of photos) await dropPhoto(p)
     logger.info({ customerId: req.customer.id }, 'customer deleted their account')
     res.clearCookie(RT_COOKIE, rtCookie())
     res.status(204).end()
+  }),
+)
+
+/**
+ * "Sign out everywhere" (ASVS 3.3.4): ends every refresh session of the
+ * account and raises its session version, so access tokens already issued on
+ * other phones stop working too (this instance at once, others within 30 s).
+ */
+router.post(
+  '/me/sign-out-everywhere',
+  asyncHandler(async (req, res) => {
+    await tx(async (c) => {
+      await c.query('UPDATE customers SET session_version = session_version + 1 WHERE id = $1', [req.customer.id])
+      await c.query("UPDATE refresh_sessions SET revoked_at = $2 WHERE user_id = $1 AND user_type = 'customer' AND revoked_at IS NULL", [req.customer.id, now()])
+    })
+    forgetCustomer(req.customer.id)
+    logger.info({ customerId: req.customer.id }, 'customer signed out everywhere')
+    res.clearCookie(RT_COOKIE, rtCookie())
+    res.status(204).end()
+  }),
+)
+
+/** Columns left out of the export: internal checks, not the customer's data. */
+const EXPORT_HIDDEN = new Set(['delivery_code_tries', 'customer_id', 'bytes', 'blob_path'])
+const exportRows = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).filter(([k, v]) => !EXPORT_HIDDEN.has(k) && !Buffer.isBuffer(v))))
+
+/**
+ * A copy of everything the shop holds about the customer (DPDP Act; ASVS
+ * 8.3.2), as JSON: the account, saved addresses, orders with their items,
+ * bookings, claims, ratings, reviews and back-in-stock alerts. Photos are
+ * listed, not included.
+ */
+router.get(
+  '/me/export',
+  asyncHandler(async (req, res) => {
+    const id = req.customer.id
+    const all = (sql) => query(sql, [id]).then((r) => exportRows(r.rows))
+    const [account] = await all('SELECT id, phone, name, email, reminders_opt_in, created_at FROM customers WHERE id = $1 AND deleted_at IS NULL')
+    if (!account) throw notFound('Customer not found')
+    const orders = await all('SELECT * FROM orders WHERE customer_id = $1 ORDER BY placed_at')
+    const items = await query('SELECT * FROM order_items WHERE order_id = ANY($1) ORDER BY order_id', [orders.map((o) => o.id)]).then((r) => exportRows(r.rows))
+    res.set('Content-Disposition', 'attachment; filename="mandimangoes-my-data.json"')
+    res.json({
+      exportedAt: now().toISOString(),
+      account,
+      addresses: await all('SELECT * FROM customer_addresses WHERE customer_id = $1 ORDER BY created_at'),
+      orders: orders.map((o) => ({ ...o, items: items.filter((i) => i.order_id === o.id) })),
+      preorders: await all('SELECT * FROM preorders WHERE customer_id = $1 ORDER BY created_at'),
+      claims: await all('SELECT * FROM claims WHERE customer_id = $1 ORDER BY created_at'),
+      ratings: await all('SELECT * FROM order_ratings WHERE customer_id = $1'),
+      reviews: await all('SELECT * FROM reviews WHERE customer_id = $1 ORDER BY created_at'),
+      stockAlerts: await all('SELECT * FROM stock_alerts WHERE customer_id = $1 ORDER BY created_at'),
+    })
   }),
 )
 
@@ -448,7 +564,8 @@ router.post(
   otpLimiter,
   asyncHandler(async (req, res) => {
     const { phone, channel, captchaToken } = parse(otpRequest, req.body)
-    await requireHuman(captchaToken, req.ip)
+    // Signed in already, so a Turnstile outage doesn't lock them out of adding a number.
+    await requireHuman(captchaToken, req.ip, { known: true })
     res.json(await issueCode(phone, channel, req.ip))
   }),
 )
@@ -466,7 +583,7 @@ router.post(
     const out = await tx(async (c) => {
       const error = await consumeCode(c, phone, code)
       if (error) return { error }
-      const { rows: mine } = await c.query('SELECT * FROM customers WHERE id = $1 FOR UPDATE', [req.customer.id])
+      const { rows: mine } = await c.query('SELECT * FROM customers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [req.customer.id])
       const me = mine[0]
       if (!me) throw notFound('Customer not found')
       if (me.phone === phone) return { customer: me }
@@ -576,6 +693,8 @@ router.post(
         return { sku: l.sku, name: findProduct(l.sku).name, stage: l.stage, qty: l.qty, unitPrice: price, linePrice: price * l.qty, eatBy: eatByFor(l.stage, date) }
       })
       const subtotal = lines.reduce((s, l) => s + l.linePrice, 0)
+      // A full day fails here, not only at confirm (INV-I); confirm re-checks under lock.
+      await checkCapacity(c, date, lines.reduce((s, l) => s + l.qty, 0), null, { lock: false })
       const slot = await quoteSlot(c, date, b.slotId ?? null, lines.reduce((s, l) => s + l.qty, 0))
       const promo = b.promoCode?.trim() ? await applyPromo(c, b.promoCode, req.customer.id, subtotal) : null
       const discount = promo?.discount ?? 0
@@ -586,7 +705,8 @@ router.post(
       const expiresAt = new Date(now().getTime() + getConfig().quoteMinutes * 60_000)
       const quoteId = newId('quo')
       await c.query('INSERT INTO quotes (id, customer_id, data, expires_at) VALUES ($1, $2, $3, $4)', [quoteId, req.customer.id, data, expiresAt])
-      return { quoteId, ...data, expiresAt }
+      // UX-3: how long the boxes are held once Pay is tapped, from the live rule (the review step says so).
+      return { quoteId, ...data, expiresAt, holdMinutes: getConfig().holdMinutes }
     })
     res.json(quote)
   }),
@@ -660,7 +780,13 @@ router.post(
     const hash = requestHash(b)
     const existing = () => replayFor(key, hash, 'orders')
     const replay = await existing()
-    if (replay && stillStarting(replay, 'razorpay_order_id')) throw startingPayment()
+    if (replay && stillStarting(replay, 'razorpay_order_id')) {
+      // PAY-B4: the first try committed the order but never stored its
+      // Razorpay order (the instance died in between). After a short wait the
+      // retry starts the payment itself, instead of 409 until the hold ends.
+      if (!startedLongAgo(replay)) throw startingPayment()
+      return res.status(200).json(confirmResponse(await startPayment(replay, key)))
+    }
     if (replay) return res.status(200).json(confirmResponse(replay))
 
     const order = await tx(async (c) => {
@@ -671,6 +797,13 @@ router.post(
       const q = rows[0]
       if (!q || q.expires_at <= now()) throw conflict('This quote has expired. Review your cart again.', 'QUOTE_EXPIRED')
       const { date } = await deliveryDateFor(c, q.data.pincode, q.data.deliveryDate)
+      // PAY-B10: a product taken off sale after the quote is not sold on it.
+      for (const l of q.data.lines) {
+        if (!sellable(l.sku)) {
+          throw new HttpError(409, 'PRODUCT_UNAVAILABLE', `${findProduct(l.sku)?.name ?? l.sku} is no longer sold`, { sku: l.sku, stage: l.stage })
+        }
+      }
+      await checkUnpaidLimit(c, req.customer.id, q.data.lines.reduce((t, l) => t + l.qty, 0))
       if (b.name) await c.query('UPDATE customers SET name = $2 WHERE id = $1', [req.customer.id, b.name])
       const cust = await requirePhone(c, req.customer.id)
       const subtotal = q.data.lines.reduce((t, l) => t + l.unitPrice * l.qty, 0)
@@ -701,24 +834,36 @@ router.post(
       if (stillStarting(first, 'razorpay_order_id')) throw startingPayment()
       return res.status(200).json(confirmResponse(first))
     }
-
-    try {
-      const rzp = await createGatewayOrder({ amount: order.total, receipt: order.number, orderId: order.id })
-      await query('UPDATE orders SET razorpay_order_id = $2 WHERE id = $1', [order.id, rzp])
-      order.razorpay_order_id = rzp
-    } catch (err) {
-      logger.error({ err, orderId: order.id }, 'could not create the gateway order')
-      await tx(async (c) => {
-        await processPayment(c, { orderId: order.id, outcome: 'abandoned' }, SYSTEM)
-        // Let the key go, so a retry is a fresh attempt rather than a replay of
-        // the cancelled order (the quote is spent: the shop quotes again).
-        await c.query('DELETE FROM idempotency_keys WHERE key = $1', [key])
-      })
-      throw new HttpError(502, 'PAYMENT_GATEWAY_ERROR', 'Could not start the payment. Please try again.')
-    }
-    res.status(201).json(confirmResponse(order))
+    res.status(201).json(confirmResponse(await startPayment(order, key)))
   }),
 )
+
+/** How long a retry waits for the first try to store its Razorpay order before starting the payment itself (PAY-B4). */
+const PAYMENT_START_GRACE_MS = 15_000
+const startedLongAgo = (o) => o.hold_expires_at > now() && now() - o.placed_at >= PAYMENT_START_GRACE_MS
+
+/**
+ * Creates the Razorpay order for a placed order and stores it, unless another
+ * request stored one first (then that one is used and ours is an unused
+ * Razorpay order, which is harmless). If the gateway fails, the order is
+ * abandoned and the key released, so a retry is a fresh attempt.
+ */
+async function startPayment(order, key) {
+  try {
+    const rzp = await createGatewayOrder({ amount: order.total, receipt: order.number, orderId: order.id })
+    const { rows } = await query('UPDATE orders SET razorpay_order_id = $2 WHERE id = $1 AND razorpay_order_id IS NULL RETURNING *', [order.id, rzp])
+    return rows[0] ?? (await query('SELECT * FROM orders WHERE id = $1', [order.id])).rows[0]
+  } catch (err) {
+    logger.error({ err, orderId: order.id }, 'could not create the gateway order')
+    await tx(async (c) => {
+      await processPayment(c, { orderId: order.id, outcome: 'abandoned' }, SYSTEM)
+      // Let the key go, so a retry is a fresh attempt rather than a replay of
+      // the cancelled order (the quote is spent: the shop quotes again).
+      await c.query('DELETE FROM idempotency_keys WHERE key = $1', [key])
+    })
+    throw new HttpError(502, 'PAYMENT_GATEWAY_ERROR', 'Could not start the payment. Please try again.')
+  }
+}
 
 // ---------------------------------------------------------------- orders
 
@@ -736,7 +881,11 @@ router.get(
          FROM orders o WHERE customer_id = $1 ORDER BY placed_at DESC LIMIT 100`,
       [req.customer.id],
     )
-    res.json(rows.map((o) => ({ id: o.id, number: o.number, status: o.status, deliveryDate: o.delivery_date, total: o.total, itemCount: o.item_count, placedAt: o.placed_at })))
+    res.json(rows.map((o) => ({
+      id: o.id, number: o.number, status: o.status, deliveryDate: o.delivery_date, total: o.total, itemCount: o.item_count, placedAt: o.placed_at,
+      // Lets the shop point to an unpaid order that is still held (FE-5).
+      holdExpiresAt: o.status === 'PAYMENT_PENDING' ? o.hold_expires_at : null,
+    })))
   }),
 )
 
@@ -744,14 +893,24 @@ router.get(
   '/orders/:id',
   asyncHandler(async (req, res) => {
     const o = await ownOrder({ query }, req)
-    const [items, events, slot, proof, rating] = await Promise.all([
+    const [items, events, slot, proof, rating, cancel, delivered] = await Promise.all([
       query('SELECT * FROM order_items WHERE order_id = $1 ORDER BY sku, stage', [o.id]),
       query(`SELECT status, created_at FROM order_events WHERE order_id = $1 AND from_status IS DISTINCT FROM status ORDER BY created_at, id`, [o.id]),
       o.slot_id ? query('SELECT * FROM delivery_slots WHERE id = $1', [o.slot_id]) : { rows: [] },
       customerDelivery({ query }, o),
       query('SELECT stars, comment, updated_at FROM order_ratings WHERE order_id = $1', [o.id]),
+      o.status === 'CANCELLED'
+        ? query(`SELECT reason, created_at FROM order_events WHERE order_id = $1 AND status = 'CANCELLED' ORDER BY created_at DESC, id DESC LIMIT 1`, [o.id])
+        : { rows: [] },
+      o.status === 'DELIVERED'
+        ? query(`SELECT MAX(created_at) AS at FROM order_events WHERE order_id = $1 AND status = 'DELIVERED'`, [o.id])
+        : { rows: [] },
     ])
     const r = rating.rows[0]
+    const cancelled = cancel.rows[0]
+    // FE-3: the claim deadline from the live rule, the same sum POST /claims checks.
+    const claimWindowHours = getConfig().claimWindowHours
+    const deliveredAt = delivered.rows[0]?.at ?? null
     res.json({
       rating: r ? { stars: r.stars, comment: r.comment, at: r.updated_at } : null,
       slot: slot.rows[0] ? (({ id, label, startsAt, endsAt }) => ({ id, label, startsAt, endsAt }))(slotView(slot.rows[0])) : null,
@@ -762,6 +921,18 @@ router.get(
       // The public key id, so checkout can be reopened from any device while unpaid.
       razorpayKeyId: o.status === 'PAYMENT_PENDING' && o.razorpay_order_id ? env.RAZORPAY_KEY_ID || null : null,
       holdExpiresAt: o.hold_expires_at,
+      // Why it was cancelled, so the shop never says "nothing was charged" while
+      // a late payment can still land on a hold that ran out (FE-1).
+      cancelReason: !cancelled ? null : o.staff_cancelled_at ? 'STAFF' : cancelled.reason === HOLD_EXPIRED_REASON ? 'HOLD_EXPIRED' : 'OTHER',
+      cancelledAt: cancelled?.created_at ?? null,
+      claimWindowHours,
+      claimUntil: deliveredAt ? new Date(deliveredAt.getTime() + claimWindowHours * 3_600_000) : null,
+      // FE-2: after the last failed attempt nothing is rescheduled; staff call first.
+      deliveryFailures: o.delivery_failures,
+      // INV-E: a retry the boxes can't make (too old, no younger stock) waits for staff, who call.
+      retryScheduled: o.status === 'DELIVERY_FAILED' ? o.delivery_failures < MAX_DELIVERY_ATTEMPTS && !o.at_risk : null,
+      // INV-B: paid, but no stock for its date yet: the date may change and we'll message when it's settled.
+      findingStock: Boolean(o.at_risk) && ['CONFIRMED', 'PROCESSING'].includes(o.status),
       items: items.rows.map((i) => ({ sku: i.sku, name: findProduct(i.sku)?.name ?? i.sku, stage: i.stage, quantity: i.quantity, unitPrice: i.unit_price, linePrice: i.line_price, eatBy: i.stage ? eatByFor(i.stage, o.delivery_date) : null, readyOn: i.stage ? readyOnFor(i.stage, o.delivery_date) : null })),
       timeline: events.rows.map((e) => ({ status: e.status, at: e.created_at })),
       ...proof,
@@ -776,10 +947,55 @@ router.get(
   }),
 )
 
+/** verify-payment calls per order per minute; each asks Razorpay (at least 2 seconds apart). */
+const VERIFY_PER_MINUTE = 6
+
 router.get(
   '/orders/:id/payment-status',
   asyncHandler(async (req, res) => {
-    const o = await ownOrder({ query }, req)
+    let o = await ownOrder({ query }, req)
+    // OPS-24: still waiting a minute after checkout: ask Razorpay now rather
+    // than wait for a late webhook or the next maintenance run (throttled per order).
+    if (o.status === 'PAYMENT_PENDING' && (o.razorpay_order_id || o.payment_link_id)) {
+      const r = await reconcileOrderNow(o.id, { minAgeMs: 60_000, throttleMs: 30_000 }).catch((err) => {
+        logger.warn({ err, orderId: o.id }, 'payment status check at Razorpay failed')
+        return null
+      })
+      if (r && r !== 'skipped') o = await ownOrder({ query }, req)
+    }
+    res.json({ status: o.payment_status, orderStatus: o.status })
+  }),
+)
+
+/**
+ * PAY-B3: Checkout's success handler posts what Razorpay gave it. The
+ * signature (HMAC-SHA256 of `order_id|payment_id` with the key secret) proves
+ * Razorpay issued it for this order; then the payment is fetched from
+ * Razorpay and applied with the same checks as the webhook (amount, currency),
+ * so nothing from the page itself is trusted. Rate-limited per order.
+ */
+router.post(
+  '/orders/:id/verify-payment',
+  asyncHandler(async (req, res) => {
+    const b = parse(
+      z.object({
+        razorpay_payment_id: z.string().min(1).max(64),
+        razorpay_order_id: z.string().min(1).max(64),
+        razorpay_signature: z.string().min(1).max(128),
+      }),
+      req.body,
+    )
+    let o = await ownOrder({ query }, req)
+    if (!o.razorpay_order_id || o.razorpay_order_id !== b.razorpay_order_id) throw badRequest('This payment is not for this order', 'PAYMENT_MISMATCH')
+    if (!verifyCheckoutSignature(b.razorpay_order_id, b.razorpay_payment_id, b.razorpay_signature)) {
+      throw badRequest('The payment could not be verified', 'BAD_SIGNATURE')
+    }
+    const tries = await hit(`verify-payment:${o.id}`, 60_000)
+    if (tries.hits > VERIFY_PER_MINUTE) throw new HttpError(429, 'RATE_LIMITED', 'Too many checks. Your order page updates on its own.')
+    if (o.payment_status !== 'SUCCEEDED') {
+      const r = await reconcileOrderNow(o.id, { throttleMs: 2_000 })
+      if (r && r !== 'skipped') o = await ownOrder({ query }, req)
+    }
     res.json({ status: o.payment_status, orderStatus: o.status })
   }),
 )
@@ -788,9 +1004,7 @@ router.post(
   '/orders/:id/cancel',
   asyncHandler(async (req, res) => {
     const refundDue = await tx((c) => customerCancel(c, req.params.id, req.customer.id, req.actor))
-    if (refundDue) {
-      await refundOrder(req.params.id).catch((err) => logger.error({ err, orderId: req.params.id }, 'refund failed; maintenance will retry'))
-    }
+    if (refundDue) await sendDueRefunds({ orderId: req.params.id })
     res.status(204).end()
   }),
 )
@@ -902,8 +1116,7 @@ router.post(
   '/preorders/:id/cancel',
   asyncHandler(async (req, res) => {
     const r = await tx((c) => cancelPreorder(c, req.params.id, req.customer.id, req.actor))
-    const send = r.refund === 'order' ? refundOrder : r.refund === 'preorder' ? refundPreorder : null
-    if (send) await send(r.id).catch((err) => logger.error({ err, id: r.id }, 'refund failed; maintenance will retry'))
+    await sendDueRefunds({ orderId: r.refund === 'order' ? r.id : null, preorderId: r.refund === 'preorder' ? r.id : null })
     res.status(204).end()
   }),
 )
@@ -915,13 +1128,15 @@ export const MAX_CLAIM_PHOTOS = 3
 /** A claim photo is uploaded first (raw image body), then linked by id when the claim is sent. */
 router.post(
   '/claims/photos',
-  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: MAX_PHOTO_BYTES }),
+  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: MAX_PHOTO_BYTES, inflate: false }),
   asyncHandler(async (req, res) => {
-    const { mime, ext } = checkPhoto(req.body)
+    checkPhoto(req.body)
     const loose = await query('SELECT COUNT(*)::int AS n FROM claim_photos WHERE customer_id = $1 AND claim_id IS NULL', [req.customer.id])
     if (loose.rows[0].n >= 10) throw new HttpError(429, 'TOO_MANY_PHOTOS', 'Send your claim with the photos you have added first')
+    // SEC-13: re-encoded, so EXIF (GPS, device) and anything hidden in the file stay behind.
+    const { bytes, mime, ext } = await cleanImage(req.body)
     const id = newId('cph')
-    const saved = await storePhoto(`claims/${req.customer.id}`, id, req.body, ext, mime)
+    const saved = await storePhoto(`claims/${req.customer.id}`, id, bytes, ext, mime)
     await query('INSERT INTO claim_photos (id, customer_id, mime, bytes, blob_path, created_at) VALUES ($1, $2, $3, $4, $5, $6)', [
       id, req.customer.id, mime, saved.bytes, saved.blobPath, now(),
     ])
@@ -979,6 +1194,8 @@ router.post(
         const linked = await c.query('UPDATE claim_photos SET claim_id = $1 WHERE id = ANY($2) AND customer_id = $3 AND claim_id IS NULL', [id, photoIds, req.customer.id])
         if (linked.rowCount !== photoIds.length) throw badRequest('One of the photos was not found. Add it again.', 'PHOTO_NOT_FOUND')
       }
+      // UX-4: "we got your report" on WhatsApp, once Meta approves mandi_claim_received.
+      if (env.WHATSAPP_CLAIM_UPDATES) await enqueue(c, b.orderId, id, 'CLAIM_RECEIVED')
       return { id, status: 'SUBMITTED', photos: photoIds.length }
     })
     res.status(201).json(claim)
@@ -996,6 +1213,7 @@ router.get(
     res.json(
       rows.map((c) => ({
         id: c.id, orderId: c.order_id, orderNumber: c.number, issueType: c.issue_type, status: c.status, resolution: c.resolution,
+        rejectionReason: c.resolution === 'REJECTED' ? (c.resolution_note ?? null) : null,
         replacementOrder: c.replacement_order_id ? { id: c.replacement_order_id, number: c.replacement_number } : null, createdAt: c.created_at,
       })),
     )
@@ -1011,8 +1229,7 @@ devRouter.post(
   asyncHandler(async (req, res) => {
     const b = parse(z.object({ orderId: z.string().min(1), outcome: z.enum(['captured', 'failed']) }), req.body)
     const r = await tx((c) => processPayment(c, { orderId: b.orderId, outcome: b.outcome, paymentId: `pay_dev_${newId('p').slice(2)}`, method: 'dev' }))
-    if (r.result === 'refund_due') await refundOrder(b.orderId)
-    if (r.result === 'duplicate_payment') await refundDuplicatePayments()
+    await sendDueRefunds(refundsFor({ ...r, orderId: b.orderId }))
     res.json({ result: r.result })
   }),
 )
@@ -1025,7 +1242,7 @@ devRouter.post(
     const r = await tx((c) =>
       processPreorderPayment(c, { preorderId: b.preorderId, outcome: b.outcome, paymentId: `pay_dev_${newId('p').slice(2)}`, method: 'dev' }),
     )
-    if (r === 'refund_due') await refundPreorder(b.preorderId)
+    await sendDueRefunds(refundsFor({ result: r, preorderId: b.preorderId }))
     res.json({ result: r })
   }),
 )

@@ -1,4 +1,4 @@
-import type { Stage } from './api'
+import { API_URL, type Stage } from './api'
 
 /** Skin colours by ripeness: green when raw, blushing as it softens, golden when ripe. */
 const SKIN: Record<Stage, { base: string; blush: string }> = {
@@ -53,4 +53,61 @@ export const CARE: Record<Stage, { title: string; tips: string[] }> = {
       'Take them out half an hour before eating for the best flavour.',
     ],
   },
+}
+
+/** A public photo URL (product or review) resized by the API to `width` px (one of its allowed widths). */
+export function photoAt(url: string, width: number) {
+  return `${API_URL}${url}${url.includes('?') ? '&' : '?'}w=${width}`
+}
+
+/**
+ * How a product photo is shown: the widths the browser may pick from, how wide it is on screen,
+ * and its intrinsic size (the CSS crops it to that shape, so the space is kept before it loads).
+ */
+const FIT = {
+  tile: { widths: [160, 320, 480, 640], sizes: '(min-width: 1024px) 260px, (min-width: 640px) 31vw, 50vw', width: 480, height: 480 },
+  hero: { widths: [480, 640, 960, 1200], sizes: '(min-width: 1024px) 520px, 100vw', width: 1200, height: 900 },
+} as const
+
+/**
+ * The product's photo when the shop team has added one, else the drawn mango. `priority` is for
+ * the photo that is the largest thing on the first screen (the product page's hero): it loads at
+ * once and ahead of other images. `eager` is for photos on the first screen (the first home tiles).
+ */
+export function ProductImage({
+  photoUrl,
+  name,
+  stage = 'RIPE',
+  size = 56,
+  className,
+  fit = 'tile',
+  eager = false,
+  priority = false,
+}: {
+  photoUrl?: string | null
+  name: string
+  stage?: Stage
+  size?: number
+  className?: string
+  fit?: keyof typeof FIT
+  eager?: boolean
+  priority?: boolean
+}) {
+  if (!photoUrl) return <MangoArt stage={stage} size={size} />
+  const f = FIT[fit]
+  return (
+    <img
+      src={photoAt(photoUrl, f.widths[1])}
+      srcSet={f.widths.map((w) => `${photoAt(photoUrl, w)} ${w}w`).join(', ')}
+      sizes={f.sizes}
+      width={f.width}
+      height={f.height}
+      alt={`Photo of ${name}`}
+      className={className ?? 'product-photo'}
+      loading={eager || priority ? 'eager' : 'lazy'}
+      decoding={priority ? 'sync' : 'async'}
+      // React 18 does not know fetchPriority yet; the lowercase attribute passes straight through.
+      {...(priority ? { fetchpriority: 'high' } : {})}
+    />
+  )
 }

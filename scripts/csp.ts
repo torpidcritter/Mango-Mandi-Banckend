@@ -9,7 +9,11 @@
 //   connect-src and img-src of the meta tag win wherever the app is hosted
 //   (Vercel or the Caddy images in deploy/).
 // tests/csp.spec.ts checks that vercel.json matches header() below.
-import type { Plugin } from 'vite'
+//
+// The same plugin also writes a preconnect hint for the API into the built
+// index.html, so the browser opens the connection to the API while it is still
+// fetching the app's script instead of after it.
+import type { HtmlTagDescriptor, Plugin } from 'vite'
 
 export type App = 'panel' | 'shop'
 
@@ -66,8 +70,24 @@ export function policy(app: App, { api, dev = false, meta = false }: Options): s
 export const header = (app: App) => policy(app, { api: null })
 
 /**
+ * <link rel="preconnect"> (and a dns-prefetch fallback) for the API's origin.
+ * Two preconnects: the apps call the API with cookies (credentials: 'include'),
+ * while CORS preflights and the plain config call go without, and browsers
+ * keep those connections apart.
+ */
+export function preconnectTags(apiUrl: string | null | undefined): HtmlTagDescriptor[] {
+  const origin = originOf(apiUrl)
+  if (!origin) return []
+  return [
+    { tag: 'link', attrs: { rel: 'preconnect', href: origin }, injectTo: 'head' },
+    { tag: 'link', attrs: { rel: 'preconnect', href: origin, crossorigin: true }, injectTo: 'head' },
+    { tag: 'link', attrs: { rel: 'dns-prefetch', href: origin }, injectTo: 'head' },
+  ]
+}
+
+/**
  * Serves the policy from `vite` and `vite preview`, and writes the exact-API
- * <meta> tag into the built index.html.
+ * <meta> tag and the API preconnect hints into the built index.html.
  */
 export function cspPlugin(app: App, apiUrl: string | undefined): Plugin {
   const api = apiUrl ?? 'http://localhost:3000'
@@ -91,7 +111,11 @@ export function cspPlugin(app: App, apiUrl: string | undefined): Plugin {
       order: 'post',
       handler(_html, ctx) {
         if (ctx.server) return [] // the dev server sends the header instead
-        return [{ tag: 'meta', attrs: { 'http-equiv': 'Content-Security-Policy', content: policy(app, { api, meta: true }) }, injectTo: 'head-prepend' }]
+        return [
+          { tag: 'meta', attrs: { 'http-equiv': 'Content-Security-Policy', content: policy(app, { api, meta: true }) }, injectTo: 'head-prepend' },
+          // Only for a configured API: a build without VITE_API_URL can't reach one anyway.
+          ...preconnectTags(apiUrl),
+        ]
       },
     },
   }

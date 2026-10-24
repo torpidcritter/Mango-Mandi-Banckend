@@ -6,6 +6,7 @@ import type {
   ClaimResolution,
   ClaimStatus,
   Condition,
+  NotificationKind,
   OrderStatus,
   Ripeness,
 } from './types'
@@ -153,4 +154,97 @@ export function batchTone(s: BatchStatus): Tone {
   if (s === 'CONDEMNED') return 'bad'
   if (s === 'EXHAUSTED') return 'neutral'
   return 'info'
+}
+
+// ---------- Labels for raw values (no enum names or internal ids on screen) ----------
+
+/** Order stock states. "committed" is paid stock waiting to be packed: "To pack", never "Held". */
+export const STOCK_STATE_LABEL: Record<string, string> = {
+  held: 'Held for payment',
+  committed: 'To pack',
+  packed: 'Packed',
+  released: 'Released',
+}
+
+/** Batch ledger event types. */
+export const LEDGER_EVENT_LABEL: Record<string, string> = {
+  INTAKE: 'Received',
+  ADJUST: 'Count corrected',
+  ADJUST_BUFFER: 'Reserve changed',
+  HOLD: 'Held for payment',
+  COMMIT: 'Set aside for an order',
+  PACK: 'Packed',
+  RELEASE: 'Released',
+  RESTOCK: 'Back on the shelf',
+  STATUS: 'Status changed',
+  CONDEMN: 'Condemned',
+  RETIRE: 'Retired',
+}
+
+/** Why a count changed (the ledger's reason code). */
+export const ADJUST_REASON_LABEL: Record<string, string> = {
+  CORRECTION: 'Correction',
+  COUNT: 'Count',
+  RECEIVED: 'Received',
+  DAMAGED: 'Damaged',
+  THEFT_LOSS: 'Theft or loss',
+  RETURN_RESTOCK: 'Return restock',
+  OTHER: 'Other',
+}
+
+/** "RIPE" → "Ripe"; unknown or empty stays readable. */
+export function ripenessLabel(stage: string | null | undefined): string {
+  if (!stage) return '—'
+  return RIPENESS_LABEL[stage as Ripeness] ?? humanize(stage)
+}
+
+/** A label for any enum-like value without a mapping: "OUT_FOR_DELIVERY" → "Out for delivery". */
+export function humanize(value: string): string {
+  const s = value.replace(/_/g, ' ').toLowerCase()
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+/**
+ * Who did something, readable: staff show by email; the system, the payment webhook and the
+ * customer by name. A bare staff id (the ledger records ids for some steps) becomes the email
+ * when `staffEmail` knows it, otherwise "Staff member".
+ */
+export function actorLabel(actor: string | null | undefined, type?: string | null, staffEmail?: (id: string) => string | undefined): string {
+  if (!actor) return '—'
+  if (actor.includes('@')) return actor
+  if (actor === 'system' || type === 'system') return 'System'
+  if (actor === 'webhook:razorpay') return 'Razorpay (payment)'
+  if (actor.startsWith('webhook:')) return humanize(actor.slice('webhook:'.length))
+  if (actor === 'customer' || actor.startsWith('customer:') || type === 'customer') return 'Customer'
+  return staffEmail?.(actor) ?? 'Staff member'
+}
+
+/** A tap-to-call link. Phones come back as +91… from the API; older rows may lack the country code. */
+export function telHref(phone: string): string {
+  const digits = phone.replace(/[\s-]/g, '')
+  return `tel:${digits.startsWith('+') ? digits : `+91${digits}`}`
+}
+
+/** Razorpay payment methods. */
+export const PAYMENT_METHOD_LABEL: Record<string, string> = {
+  upi: 'UPI',
+  card: 'Card',
+  netbanking: 'Net banking',
+  wallet: 'Wallet',
+  emi: 'EMI',
+  paylater: 'Pay later',
+}
+
+/** WhatsApp update kinds. */
+export const NOTIFICATION_LABEL: Record<NotificationKind, string> = {
+  ORDER_CONFIRMED: 'Order confirmed',
+  REPLACEMENT_CONFIRMED: 'Replacement confirmed',
+  OUT_FOR_DELIVERY: 'Out for delivery',
+  DELIVERED: 'Delivered',
+  DELIVERY_FAILED: 'Delivery missed',
+  CANCELLED: 'Order cancelled',
+  REFUNDED: 'Refund sent',
+  DATE_MOVED: 'Delivery date moved',
+  CLAIM_RECEIVED: 'Claim received',
+  CLAIM_REJECTED: 'Claim rejected',
 }

@@ -90,6 +90,8 @@ you deploy to.
 
 ```bash
 npm run typecheck             # tsc --noEmit
+npm run lint                  # rules of hooks and unused variables (ESLint)
+npm run test:unit             # the API clients' answer handling (node --test)
 npx playwright install chromium   # once, if not already present
 npm run test:e2e              # all specs at both viewports
 

@@ -1,4 +1,4 @@
-import { closeAll, checkout, client, customerToken, line, makeBatch, resetDb, startServer } from './helpers.js'
+import { closeAll, client, customerToken, line, makeBatch, resetDb, startServer } from './helpers.js'
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
 import { query, tx } from '../src/db.js'

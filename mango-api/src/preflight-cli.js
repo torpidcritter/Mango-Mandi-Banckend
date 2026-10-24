@@ -1,12 +1,13 @@
 // npm run preflight [-- --online]
 // Prints every go-live problem with the current settings and database, then
 // exits 1 if anything would stop the launch. --online also checks the Razorpay
-// keys and the WhatsApp number against their APIs (read-only calls).
+// keys and the WhatsApp number against their APIs (read-only calls), and the
+// database role's statement and idle-in-transaction time limits (OPS-29).
 process.env.PREFLIGHT = '1'
 
 const { deployEnv, env, isProd } = await import('./env.js')
-const { checkProduction } = await import('./preflight.js')
-const { query, closePool } = await import('./db.js')
+const { checkProduction, checkRoleTimeouts } = await import('./preflight.js')
+const { isPooledUrl, query, closePool } = await import('./db.js')
 const { checkDatabaseEnvironment } = await import('./migrate.js')
 
 const online = process.argv.includes('--online')
@@ -42,12 +43,24 @@ try {
     ok.push(`${pins} delivery pincode(s) active`)
     const slots = (await query('SELECT COUNT(*)::int AS n FROM delivery_slots WHERE active')).rows[0].n
     if (!slots) warnings.push('No delivery slots: checkout will not ask for a time window (add them on the Planning page)')
+    if (!env.BACKUP_HEARTBEAT_EXPECTED) {
+      warnings.push('BACKUP_HEARTBEAT_EXPECTED is off: a stopped nightly backup will not show in Needs attention or Sentry (deploy/VERCEL.md, Backups)')
+    }
   }
 } catch (err) {
   errors.push(`Database: ${err.message}`)
 }
 
 if (online) {
+  // OPS-29: the role's time limits, as the app's own connections see them.
+  try {
+    const t = await checkRoleTimeouts(query, { pooled: isPooledUrl(env.DATABASE_URL) })
+    ok.push(...t.ok)
+    warnings.push(...t.warnings)
+    errors.push(...t.errors)
+  } catch (err) {
+    errors.push(`Database time limits: ${err.message}`)
+  }
   if (env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET) {
     const auth = Buffer.from(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`).toString('base64')
     const r = await fetch('https://api.razorpay.com/v1/orders?count=1', { headers: { Authorization: `Basic ${auth}` } }).catch((e) => e)

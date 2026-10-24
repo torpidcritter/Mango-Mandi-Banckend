@@ -5,6 +5,7 @@
 import { adminToken, checkout, client, closeAll, customerToken, makeBatch, resetDb, signWebhook, startServer, T0 } from './helpers.js'
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
+import { drainBackground } from '../src/background.js'
 import { canStartCall, withBudget, withSlice } from '../src/budget.js'
 import { setNow } from '../src/clock.js'
 import { query } from '../src/db.js'
@@ -108,6 +109,7 @@ describe('a captured payment must match what we charged', () => {
     const rzp = (await order(o.orderId)).razorpay_order_id
     const r = await hook(capture({ id: 'pay_short', order_id: rzp, amount: 100 }), 'evt_short')
     assert.equal(r.body.result, 'rejected')
+    await drainBackground() // the refund goes out after the webhook has been answered (PAY-B1)
     assert.equal((await order(o.orderId)).status, 'PAYMENT_PENDING')
     assert.equal((await query(`SELECT COUNT(*)::int AS n FROM webhook_failures WHERE reason LIKE '%pay_short%'`)).rows[0].n, 1)
     // The money goes back like a double charge.

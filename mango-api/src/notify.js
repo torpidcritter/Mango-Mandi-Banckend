@@ -7,7 +7,7 @@ import { now } from './clock.js'
 import { query } from './db.js'
 import { env, isProd } from './env.js'
 import { newId } from './ids.js'
-import { logger } from './logger.js'
+import { logger, maskPhone } from './logger.js'
 import { metrics } from './metrics.js'
 import { productName } from './products.js'
 import { eatByFor, readyOnFor, STAGE_WORDS, storageTip } from './ripeness.js'
@@ -136,9 +136,31 @@ export function paramsFor(n) {
       return [name, n.number, `${n.pre_qty} × ${productName(n.pre_sku)}`, weekWords(n.week_start)]
     case 'PREORDER_SPOT_OPEN':
       return [name, `${n.pre_qty} × ${productName(n.pre_sku)}`, weekWords(n.week_start), n.payment_link_url ?? '']
+    case 'CLAIM_RECEIVED':
+      return [name, n.number]
+    case 'CLAIM_REJECTED':
+      // One line: template variables may not hold line breaks.
+      return [name, n.number, clip(n.claim_reason?.replace(/\s+/g, ' ').trim() || 'no reason given', 500)]
     default:
       return [name, n.number]
   }
+}
+
+/**
+ * UX-7: order updates whose template carries an "Open order" URL button,
+ * https://<shop>/orders/{{1}}; the button's one variable is the order id. The claim
+ * templates are new and have the button from the start. The older ones get it only
+ * once Meta approves their new versions, so it is sent only with WHATSAPP_ORDER_LINKS=true
+ * (sending a button variable to a template without the button fails at Meta).
+ * The gift recipient's out-for-delivery message shares the template, so it carries the
+ * button too; the page asks them to sign in as the buyer.
+ */
+const ORDER_LINK_ALWAYS = new Set(['CLAIM_RECEIVED', 'CLAIM_REJECTED'])
+const ORDER_LINK_WITH_FLAG = new Set(['ORDER_CONFIRMED', 'REPLACEMENT_CONFIRMED', 'OUT_FOR_DELIVERY', 'GIFT_OUT_FOR_DELIVERY', 'DELIVERED', 'DELIVERY_FAILED', 'DATE_MOVED'])
+export function orderLinkFor(n) {
+  if (!n.order_id) return null
+  if (ORDER_LINK_ALWAYS.has(n.kind) || (env.WHATSAPP_ORDER_LINKS && ORDER_LINK_WITH_FLAG.has(n.kind))) return n.order_id
+  return null
 }
 
 async function mark(id, fields) {
@@ -146,9 +168,30 @@ async function mark(id, fields) {
   await query(`UPDATE notifications SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(', ')} WHERE id = $1`, [id, ...keys.map((k) => fields[k])])
 }
 
-/** Sends due updates. `sender` is injectable for tests. Returns how many were sent. */
-export async function sendDueNotifications({ sender = whatsappSender, limit = 50 } = {}) {
+/** Batches one call may claim, so a call outside a time budget (a test, a script) still ends. */
+const MAX_BATCHES = 40
+
+/**
+ * Sends due updates. `sender` is injectable for tests. Returns how many were sent.
+ * OPS-30: claims batch after batch while the run's time allows (a dispatch
+ * burst of hundreds of delivery codes goes out in one run, not 50 a minute).
+ * Only messages due when the call started are claimed, and every outcome
+ * moves a message's next attempt past that time, so nothing is sent twice.
+ */
+export async function sendDueNotifications({ sender = whatsappSender, limit = 50, maxBatches = MAX_BATCHES } = {}) {
   const at = now()
+  let sent = 0
+  for (let b = 0; b < maxBatches; b++) {
+    if (b > 0 && !canStartCall(SEND_CALL_MS)) break
+    const r = await sendBatch(sender, limit, at)
+    sent += r.sent
+    if (r.claimed < limit || r.outOfTime) break
+  }
+  return sent
+}
+
+/** Claims and sends up to `limit` messages due at `at`. */
+async function sendBatch(sender, limit, at) {
   // Claim due rows first: SKIP LOCKED plus pushing next_attempt_at out a few
   // minutes means a second sender (another instance, an overlapping run) never
   // picks up the same message. Each outcome below sets the real next state.
@@ -159,7 +202,7 @@ export async function sendDueNotifications({ sender = whatsappSender, limit = 50
       RETURNING id`,
     [at, limit, new Date(at.getTime() + CLAIM_MS)],
   )
-  if (!claimed.rows.length) return 0
+  if (!claimed.rows.length) return { sent: 0, claimed: 0, outOfTime: false }
   const { rows } = await query(
     `SELECT n.*, COALESCE(o.number, p.number) AS number, o.status AS order_status,
             o.delivery_date, o.delivery_code, o.gift_recipient_name, COALESCE(o.total, p.total) AS total, COALESCE(o.payment_amount, p.paid_amount) AS payment_amount,
@@ -167,7 +210,8 @@ export async function sendDueNotifications({ sender = whatsappSender, limit = 50
             (SELECT json_agg(json_build_object('sku', i.sku, 'stage', i.stage) ORDER BY i.sku) FROM order_items i WHERE i.order_id = o.id) AS items,
             (SELECT i.sku FROM order_items i WHERE i.order_id = o.id ORDER BY i.line_price DESC LIMIT 1) AS last_product,
             a.sku AS alert_sku, a.stage AS alert_stage, a.available_on AS alert_date,
-            COALESCE(o.customer_name, p.customer_name, ac.name) AS customer_name
+            COALESCE(o.customer_name, p.customer_name, ac.name) AS customer_name,
+            (SELECT cl.resolution_note FROM claims cl WHERE cl.id = n.event_id AND n.kind = 'CLAIM_REJECTED') AS claim_reason
        FROM notifications n LEFT JOIN orders o ON o.id = n.order_id LEFT JOIN preorders p ON p.id = n.preorder_id
        LEFT JOIN delivery_slots s ON s.id = o.slot_id
        LEFT JOIN stock_alerts a ON a.id = n.stock_alert_id LEFT JOIN customers ac ON ac.id = a.customer_id
@@ -181,12 +225,12 @@ export async function sendDueNotifications({ sender = whatsappSender, limit = 50
     if (!canStartCall(SEND_CALL_MS)) {
       // Out of time: hand the rest back so the next run sends them straight away.
       await query('UPDATE notifications SET next_attempt_at = $2 WHERE id = ANY($1)', [rows.slice(i).map((r) => r.id), at])
-      break
+      return { sent, claimed: claimed.rows.length, outOfTime: true }
     }
     const results = await Promise.all(rows.slice(i, i + SEND_CONCURRENCY).map((n) => sendOne(n, sender, at)))
     sent += results.filter(Boolean).length
   }
-  return sent
+  return { sent, claimed: claimed.rows.length, outOfTime: false }
 }
 
 /**
@@ -220,13 +264,13 @@ async function sendOne(n, sender, at) {
       await mark(n.id, { status: 'SKIPPED', last_error: 'no WhatsApp provider configured' })
       return false
     }
-    logger.info({ phone: n.phone, kind: n.kind, params: paramsFor(n) }, `WhatsApp ${templateFor(n.kind)}`)
+    logger.info({ phone: maskPhone(n.phone), kind: n.kind, params: paramsFor(n), orderLink: orderLinkFor(n) }, `WhatsApp ${templateFor(n.kind)}`)
     await mark(n.id, { status: 'SENT', sent_at: at, provider_id: 'log' })
     return true
   }
   let providerId
   try {
-    providerId = await sender({ phone: n.phone, template: templateFor(n.kind), params: paramsFor(n) })
+    providerId = await sender({ phone: n.phone, template: templateFor(n.kind), params: paramsFor(n), urlParam: orderLinkFor(n) })
   } catch (err) {
     const attempts = n.attempts + 1
     // Meta refusing the request itself (bad number, unknown or paused template) won't change on a retry.

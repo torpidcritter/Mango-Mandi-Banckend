@@ -41,20 +41,35 @@ export async function orderableDates(c, at = now()) {
 export const nextDeliveryDay = (c, at = now()) => firstOpenDay(c, addDays(istParts(at).date, 1))
 
 /**
+ * Orders that take a day's or a slot's capacity: anything not cancelled or
+ * returned, except unpaid orders whose hold has already run out (INV-A). Those
+ * are cancelled by the sweep or lazily at the next checkout, but until then
+ * they must not keep a capped day or slot full. $3 is "now" (clock.js, so
+ * tests can move it).
+ */
+const BOOKED = `o.status NOT IN ('CANCELLED', 'RTO') AND NOT (o.status = 'PAYMENT_PENDING' AND COALESCE(o.hold_expires_at < $3::timestamptz, FALSE))`
+
+/** Boxes booked on a date (see BOOKED), leaving out one order. */
+async function dayBooked(c, date, excludeOrderId = null) {
+  const used = await c.query(
+    `SELECT COALESCE(SUM(i.quantity), 0)::int AS n FROM orders o JOIN order_items i ON i.order_id = o.id
+      WHERE o.delivery_date = $1 AND ${BOOKED} AND o.id IS DISTINCT FROM $2`,
+    [date, excludeOrderId, now()],
+  )
+  return used.rows[0].n
+}
+
+/**
  * Locks the day's calendar row (if any) and checks box capacity. Callers hold
  * the lock until their transaction ends, which serialises bookings per day.
+ * `lock: false` (the checkout quote) only reads: the confirm re-checks under lock.
  */
-export async function checkCapacity(c, date, boxes, excludeOrderId = null) {
-  const { rows } = await c.query('SELECT is_open, max_boxes FROM delivery_calendar WHERE date = $1 FOR UPDATE', [date])
+export async function checkCapacity(c, date, boxes, excludeOrderId = null, { lock = true } = {}) {
+  const { rows } = await c.query(`SELECT is_open, max_boxes FROM delivery_calendar WHERE date = $1${lock ? ' FOR UPDATE' : ''}`, [date])
   if (!rows.length) return
   if (!rows[0].is_open) throw conflict(`Deliveries are closed on ${date}`, 'DATE_CLOSED')
   if (rows[0].max_boxes == null) return
-  const used = await c.query(
-    `SELECT COALESCE(SUM(i.quantity), 0)::int AS n FROM orders o JOIN order_items i ON i.order_id = o.id
-      WHERE o.delivery_date = $1 AND o.status NOT IN ('CANCELLED', 'RTO') AND o.id IS DISTINCT FROM $2`,
-    [date, excludeOrderId],
-  )
-  if (used.rows[0].n + boxes > rows[0].max_boxes) throw conflict(`${date} is fully booked`, 'DATE_FULL')
+  if ((await dayBooked(c, date, excludeOrderId)) + boxes > rows[0].max_boxes) throw conflict(`${date} is fully booked`, 'DATE_FULL')
 }
 
 // ---------------------------------------------------------------- slots
@@ -76,9 +91,9 @@ export async function activeSlots(c, { lock = false } = {}) {
 export async function slotUsage(c, date, excludeOrderId = null) {
   const { rows } = await c.query(
     `SELECT o.slot_id, COALESCE(SUM(i.quantity), 0)::int AS n FROM orders o JOIN order_items i ON i.order_id = o.id
-      WHERE o.delivery_date = $1 AND o.slot_id IS NOT NULL AND o.status NOT IN ('CANCELLED', 'RTO') AND o.id IS DISTINCT FROM $2
+      WHERE o.delivery_date = $1 AND o.slot_id IS NOT NULL AND ${BOOKED} AND o.id IS DISTINCT FROM $2
       GROUP BY o.slot_id`,
-    [date, excludeOrderId],
+    [date, excludeOrderId, now()],
   )
   return new Map(rows.map((r) => [r.slot_id, r.n]))
 }

@@ -10,11 +10,16 @@ let bySku = new Map()
 const view = (r) => ({
   sku: r.sku, name: r.name, variety: r.variety, boxSize: r.box_size, price: r.price, gstRate: Number(r.gst_rate), hsnCode: r.hsn_code,
   description: r.description, active: r.active, sortOrder: r.sort_order,
+  // What is in the box (optional): about how many mangoes, and about how heavy each one is.
+  fruitsPerBox: r.fruits_per_box ?? null, fruitWeightG: r.fruit_weight_g ?? null,
+  // Served by the API (GET /v1/products/:sku/photo); the version makes a new photo a new URL.
+  photoUrl: r.photo_version ? `/v1/products/${encodeURIComponent(r.sku)}/photo?v=${r.photo_version}` : null,
 })
 
 export async function loadProducts() {
   const { rows } = await query(
-    'SELECT sku, name, variety, box_size, price, gst_rate, hsn_code, description, active, sort_order FROM products ORDER BY sort_order, name, sku',
+    `SELECT p.sku, p.name, p.variety, p.box_size, p.price, p.gst_rate, p.hsn_code, p.description, p.active, p.sort_order, p.fruits_per_box, p.fruit_weight_g, ph.version AS photo_version
+       FROM products p LEFT JOIN product_photos ph ON ph.sku = p.sku ORDER BY p.sort_order, p.name, p.sku`,
   )
   bySku = new Map(rows.map((r) => [r.sku, view(r)]))
 }

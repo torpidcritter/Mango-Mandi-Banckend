@@ -2,11 +2,29 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, api } from '../api'
-import { BATCH_STATUS_LABEL, CONDITION_LABEL, RIPENESS_LABEL, date, dateTime } from '../format'
-import { MANAGER_ONLY_HINT, can } from '../permissions'
+import { ADJUST_REASON_LABEL, BATCH_STATUS_LABEL, CONDITION_LABEL, LEDGER_EVENT_LABEL, RIPENESS_LABEL, actorLabel, date, dateTime, humanize } from '../format'
+import { can, canSee } from '../permissions'
 import { useSession } from '../session'
-import { BATCH_FLOW, type BatchDetail as Batch, type BatchLine, type BatchStatus, type Condition, type Ripeness } from '../types'
-import { BatchBadge, Dialog, EmptyState, FormError, GatedButton, QueryError, Spinner, useToast, scrollRegion } from '../ui'
+import { BATCH_FLOW, type AdjustReason, type BatchDetail as Batch, type BatchLine, type BatchStatus, type Condition, type LedgerEntry, type Ripeness } from '../types'
+import {
+  BackLink,
+  BatchBadge,
+  ConfirmDialog,
+  Dialog,
+  DisabledReason,
+  EmptyState,
+  FormError,
+  GatedButton,
+  ManagerOnlyNote,
+  QueryError,
+  ReasonDialog,
+  Spinner,
+  Tabs,
+  tabPanelProps,
+  useToast,
+  scrollRegion,
+  usePageTitle,
+} from '../ui'
 
 /** Forward-only: every later step in the flow is reachable; the next one is primary. */
 function forwardSteps(status: BatchStatus): BatchStatus[] {
@@ -21,6 +39,7 @@ function isFinal(status: BatchStatus) {
 export default function BatchDetail() {
   const { id = '' } = useParams()
   const q = useQuery({ queryKey: ['batch', id], queryFn: () => api.batch(id) })
+  usePageTitle(q.data ? `${q.data.variety} batch, plucked ${date(q.data.pluckedOn)}` : q.isError ? 'Batch not found' : 'Batch')
 
   if (q.isPending) return <Spinner />
   if (q.isError) {
@@ -39,11 +58,13 @@ export default function BatchDetail() {
 
 function BatchView({ batch }: { batch: Batch }) {
   const [adjusting, setAdjusting] = useState<BatchLine | null>(null)
+  const [counting, setCounting] = useState(false)
   const [params] = useSearchParams()
   const [tab, setTab] = useState<'qc' | 'ledger'>('qc')
 
   return (
     <>
+      <BackLink to="/batches">Batches</BackLink>
       <div className="topbar">
         <h1>
           {batch.variety} <span className="muted small">plucked {date(batch.pluckedOn)}</span>
@@ -56,7 +77,15 @@ function BatchView({ batch }: { batch: Batch }) {
       <StatusControls batch={batch} />
 
       <section className="card">
-        <h2>Stock</h2>
+        <div className="topbar section-head">
+          <h2>Stock</h2>
+          <span className="spacer" />
+          {!isFinal(batch.status) && (
+            <button type="button" className="btn" onClick={() => setCounting(true)}>
+              Count stock
+            </button>
+          )}
+        </div>
         <div {...scrollRegion('Stock per SKU')}>
           <table>
             <thead>
@@ -64,10 +93,10 @@ function BatchView({ batch }: { batch: Batch }) {
                 <th>SKU</th>
                 <th className="num">On hand</th>
                 <th className="num">
-                  <abbr title="Reserved by customers who have not paid yet">Held</abbr>
+                  <abbr title="Reserved by customers who have not paid yet">Unpaid</abbr>
                 </th>
                 <th className="num">
-                  <abbr title="Paid, not yet packed">Committed</abbr>
+                  <abbr title="Paid, not yet packed">To pack</abbr>
                 </th>
                 <th className="num">Reserve buffer</th>
                 <th className="num">Available</th>
@@ -105,21 +134,27 @@ function BatchView({ batch }: { batch: Batch }) {
             </tbody>
           </table>
         </div>
+        {batch.status === 'CONDEMNED' && <DisabledReason>A condemned batch's stock can't be adjusted.</DisabledReason>}
       </section>
 
       <section className="card">
-        <div className="tabs" role="tablist">
-          <button type="button" role="tab" aria-selected={tab === 'qc'} onClick={() => setTab('qc')}>
-            QC
-          </button>
-          <button type="button" role="tab" aria-selected={tab === 'ledger'} onClick={() => setTab('ledger')}>
-            Ledger
-          </button>
+        <Tabs
+          id="batch"
+          label="QC and ledger"
+          tabs={[
+            ['qc', 'QC'],
+            ['ledger', 'Ledger'],
+          ]}
+          value={tab}
+          onChange={setTab}
+        />
+        <div {...tabPanelProps('batch', tab)}>
+          {tab === 'qc' ? <QcPanel batch={batch} focus={params.get('focusQC') === '1'} /> : <LedgerPanel batchId={batch.id} />}
         </div>
-        {tab === 'qc' ? <QcPanel batch={batch} focus={params.get('focusQC') === '1'} /> : <LedgerPanel batchId={batch.id} />}
       </section>
 
       {adjusting && <AdjustDialog batchId={batch.id} line={adjusting} onClose={() => setAdjusting(null)} />}
+      {counting && <CountDialog batch={batch} onClose={() => setCounting(false)} />}
     </>
   )
 }
@@ -132,17 +167,22 @@ function StatusControls({ batch }: { batch: Batch }) {
   const [condemned, setCondemned] = useState<{ moved: string[]; atRisk: string[] } | null>(null)
   // Exhausting a batch with boxes still on hand writes them off: a manager's call, with a reason.
   const [exhausting, setExhausting] = useState(false)
-  const [exhaustReason, setExhaustReason] = useState('')
+  const exhaustReason = useRef('')
+  // Skipping steps (Arriving straight to Selling) asks first, naming the steps it jumps over.
+  const [skipping, setSkipping] = useState<BatchStatus | null>(null)
   const left = batch.lines.reduce((n, l) => n + l.onHand, 0)
   const manager = me?.role === 'MANAGER'
+  // Condemning is shown (disabled) to operators, who escalate it; roles that never handle it don't see it.
+  const showCondemn = manager || me?.role === 'OPERATOR'
 
   const move = useMutation({
-    mutationFn: (status: BatchStatus) => api.setBatchStatus(batch.id, status, status === 'EXHAUSTED' && left > 0 ? exhaustReason.trim() : undefined),
+    mutationFn: (status: BatchStatus) => api.setBatchStatus(batch.id, status, status === 'EXHAUSTED' && left > 0 ? exhaustReason.current : undefined),
     onSuccess: (res, status) => {
       queryClient.invalidateQueries({ queryKey: ['batch', batch.id] })
       queryClient.invalidateQueries({ queryKey: ['batches'] })
       queryClient.invalidateQueries({ queryKey: ['summary'] })
       setExhausting(false)
+      setSkipping(null)
       if (status === 'CONDEMNED') {
         setConfirmCondemn(false)
         setCondemned({ moved: res?.rebalancedOrders ?? [], atRisk: res?.atRiskOrders ?? [] })
@@ -151,12 +191,13 @@ function StatusControls({ batch }: { batch: Batch }) {
       }
     },
     onError: (err) => {
-      if (!confirmCondemn && !exhausting) toast.error(err)
+      if (!confirmCondemn && !exhausting && !skipping) toast.error(err)
     },
   })
 
   const steps = forwardSteps(batch.status)
   const [next, ...skips] = steps
+  const writeOffGated = steps.includes('EXHAUSTED') && left > 0
 
   return (
     <section className="card">
@@ -183,91 +224,83 @@ function StatusControls({ batch }: { batch: Batch }) {
                 Skip to {BATCH_STATUS_LABEL[s]}
               </GatedButton>
             ) : (
-              <button key={s} type="button" className="btn" disabled={move.isPending} onClick={() => move.mutate(s)}>
+              <button
+                key={s}
+                type="button"
+                className="btn"
+                disabled={move.isPending}
+                onClick={() => {
+                  move.reset()
+                  setSkipping(s)
+                }}
+              >
                 Skip to {BATCH_STATUS_LABEL[s]}
               </button>
             ),
           )}
-          <span className="spacer" style={{ flex: 1 }} />
-          <GatedButton
-            allowed={can(me?.role, 'condemnBatch')}
-            className="btn btn-danger"
-            onClick={() => setConfirmCondemn(true)}
-          >
-            Condemn batch
-          </GatedButton>
+          <span className="grow" />
+          {showCondemn && (
+            <GatedButton allowed={can(me?.role, 'condemnBatch')} className="btn btn-danger" onClick={() => setConfirmCondemn(true)}>
+              Condemn batch
+            </GatedButton>
+          )}
         </div>
       )}
 
-      {exhausting && (
-        <Dialog
-          title="Write off the rest of this batch?"
-          tone="danger"
-          onClose={() => setExhausting(false)}
-          footer={
-            <>
-              <button type="button" className="btn" onClick={() => setExhausting(false)}>
-                Keep batch
-              </button>
-              <button
-                type="submit"
-                form="exhaust-form"
-                className="btn btn-danger"
-                disabled={move.isPending || exhaustReason.trim().length < 3}
-              >
-                {move.isPending ? 'Saving…' : `Write off ${left} boxes`}
-              </button>
-            </>
-          }
+      {skipping && (
+        <ConfirmDialog
+          title={`Skip to ${BATCH_STATUS_LABEL[skipping]}?`}
+          confirmLabel={`Move to ${BATCH_STATUS_LABEL[skipping]}`}
+          busy={move.isPending}
+          error={move.error}
+          onClose={() => setSkipping(null)}
+          onConfirm={() => move.mutate(skipping)}
         >
-          <form
-            id="exhaust-form"
-            onSubmit={(e) => {
-              e.preventDefault()
-              if (exhaustReason.trim().length >= 3) move.mutate('EXHAUSTED')
-            }}
-          >
-            <p>
-              {left} boxes are still on hand. Marking the batch exhausted writes them off for good; it cannot be undone.
-            </p>
-            <div className="field">
-              <label htmlFor="exhaust-reason">Reason</label>
-              <textarea id="exhaust-reason" value={exhaustReason} onChange={(e) => setExhaustReason(e.target.value)} data-autofocus />
-              <p className="hint">At least 3 characters. Saved in the batch ledger.</p>
-            </div>
-            <FormError error={move.error} />
-          </form>
-        </Dialog>
+          <p>
+            This jumps over {steps.slice(0, steps.indexOf(skipping)).map((x) => BATCH_STATUS_LABEL[x]).join(', ')}. Batches only move forward, so it can't
+            be undone.
+          </p>
+        </ConfirmDialog>
+      )}
+
+      {exhausting && (
+        <ReasonDialog
+          title="Write off the rest of this batch?"
+          confirmLabel={`Write off ${left} boxes`}
+          cancelLabel="Keep batch"
+          hint="At least 3 characters. Saved in the batch ledger."
+          busy={move.isPending}
+          error={move.error}
+          onClose={() => setExhausting(false)}
+          onSubmit={(reason) => {
+            exhaustReason.current = reason
+            move.mutate('EXHAUSTED')
+          }}
+        >
+          <p>
+            {left} boxes are still on hand. Marking the batch exhausted writes them off for good; it cannot be undone.
+          </p>
+        </ReasonDialog>
       )}
 
       {confirmCondemn && (
-        <Dialog
+        <ConfirmDialog
           title="Condemn this batch?"
           tone="danger"
+          confirmLabel="Condemn and move orders"
+          cancelLabel="Keep batch"
+          busyLabel="Condemning…"
+          busy={move.isPending}
+          error={move.error}
           onClose={() => setConfirmCondemn(false)}
-          footer={
-            <>
-              <button type="button" className="btn" onClick={() => setConfirmCondemn(false)} data-autofocus>
-                Keep batch
-              </button>
-              <button
-                type="button"
-                className="btn btn-danger"
-                disabled={move.isPending}
-                onClick={() => move.mutate('CONDEMNED')}
-              >
-                {move.isPending ? 'Condemning…' : 'Condemn and move orders'}
-              </button>
-            </>
-          }
+          onConfirm={() => move.mutate('CONDEMNED')}
         >
           <p>
             This cannot be undone. Its remaining stock is written off. Open orders holding this batch are moved to
             another batch of the same ripeness where stock allows; any that can't be moved are flagged{' '}
             <strong>at risk</strong> for you to sort out. No order is cancelled.
           </p>
-          <FormError error={move.error} />
-        </Dialog>
+        </ConfirmDialog>
       )}
 
       {condemned && (
@@ -306,8 +339,16 @@ function StatusControls({ batch }: { batch: Batch }) {
           )}
         </Dialog>
       )}
-      {!can(me?.role, 'condemnBatch') && !isFinal(batch.status) && (
-        <p className="hint">Condemning a batch: {MANAGER_ONLY_HINT.toLowerCase()}.</p>
+      {!manager && !isFinal(batch.status) && (showCondemn || writeOffGated) && (
+        <ManagerOnlyNote
+          what={
+            showCondemn && writeOffGated
+              ? 'Condemning a batch or writing off boxes still on hand'
+              : showCondemn
+                ? 'Condemning a batch'
+                : 'Writing off boxes still on hand'
+          }
+        />
       )}
     </section>
   )
@@ -391,7 +432,7 @@ function QcPanel({ batch, focus }: { batch: Batch; focus: boolean }) {
         </button>
       </form>
 
-      <h3 style={{ marginTop: '1.25rem' }}>History</h3>
+      <h3 className="mt-5">History</h3>
       {batch.qc.length === 0 ? (
         <EmptyState>No QC logged yet. This batch is not sellable until QC is logged.</EmptyState>
       ) : (
@@ -426,9 +467,21 @@ function QcPanel({ batch, focus }: { batch: Batch; focus: boolean }) {
   )
 }
 
+/** "SELLING → CONDEMNED: mould" (a status change's reason) → "Selling → Condemned: mould". */
+function ledgerReason(e: LedgerEntry): string {
+  if (!e.reason) return '—'
+  return e.reason.replace(/^([A-Z_]+) → ([A-Z_]+)/, (_m, from: string, to: string) =>
+    `${BATCH_STATUS_LABEL[from as BatchStatus] ?? humanize(from)} → ${BATCH_STATUS_LABEL[to as BatchStatus] ?? humanize(to)}`,
+  )
+}
+
 function LedgerPanel({ batchId }: { batchId: string }) {
   // Loaded lazily: this component only mounts when the Ledger tab is open.
   const q = useQuery({ queryKey: ['ledger', batchId], queryFn: () => api.ledger(batchId) })
+  // Some steps record the staff id, not the email: managers can see the staff list to name them.
+  const { me } = useSession()
+  const staff = useQuery({ queryKey: ['staff'], queryFn: api.staff, enabled: canSee(me?.role, 'staff') })
+  const staffEmail = (staffId: string) => staff.data?.find((m) => m.id === staffId)?.email
   if (q.isPending) return <Spinner label="Loading ledger" />
   if (q.isError) return <QueryError error={q.error} onRetry={() => q.refetch()} />
   if (q.data.length === 0) return <EmptyState>No stock movements yet.</EmptyState>
@@ -439,8 +492,8 @@ function LedgerPanel({ batchId }: { batchId: string }) {
           <tr>
             <th>Event</th>
             <th>SKU</th>
-            <th className="num">Δ Qty</th>
-            <th>Actor</th>
+            <th className="num">Change</th>
+            <th>By</th>
             <th>Reason</th>
             <th>Time</th>
           </tr>
@@ -448,13 +501,15 @@ function LedgerPanel({ batchId }: { batchId: string }) {
         <tbody>
           {q.data.map((e, i) => (
             <tr key={e.id ?? i}>
-              <td>{e.eventType}</td>
+              <td>{LEDGER_EVENT_LABEL[e.eventType] ?? humanize(e.eventType)}</td>
               <td>{e.sku ?? '—'}</td>
               <td className={`num ${e.delta < 0 ? 'text-danger' : e.delta > 0 ? 'text-good' : ''}`}>
                 {e.delta > 0 ? `+${e.delta}` : e.delta}
               </td>
-              <td>{e.actorId}</td>
-              <td>{e.reason ?? '—'}</td>
+              <td>{e.actorEmail ?? actorLabel(e.actorId, e.actorType, staffEmail)}</td>
+              <td>
+                {e.reasonCode && <span className="badge">{ADJUST_REASON_LABEL[e.reasonCode] ?? humanize(e.reasonCode)}</span>} {ledgerReason(e)}
+              </td>
               <td>{dateTime(e.createdAt)}</td>
             </tr>
           ))}
@@ -470,10 +525,12 @@ function AdjustDialog({ batchId, line, onClose }: { batchId: string; line: Batch
   const [onHand, setOnHand] = useState(String(line.onHand))
   const [reserve, setReserve] = useState(String(line.reserveBuffer))
   const [reason, setReason] = useState('')
+  // Until staff pick one: Received for a short arrival, Correction otherwise.
+  const [picked, setCode] = useState<AdjustReason | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
 
   const save = useMutation({
-    mutationFn: (input: { onHand?: number; reserveBuffer?: number; reason: string }) =>
+    mutationFn: (input: { onHand?: number; reserveBuffer?: number; reason: string; reasonCode: AdjustReason }) =>
       api.adjustLine(batchId, line.id, input),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['batch', batchId] })
@@ -487,8 +544,9 @@ function AdjustDialog({ batchId, line, onClose }: { batchId: string; line: Batch
   const ohNumber = Number(onHand)
   // Fewer boxes than customers already hold: a short arrival, which takes boxes back from orders.
   const short = Number.isInteger(ohNumber) && ohNumber >= 0 && ohNumber < promised
+  const code: AdjustReason = picked ?? (short ? 'RECEIVED' : 'CORRECTION')
   const shortArrival = useMutation({
-    mutationFn: (input: { onHand: number; reason: string }) => api.shortArrival(batchId, line.id, input),
+    mutationFn: (input: { onHand: number; reason: string; reasonCode: AdjustReason }) => api.shortArrival(batchId, line.id, input),
     onSuccess: (r) => {
       queryClient.invalidateQueries({ queryKey: ['batch', batchId] })
       queryClient.invalidateQueries({ queryKey: ['ledger', batchId] })
@@ -514,8 +572,8 @@ function AdjustDialog({ batchId, line, onClose }: { batchId: string; line: Batch
       return setFormError('Enter whole numbers of zero or more.')
     }
     if (!reason.trim()) return setFormError('A reason is required.')
-    if (short) return shortArrival.mutate({ onHand: oh, reason: reason.trim() })
-    const input: { onHand?: number; reserveBuffer?: number; reason: string } = { reason: reason.trim() }
+    if (short) return shortArrival.mutate({ onHand: oh, reason: reason.trim(), reasonCode: code })
+    const input: { onHand?: number; reserveBuffer?: number; reason: string; reasonCode: AdjustReason } = { reason: reason.trim(), reasonCode: code }
     if (oh !== line.onHand) input.onHand = oh
     if (rb !== line.reserveBuffer) input.reserveBuffer = rb
     if (input.onHand === undefined && input.reserveBuffer === undefined) return setFormError('Nothing has changed.')
@@ -539,7 +597,7 @@ function AdjustDialog({ batchId, line, onClose }: { batchId: string; line: Batch
     >
       <form id="adjust-form" onSubmit={onSubmit} noValidate>
         <p className="muted small">
-          Held {line.held} + committed {line.committed}. Going below what customers already hold records a short arrival.
+          Customers already hold {line.held} unpaid and {line.committed} to pack. Going below what customers already hold records a short arrival.
         </p>
         <div className="field">
           <label htmlFor="adj-onhand">On hand</label>
@@ -548,6 +606,16 @@ function AdjustDialog({ batchId, line, onClose }: { batchId: string; line: Batch
         <div className="field">
           <label htmlFor="adj-reserve">Reserve buffer</label>
           <input id="adj-reserve" type="number" min={0} step={1} value={reserve} onChange={(e) => setReserve(e.target.value)} />
+        </div>
+        <div className="field">
+          <label htmlFor="adj-code">Why</label>
+          <select id="adj-code" value={code} onChange={(e) => setCode(e.target.value as AdjustReason)}>
+            {ADJUST_CODES.map((c) => (
+              <option key={c} value={c}>
+                {ADJUST_REASON_LABEL[c]}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="field">
           <label htmlFor="adj-reason">Reason</label>
@@ -560,6 +628,130 @@ function AdjustDialog({ batchId, line, onClose }: { batchId: string; line: Batch
           </p>
         )}
         <FormError error={formError ?? save.error ?? shortArrival.error} />
+      </form>
+    </Dialog>
+  )
+}
+
+/** Reasons staff pick when changing a count by hand (Return restock is booked from the order). */
+const ADJUST_CODES: AdjustReason[] = ['CORRECTION', 'COUNT', 'RECEIVED', 'DAMAGED', 'THEFT_LOSS', 'OTHER']
+
+/**
+ * A physical count (INV-D): per line, the boxes on the shelf, including those
+ * packed for orders that haven't left yet (they are off "on hand" already).
+ * Shows the difference from the books, then posts each difference as an
+ * adjustment with reason Count, or as a short arrival when the count is below
+ * what customers already hold.
+ */
+function CountDialog({ batch, onClose }: { batch: Batch; onClose: () => void }) {
+  const toast = useToast()
+  const queryClient = useQueryClient()
+  const [counted, setCounted] = useState<Record<string, string>>({})
+  const [done, setDone] = useState<string[]>([])
+  const rows = batch.lines.map((l) => {
+    const packed = l.packedNotDispatched ?? 0
+    const expected = l.onHand + packed
+    const raw = counted[l.id] ?? ''
+    const n = raw === '' ? null : Number(raw)
+    const valid = n !== null && Number.isInteger(n) && n >= 0
+    return { l, packed, expected, n: valid ? n : null, invalid: raw !== '' && !valid, variance: valid ? n - expected : null }
+  })
+  const changes = rows.filter((r) => r.variance !== null && r.variance !== 0 && !done.includes(r.l.id))
+  const tooFew = rows.find((r) => r.n !== null && r.n < r.packed)
+
+  const post = useMutation({
+    mutationFn: async () => {
+      for (const r of changes) {
+        const onHand = (r.n as number) - r.packed
+        const reason = `Physical count: ${r.n} counted${r.packed ? `, ${r.packed} of them packed for orders not yet dispatched` : ''} (books said ${r.expected})`
+        if (onHand < r.l.held + r.l.committed) await api.shortArrival(batch.id, r.l.id, { onHand, reason, reasonCode: 'COUNT' })
+        else await api.adjustLine(batch.id, r.l.id, { onHand, reason, reasonCode: 'COUNT' })
+        setDone((d) => [...d, r.l.id])
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['batch', batch.id] })
+      queryClient.invalidateQueries({ queryKey: ['ledger', batch.id] })
+      queryClient.invalidateQueries({ queryKey: ['batches'] })
+      queryClient.invalidateQueries({ queryKey: ['orders'] })
+    },
+    onSuccess: () => {
+      toast.success('Count recorded')
+      onClose()
+    },
+  })
+
+  function onSubmit(e: FormEvent) {
+    e.preventDefault()
+    if (changes.length && !tooFew && !rows.some((r) => r.invalid)) post.mutate()
+  }
+
+  return (
+    <Dialog
+      title="Count stock"
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" form="count-form" className="btn btn-primary" disabled={post.isPending || !changes.length || Boolean(tooFew)}>
+            {post.isPending ? 'Saving…' : changes.length ? `Record ${changes.length} ${changes.length === 1 ? 'difference' : 'differences'}` : 'No differences'}
+          </button>
+        </>
+      }
+    >
+      <form id="count-form" onSubmit={onSubmit} noValidate>
+        <p className="muted small">
+          Count every box of this batch on the shelf, including boxes already packed for orders that haven't left. Each difference is
+          saved with the reason Count.
+        </p>
+        <div {...scrollRegion('Count per SKU')}>
+          <table>
+            <thead>
+              <tr>
+                <th>SKU</th>
+                <th className="num">Books</th>
+                <th className="num">Counted</th>
+                <th className="num">Difference</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.l.id}>
+                  <td>
+                    {r.l.productName ?? r.l.sku}
+                    {r.packed > 0 && <div className="muted small">{r.packed} packed, not yet dispatched</div>}
+                  </td>
+                  <td className="num">{r.expected}</td>
+                  <td className="num">
+                    <label className="sr-only" htmlFor={`count-${r.l.id}`}>
+                      Boxes counted for {r.l.sku}
+                    </label>
+                    <input
+                      id={`count-${r.l.id}`}
+                      inputMode="numeric"
+                      size={5}
+                      value={counted[r.l.id] ?? ''}
+                      aria-invalid={r.invalid || undefined}
+                      onChange={(e) => setCounted({ ...counted, [r.l.id]: e.target.value.trim() })}
+                    />
+                  </td>
+                  <td className={`num ${r.variance && r.variance < 0 ? 'text-danger' : r.variance ? 'text-good' : ''}`}>
+                    {r.variance === null ? '—' : r.variance > 0 ? `+${r.variance}` : r.variance}
+                    {done.includes(r.l.id) && <span className="muted small"> saved</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {tooFew && (
+          <p className="notice notice-warn" role="status">
+            {tooFew.l.sku}: fewer boxes than are packed for orders ({tooFew.packed}). Check the packed orders first.
+          </p>
+        )}
+        <FormError error={post.error} />
       </form>
     </Dialog>
   )

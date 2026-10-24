@@ -31,6 +31,20 @@ export const pool = new pg.Pool({
 /** The error pg raises when no connection frees up in time. */
 export const isPoolTimeout = (err) => /timeout exceeded when trying to connect/i.test(err?.message ?? '')
 
+/**
+ * The database can't be reached at all (OPS-08): refused, reset, unknown host,
+ * a server shutting down (57P0x) or a connection-class SQLSTATE (08xxx).
+ * Callers answer these with a retryable 503, not a 500.
+ */
+const NET_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE'])
+export const isDbUnavailable = (err) => {
+  if (!err) return false
+  const code = String(err.code ?? '')
+  if (NET_CODES.has(code) || /^57P0[1-3]$/.test(code) || /^08/.test(code)) return true
+  if (err instanceof AggregateError && err.errors?.some(isDbUnavailable)) return true
+  return /Connection terminated|connection timeout|Client has encountered a connection error/i.test(err.message ?? '')
+}
+
 // Lets Vercel close idle connections before it suspends an instance.
 if (onVercel) attachDatabasePool(pool)
 
@@ -55,8 +69,10 @@ export async function tx(fn, { retries = 2 } = {}) {
     } catch (err) {
       if (!RETRYABLE.has(err?.code) || attempt >= retries) throw err
       metrics.dbRetries.inc({ code: err.code })
-      logger.warn({ code: err.code, attempt: attempt + 1 }, 'transaction retried')
-      await new Promise((r) => setTimeout(r, 10 + Math.random() * 40 * (attempt + 1)))
+      logger.warn({ sqlState: err.code, attempt: attempt + 1 }, 'transaction retried')
+      await new Promise((r) => {
+        setTimeout(r, 10 + Math.random() * 40 * (attempt + 1))
+      })
     }
   }
 }
@@ -85,7 +101,9 @@ export async function connectWithRetry(retries = 10, baseMs = 1000) {
     } catch (err) {
       if (attempt >= retries) throw err
       logger.warn({ attempt, err: err.message }, 'database not ready, retrying')
-      await new Promise((r) => setTimeout(r, attempt * baseMs))
+      await new Promise((r) => {
+        setTimeout(r, attempt * baseMs)
+      })
     }
   }
 }

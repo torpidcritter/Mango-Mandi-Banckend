@@ -4,9 +4,10 @@ import { api } from '../api'
 import { can } from '../permissions'
 import { useSession } from '../session'
 import type { Pincode } from '../types'
-import { Badge, Dialog, EmptyState, FormError, GatedButton, QueryError, Spinner, useToast, scrollRegion } from '../ui'
+import { Badge, ConfirmDialog, Dialog, EmptyState, FormError, GatedButton, ManagerOnlyNote, QueryError, Spinner, useToast, scrollRegion, usePageTitle } from '../ui'
 
 export default function Pincodes() {
+  usePageTitle('Pincodes')
   const { me } = useSession()
   const toast = useToast()
   const queryClient = useQueryClient()
@@ -105,63 +106,42 @@ export default function Pincodes() {
           </table>
         </div>
       )}
+      {!canDelete && q.data && q.data.length > 0 && <ManagerOnlyNote what="Deleting a pincode" />}
 
       {adding && <AddDialog onClose={() => setAdding(false)} onDone={refresh} />}
 
       {deactivating && (
-        <Dialog
+        <ConfirmDialog
           title={`Deactivate ${deactivating.pincode}?`}
+          tone="danger"
+          confirmLabel="Deactivate"
+          cancelLabel="Keep active"
+          busy={toggle.isPending}
           onClose={() => setDeactivating(null)}
-          footer={
-            <>
-              <button type="button" className="btn" onClick={() => setDeactivating(null)}>
-                Keep active
-              </button>
-              <button
-                type="button"
-                className="btn btn-danger"
-                disabled={toggle.isPending}
-                onClick={() => toggle.mutate({ pincode: deactivating.pincode, active: false })}
-              >
-                Deactivate
-              </button>
-            </>
-          }
+          onConfirm={() => toggle.mutate({ pincode: deactivating.pincode, active: false })}
         >
           <p>
             Customers in {deactivating.city} ({deactivating.pincode}) will no longer be able to order. You can activate it
             again at any time.
           </p>
-        </Dialog>
+        </ConfirmDialog>
       )}
 
       {deleting && (
-        <Dialog
+        <ConfirmDialog
           title={`Delete ${deleting.pincode}?`}
           tone="danger"
+          confirmLabel="Delete pincode"
+          busy={remove.isPending}
+          error={remove.error}
           onClose={() => setDeleting(null)}
-          footer={
-            <>
-              <button type="button" className="btn" onClick={() => setDeleting(null)}>
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="btn btn-danger"
-                disabled={remove.isPending}
-                onClick={() => remove.mutate(deleting.pincode)}
-              >
-                Delete pincode
-              </button>
-            </>
-          }
+          onConfirm={() => remove.mutate(deleting.pincode)}
         >
           <p>
             This removes {deleting.pincode} ({deleting.city}) entirely. If you only want to stop orders there,{' '}
             <strong>deactivate</strong> it instead.
           </p>
-          <FormError error={remove.error} />
-        </Dialog>
+        </ConfirmDialog>
       )}
     </>
   )

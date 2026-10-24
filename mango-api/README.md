@@ -30,13 +30,19 @@ batches when the database is empty. Point the panel at it with
 ## Login codes by SMS (Jio)
 
 Customers sign in with a 6-digit code. With `SMS_PROVIDER=jio` the code goes out
-through the Jio SMS gateway; production refuses to start without it. Set `JIO_SMS_URL`,
+through the Jio SMS gateway. Production needs Jio, or WhatsApp with
+`OTP_DEFAULT_CHANNEL=whatsapp` (codes by WhatsApp only, e.g. before DLT is approved). Set `JIO_SMS_URL`,
 `JIO_SMS_API_KEY`, and the DLT registration (`JIO_SMS_SENDER_ID`, `JIO_SMS_TEMPLATE_ID`,
 `JIO_SMS_ENTITY_ID`). `JIO_SMS_TEXT` must match the registered template exactly, with
 `{code}` where the code goes. The request body is in [`src/sms.js`](src/sms.js); check it
-against your Jio account's API docs before going live. Outside production the default
-`SMS_PROVIDER=log` returns the code as `devCode`; it is written to the log only with
-`LOG_OTP_CODES=true` (for a preview, where `devCode` is off; production refuses it).
+against your Jio account's API docs before going live: **the request format in the code is
+not yet verified against Jio's documentation** (remaining blocker OPS-03b). A reply counts as sent only
+when the field `JIO_SMS_SUCCESS_PATH` holds one of `JIO_SMS_SUCCESS_VALUES`, both copied from
+Jio's docs; anything else (including a bare HTTP 200) counts as not sent and the code goes by
+WhatsApp instead. Outside production the default
+`SMS_PROVIDER=log` returns the code as `devCode` (unless `OTP_CODE_IN_RESPONSE=false`); it is
+written to the log only with `LOG_OTP_CODES=true` (for a preview, where `devCode` is off;
+production refuses it).
 
 If the SMS send fails and WhatsApp is set up (`WHATSAPP_PROVIDER=meta`), the code goes out
 on WhatsApp instead, as the authentication template `mandi_login_code` (code in the body and
@@ -75,8 +81,34 @@ named `WHATSAPP_TEMPLATE_PREFIX` + kind (default prefix `mandi_`), in `WHATSAPP_
 | `mandi_ripeness_guide` | a minute after `order_confirmed` or `replacement_confirmed`, only when a box arrives raw or semi-ripe (utility) | name, order number, when each box is ready ("Alphonso 3kg Box (raw): ready around Mon, 19 Oct"), storage tip |
 | `mandi_back_in_stock` | a box the customer asked about is in stock again (they tapped "Tell me when it's back") | name, box ("Alphonso 3kg Box (ripe)"), first day ("Fri, 16 Oct"), shop link |
 | `mandi_reorder_reminder` | a week after a delivery, only for customers who turned reminders on, between 10 AM and 7 PM, not if they ordered since (marketing) | name, box they had, shop link |
+| `mandi_claim_received` | a customer reports a problem with a delivered order (utility). **New: needs Meta approval; only sent once `WHATSAPP_CLAIM_UPDATES=true`** | name, order number; "Open order" URL button |
+| `mandi_claim_rejected` | staff reject a claim; a replacement sends `mandi_replacement_confirmed` instead (utility). **New: needs Meta approval; only sent once `WHATSAPP_CLAIM_UPDATES=true`** | name, order number, the reason staff gave (shown to the customer); "Open order" URL button |
 
 An order without a slot says "during the day" in place of the slot.
+
+A payment that lands after the hold ran out, when no date has stock, confirms the order at
+risk. Its `order_confirmed` is held back (shown on the order page as not sent) rather than
+promise a date the shop can't keep, and the shop's order page says we're finding stock. When
+stock is found the confirmation goes out with the real date; a manager may instead move or
+cancel the order. There is no "we're finding stock" template yet: if the owner wants the
+customer told straight away, a new utility template has to be approved in WhatsApp Manager first.
+
+**"Open order" button (UX-7).** A template with this button has one URL button (index 0) of
+type *dynamic URL*, `https://mandimangoes.in/orders/{{1}}` (the shop's real domain), whose
+variable the API fills with the order id, so one tap opens the order to track, move, cancel or
+report a problem. `mandi_claim_received` and `mandi_claim_rejected` are created with it. For
+`mandi_order_confirmed`, `mandi_replacement_confirmed`, `mandi_out_for_delivery`,
+`mandi_delivered`, `mandi_delivery_failed` and `mandi_date_moved` the button is a template
+change that needs Meta's approval again: add it in WhatsApp Manager, wait for every one of them
+to be approved, then set `WHATSAPP_ORDER_LINKS=true`. Until then the API sends them without the
+button (a button variable sent to a template without one is refused by Meta). The gift
+recipient's copy of `mandi_out_for_delivery` carries the button too; the order page asks them to
+sign in as the buyer.
+
+Suggested wording for the two new templates (the owner words the final text in WhatsApp
+Manager): "Hi {{1}}, we have your report about order {{2}}. We will look at it and reply here
+within a day." and "Hi {{1}}, we looked into your report about order {{2}} and could not offer
+a replacement: {{3}}. Reply here if you would like to talk to us about it."
 
 Word `mandi_date_moved` so it also says the customer can cancel for a full refund until the
 order is packed, for example: "Hi {{1}}, order {{2}} will now arrive on {{3}}, {{4}}. If that
@@ -271,6 +303,9 @@ below override both.
   payment page until the hold ends. Only the hold expiring cancels an unpaid order.
 - **Double charges**: a second payment captured for an order or preorder that is
   already paid is refunded on its own (`duplicate_payments`); the order is untouched.
+  So is a captured payment that fails the amount or currency check. Every refund the
+  system sends on its own is listed in deploy/VERCEL.md ("Refunds the system sends on
+  its own").
   Payment links expire 16 minutes after they are made, and the shop's payment window
   closes when the hold ends.
 - **Customer cancels** are allowed until the order is packed. A paid order is refunded
@@ -297,7 +332,7 @@ All the numbers above live in the versioned `app_config` table (`GET/PUT
 
 | Area | Routes |
 |------|--------|
-| System | `GET /health`, `GET /ready`, `GET /metrics` (optional bearer `METRICS_TOKEN`) |
+| System | `GET /health`, `GET /ready`, `GET /metrics` (optional bearer `METRICS_TOKEN`; Docker path only, 404 on Vercel) |
 | Staff auth | `POST /admin/v1/auth/login`, `/refresh`, `/logout`, `GET /auth/me`. Refresh token is the httpOnly `mango_admin_rt` cookie, rotated on each use. |
 | Dashboard | `GET /admin/v1/summary` (adds `atRiskOrders`), `GET /products` |
 | Products (manager) | `POST /products`, `PATCH /products/:sku` (rename, reprice, `active: true` to put back on sale; the variety is fixed once a batch holds it), `DELETE /products/:sku` (deletes a never-used product, otherwise takes it off sale and keeps it for history). Starter products are seeded only into an empty database. |
@@ -316,11 +351,21 @@ All the numbers above live in the versioned `app_config` table (`GET/PUT
 | Storefront | `GET /v1/delivery/check?pincode=`, `GET /v1/delivery/slots?pincode=&delivery_date=`, `GET /v1/catalogue?pincode=&delivery_date=`, `GET/POST /v1/cart`, `DELETE /v1/cart/items/:sku` |
 | Checkout | `POST /v1/checkout/quote`, `POST /v1/checkout/confirm` (requires `Idempotency-Key`) |
 | Customer preorders | `GET /v1/preorders/weeks?sku=`, `POST /v1/preorders` (requires `Idempotency-Key`), `GET /v1/preorders`, `GET /v1/preorders/:id`, `POST /v1/preorders/:id/cancel` |
-| Orders and claims | `GET /v1/orders`, `GET /v1/orders/:id`, `/payment-status`, `POST /v1/orders/:id/cancel`, `POST /v1/orders/:id/reschedule` (confirmed orders, before packing), `PUT /v1/orders/:id/rating` (delivered orders), `GET/POST /v1/claims` |
+| Orders and claims | `GET /v1/orders`, `GET /v1/orders/:id`, `/payment-status` (asks Razorpay when an order is still unpaid a minute after checkout, at most every 30 s), `POST /v1/orders/:id/verify-payment` (Checkout's `razorpay_payment_id`, `razorpay_order_id`, `razorpay_signature`: the signature is checked with the key secret, then the payment is fetched from Razorpay and applied), `POST /v1/orders/:id/cancel`, `POST /v1/orders/:id/reschedule` (confirmed orders, before packing), `PUT /v1/orders/:id/rating` (delivered orders), `GET/POST /v1/claims` |
 | Saved addresses | `GET /v1/me/addresses`, `DELETE /v1/me/addresses/:id` (an order saves its address; at most five, gifts are not saved) |
-| Payments | `POST /webhooks/razorpay` (HMAC-SHA256 over the raw body, deduplicated; `payment.authorized`, `payment.captured`, `payment.failed`, `payment_link.paid`, `refund.processed`, `refund.failed`) |
+| Payments | `POST /webhooks/razorpay` (HMAC-SHA256 over the raw body, deduplicated; `payment.authorized`, `payment.captured`, `payment.failed`, `payment_link.paid`, `refund.processed`, `refund.failed`, `payment.dispute.*` recorded for Needs attention; `RAZORPAY_WEBHOOK_SECRET_PREVIOUS` is also accepted while set) |
 | WhatsApp | `GET /webhooks/whatsapp` (Meta's verify handshake), `POST /webhooks/whatsapp` (signed messages and payment updates) |
 | Dev only | `POST /v1/dev/pay`, `/v1/dev/mark-paid-at-gateway`, `/v1/dev/reconcile` (mounted only with `ENABLE_DEV_ROUTES=true`, outside production, with no Razorpay keys set) |
+
+The staff routes live in one file per area under [`src/admin/`](src/admin): `auth.js` (sign-in,
+`/auth/me`, `/me/*`), `reports.js` (summary, analytics, attention, audit), `products.js`,
+`batches.js`, `orders.js` (with the pack list), `deliveries.js` (manifest, dispatch, riders, proof
+of delivery), `promos.js`, `staff.js`, `claims.js`, `planning.js` (pincodes, rules, calendar,
+slots, coverage) and `preorders.js`, with helpers more than one area uses in `shared.js`.
+[`src/admin.js`](src/admin.js) only builds `/admin/v1`: the sign-in routes, then the gate
+(`requireAdmin`, two-step setup, `limitByRole`, `riderScope`, the audit), then each area's
+router. Manager-only routes carry `requireManager` on the route itself, which is where the role
+matrix test looks for it; a new area router must be mounted after the gate.
 
 Errors are `{ error: { code, message, requestId } }`. Admin routes are the contract in
 the panel's `src/types.ts`; extra fields (`atRisk`, `atRiskReason`, `replacementFor`,
@@ -377,11 +422,46 @@ two-minute lease before Razorpay is called (and Razorpay gets an idempotency key
 Razorpay webhook event id is stored in the same transaction as its effect, so a repeat is
 ignored and an out-of-order `payment.failed` never undoes a capture.
 
+## Security and privacy notes
+
+- **Riders' stops.** Each order can be given to a rider (`orders.rider_id`). Managers and
+  operators do it on the Deliveries page, per stop or per slot (`POST /admin/v1/manifest/assign`
+  `{date, riderId, orderIds?, slotId?}`; `GET /admin/v1/riders` lists riders), or when starting a
+  run (`riderId` on `/manifest/dispatch`). A rider who sends out a packed stop nobody has takes
+  it. Riders see only their own stops (plus how many packed ones nobody has), another rider's
+  stop answers 404, and delivered stops from before today drop out of their view. Removing a
+  rider puts their stops back in the pool.
+- **No caching.** Every signed-in answer and every sign-in answer carries
+  `Cache-Control: no-store`; photos keep their own `private` caching.
+- **Sign out everywhere.** `POST /v1/me/sign-out-everywhere` (the shop's Account page) ends
+  every refresh session and raises the account's `session_version`, so access tokens already
+  issued stop working (at once on this instance, within 30 seconds on others).
+- **Login codes.** Codes are stored as a SHA-256 of the code with a pepper: `OTP_PEPPER`, or
+  `JWT_SECRET` when that is unset. Setting `OTP_PEPPER` later keeps codes already sent working
+  for their five minutes. Outside production the code also comes back as `devCode` unless
+  `OTP_CODE_IN_RESPONSE=false` (the local launcher's `--phone` mode sets it).
+- **Turnstile.** A token counts only when Cloudflare says it passed, on one of the
+  `CUSTOMER_ORIGIN` host names, for the action `otp` (the shop's widget sets it).
+- **Degraded-mode answers (a known trade-off).** While the day's share of codes for new
+  numbers is used up (`OTP_PAUSED`), or Cloudflare cannot be reached (`CAPTCHA_UNAVAILABLE`),
+  numbers with an account still get a code and new numbers get a 503. Someone watching the
+  answers during such a window can tell whether a number has an account. Answering everyone
+  alike would mean either locking existing customers out during an SMS-pumping attack or a
+  Cloudflare outage, or telling a new customer a code was sent when it was not. We keep
+  existing customers signed in and accept the narrow oracle; it lasts only while the shop is
+  under attack or Cloudflare is down, and Sentry is told when the budget runs out.
+- **Logs.** Phone numbers are logged only masked (`maskPhone` in `src/logger.js`, e.g.
+  `+9198*****`); phones and addresses inside logged objects are redacted, and
+  `test/log-safety.test.js` fails on a logger call that passes a raw phone.
+- **Photos.** Claim and delivery photos are re-encoded on upload (like review photos), so the
+  phone's EXIF data (GPS, device) is not kept.
+- **Constant-time checks** for the cron secret, `METRICS_TOKEN` and the WhatsApp verify token.
+
 ## Staff roles and the audit trail
 
 Five roles: `MANAGER`, `OPERATOR`, `PACKER`, `QC` and `RIDER`. Riders only reach
-orders on yesterday's, today's or tomorrow's run that are packed or on the road; any
-other order id answers 404. With `STAFF_TWO_STEP=all` (the production default) every
+their own stops (see "Riders' stops" below) on yesterday's, today's or tomorrow's run that
+are packed or on the road; any other order id answers 404. With `STAFF_TWO_STEP=all` (the production default) every
 staff account must use two-step sign-in; `managers` limits it to managers and operators.
 Where it is required, setting it up needs a one-time setup code from a manager as well as
 the password (shown once when a manager adds someone, resets their two-step sign-in, or
@@ -402,6 +482,19 @@ row (cached for 5 seconds per instance). In production the first manager comes f
 `ADMIN_BOOTSTRAP_PASSWORD`; on Vercel previews from `PREVIEW_ADMIN_EMAIL` /
 `PREVIEW_ADMIN_PASSWORD` instead, so the production login never reaches a preview.
 
+Staff passwords are at least 12 characters and may not be on the bundled list of common
+passwords ([`src/data/common-passwords.txt`](src/data/common-passwords.txt), from SecLists,
+checked ignoring case). Anyone can change their own password on the panel's Two-step sign-in
+page (`POST /admin/v1/me/password` with the current one); their other sessions end. With
+`STAFF_GOOGLE_HD` set (say `mandimangoes.in`), staff Google sign-in only accepts accounts of
+that Google Workspace domain.
+
+Who may call which staff route is snapshotted in
+[`test/fixtures/role-policy.json`](test/fixtures/role-policy.json), one route per line, and
+the role matrix test checks the code against it. A change to `src/access.js` or a new route
+fails that test until the snapshot is regenerated (`UPDATE_ROLE_POLICY=1 npm test`) and the
+diff is reviewed with the change.
+
 Every successful staff change (any non-GET admin request) and every sign-in is written to
 `staff_audit`: who, their role, the route, what it was done to, and the request body with
 passwords and tokens removed. Read it at `GET /admin/v1/audit` or on the panel's Staff
@@ -414,25 +507,48 @@ screen.
   Send again button), a refund has been stuck for 30 minutes, or a webhook was rejected.
   It reads `GET /admin/v1/attention`. Each loop step's last success and error are kept in
   `maintenance_runs`; rejected webhooks are kept in `webhook_failures` for 30 days.
-- **Alerts.** [`ops/alerts.yml`](ops/alerts.yml) holds Prometheus alert rules for the loop
-  stopping, failing steps, failing WhatsApp sends, webhook errors, login codes on fallback,
-  ledger drift and API errors. Scrape `/metrics` with `METRICS_TOKEN` as a bearer token and
-  route the alerts to the phone of whoever is on call.
-- **Backups.** [`ops/backup.sh`](ops/backup.sh) writes a `pg_dump` custom-format file and
-  keeps 14 days (`RETAIN_DAYS`). Run it nightly and copy the files off the database host.
+- **Alerts.** On Vercel, alerts go through Sentry: the maintenance job's cron monitor, an
+  uptime monitor on `/ready`, and a Sentry message (at most hourly each) for overdue
+  messages or refunds, failing webhooks, a missed backup and ledger drift (see
+  [deploy/VERCEL.md, Watch it](../deploy/VERCEL.md#8-watch-it)).
+  **Docker path only:** [`ops/alerts.yml`](ops/alerts.yml) holds Prometheus alert rules for
+  the loop stopping, failing steps, failing WhatsApp sends, webhook errors, login codes on
+  fallback, ledger drift and API errors. Scrape `/metrics` with `METRICS_TOKEN` as a bearer
+  token and route the alerts to the phone of whoever is on call. `/metrics` answers 404 on
+  Vercel, so neither the metrics nor these rules apply there.
+- **Backups.** [`ops/backup.sh`](ops/backup.sh) writes a `pg_dump` custom-format file,
+  encrypted to a GPG public key (`BACKUP_GPG_PUBLIC_KEY_FILE` or `BACKUP_GPG_RECIPIENT`;
+  with neither it refuses), and keeps 14 days (`RETAIN_DAYS`). `BACKUP_UPLOAD_CMD` copies
+  it off the host in the same run, and `BACKUP_HEARTBEAT=true` records each outcome as the
+  step `backup` in `maintenance_runs`. With `BACKUP_HEARTBEAT_EXPECTED=true` on the API
+  (the Docker deploy sets both), Needs attention and the health check warn when no backup
+  has succeeded for 26 hours.
   [`ops/restore-check.sh`](ops/restore-check.sh) restores a dump into a scratch database,
   prints the migrations and row counts, checks the stock ledger balances, then drops it.
   Run it weekly and after each schema change; a backup nobody has restored is a guess.
-  Set `BACKUP_GPG_RECIPIENT` to encrypt the dump (it holds customers' details); the
-  nightly GitHub workflow [`backup.yml`](../.github/workflows/backup.yml) does this for Neon.
+  The nightly GitHub workflow [`backup.yml`](../.github/workflows/backup.yml) runs it for Neon.
   That workflow fails (red, with an email) when its secrets are missing; a copy with no
-  production database sets the repository variable `BACKUP_DISABLED=true` instead.
+  production database sets the repository variable `BACKUP_DISABLED=true` instead. Its
+  last step records the heartbeat with [`ops/backup-heartbeat.sh`](ops/backup-heartbeat.sh)
+  over `BACKUP_HEARTBEAT_DATABASE_URL`, a role that may write only that record (grants in
+  the script and in [deploy/VERCEL.md](../deploy/VERCEL.md#backups-and-restore-drill));
+  with `BACKUP_HEARTBEAT_EXPECTED=true` on Vercel a missed backup warns as on Docker.
 - **Ready.** `GET /ready` answers 503 when the database doesn't answer, when the last
   maintenance run finished over 5 minutes ago, and, in production, when no run has ever
   finished (the cron is missing or its secret is wrong). Previews and development may have
   no run yet.
 - **Retention.** Sent, failed and skipped WhatsApp messages are deleted after 180 days
-  ([`src/retention.js`](src/retention.js)), up to 5,000 a run.
+  ([`src/retention.js`](src/retention.js)), up to 5,000 a run. Once a day, orders delivered,
+  cancelled or returned more than `PII_RETENTION_MONTHS` (default 12) months ago lose the
+  customer's name, phone, address and gift details, and their delivery attempts lose who took
+  the box and the rider's location; amounts, items and tax fields stay for the books. Orders
+  with money still owed back wait until it is paid.
+- **Erasure and export.** Customers delete their account in the shop (`DELETE /v1/me`) and
+  download what we hold about them (`GET /v1/me/export`, JSON). For a deletion request that
+  arrives by email or WhatsApp, check it comes from the number's owner, then run
+  `node --env-file=.env ops/erase-customer.js --phone <number>` (it shows the account), and
+  again with `--yes` to delete it. It refuses while an order is open, like the app. Keep the
+  printed id with the request: `ops/reapply-deletions.js --ids <id>` repeats it after a restore.
 - **Connections.** `DB_POOL_MAX` sets each instance's pool (default 5 on Vercel, 10
   elsewhere) and `DB_CONNECT_TIMEOUT_MS` how long a request waits for a connection before
   answering 503 BUSY (default 5000). On Vercel, keep instances × `DB_POOL_MAX` under the

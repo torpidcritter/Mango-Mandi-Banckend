@@ -41,6 +41,18 @@ const schema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  // UX-4: "we got your claim" and "claim rejected, because …". Turn on once Meta approves
+  // mandi_claim_received and mandi_claim_rejected (each with an "Open order" URL button).
+  WHATSAPP_CLAIM_UPDATES: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  // UX-7: an "Open order" URL button (https://<shop>/orders/{{1}}) on the order update templates.
+  // Turn on only once Meta has approved the new versions with that button (mango-api/README.md).
+  WHATSAPP_ORDER_LINKS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   // Two-step sign-in for staff: required for managers, everyone, or nobody (each person can still turn it on).
   STAFF_TWO_STEP: z.enum(['managers', 'all', 'optional']).optional(),
   // Login codes sent per day across the shop before sending pauses (SMS pumping guard).
@@ -54,8 +66,15 @@ const schema = z.object({
   PRODUCTION_DB_HOST: z.string().default(''),
   // Requests per address per 15 minutes before 429 (shared by everyone behind one carrier NAT).
   API_RATE_LIMIT: z.coerce.number().int().positive().default(3000),
+  // Login-code requests per address per 15 minutes (ratelimit.js otpIpLimit). Unset: 200 in
+  // production, 300 elsewhere. Kept well above one person's need because a mobile carrier's NAT
+  // puts many customers behind one address; the per-number caps, Turnstile and the daily
+  // budget are what stop SMS pumping.
+  OTP_IP_LIMIT: z.coerce.number().int().positive().optional(),
   REFRESH_REUSE_GRACE_MS: z.coerce.number().int().min(0).default(10_000),
   RAZORPAY_WEBHOOK_SECRET: z.string().default('whsec_dev'),
+  // While rotating the webhook secret: the old one, so Razorpay's retries of older events still verify. Remove it a day later.
+  RAZORPAY_WEBHOOK_SECRET_PREVIOUS: z.string().default(''),
   RAZORPAY_KEY_ID: z.string().default(''),
   RAZORPAY_KEY_SECRET: z.string().default(''),
   METRICS_TOKEN: z.string().default(''),
@@ -71,6 +90,22 @@ const schema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  // Outside production the code also comes back in the response (devCode), for the shop's test
+  // mode. scripts/start-local.mjs --phone turns it off (SEC-01): the shop is then on a public link,
+  // and the code is printed in the local console instead (with LOG_OTP_CODES=true).
+  OTP_CODE_IN_RESPONSE: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  // The pepper for stored login-code hashes. Unset: JWT_SECRET, as before. Setting it later keeps
+  // codes already sent working (they are checked against both until they lapse in 5 minutes).
+  OTP_PEPPER: z.string().default(''),
+  // SEC-05: customer details on finished orders (name, phone, address, gift details, delivery GPS)
+  // are removed this many months after the delivery date. Amounts and tax fields stay.
+  PII_RETENTION_MONTHS: z.coerce.number().int().min(1).max(120).default(12),
+  // Staff Google sign-in only for accounts of this Google Workspace domain (the token's hd claim).
+  // Unset: any verified Google account whose email is a staff email.
+  STAFF_GOOGLE_HD: z.string().default(''),
   // /v1/dev (pay any order without paying). Needs this, NODE_ENV other than production and no Razorpay keys.
   ENABLE_DEV_ROUTES: z
     .enum(['true', 'false'])
@@ -82,6 +117,16 @@ const schema = z.object({
   JIO_SMS_TEMPLATE_ID: z.string().optional(),
   JIO_SMS_ENTITY_ID: z.string().optional(),
   JIO_SMS_TEXT: z.string().default('{code} is your MandiMangoes login code. It expires in 5 minutes.'),
+  // How a Jio reply says the SMS was accepted, copied from Jio's API documentation
+  // (OPS-03): an HTTP 200 alone is not proof. A dot path into the JSON reply
+  // (e.g. "status" or "data.state") and the values that mean accepted, comma
+  // separated. Optional: the field holding Jio's message id, for the log.
+  JIO_SMS_SUCCESS_PATH: z.string().default(''),
+  JIO_SMS_SUCCESS_VALUES: z.string().default(''),
+  JIO_SMS_ID_PATH: z.string().default(''),
+  // The channel a login code goes by when the customer didn't choose; the other is the fallback.
+  // whatsapp: WhatsApp first (works before Jio DLT is approved).
+  OTP_DEFAULT_CHANNEL: z.enum(['sms', 'whatsapp']).default('sms'),
   WHATSAPP_PROVIDER: z.enum(['log', 'meta']).default('log'),
   WHATSAPP_TOKEN: z.string().optional(),
   WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
@@ -97,6 +142,14 @@ const schema = z.object({
   SEED_DEMO_DATA: z
     .enum(['true', 'false'])
     .default('true')
+    .transform((v) => v === 'true'),
+  // Backups record each run in maintenance_runs: Needs attention and Sentry warn
+  // when none is recorded for 26 hours. Set by deploy/compose.yml (its backup
+  // service); on Vercel set it once the GitHub backup workflow has its
+  // BACKUP_HEARTBEAT_DATABASE_URL secret (deploy/VERCEL.md, Backups).
+  BACKUP_HEARTBEAT_EXPECTED: z
+    .enum(['true', 'false'])
+    .default('false')
     .transform((v) => v === 'true'),
 })
 
@@ -131,6 +184,8 @@ if (env.WHATSAPP_PROVIDER === 'meta' && !(env.WHATSAPP_TOKEN && env.WHATSAPP_PHO
 const JIO_KEYS = ['JIO_SMS_URL', 'JIO_SMS_API_KEY', 'JIO_SMS_SENDER_ID', 'JIO_SMS_TEMPLATE_ID', 'JIO_SMS_ENTITY_ID']
 if (env.SMS_PROVIDER === 'jio') {
   const missing = JIO_KEYS.filter((k) => !env[k])
+  if (!env.JIO_SMS_SUCCESS_PATH) missing.push('JIO_SMS_SUCCESS_PATH')
+  if (!env.JIO_SMS_SUCCESS_VALUES) missing.push('JIO_SMS_SUCCESS_VALUES')
   if (missing.length || !env.JIO_SMS_TEXT.includes('{code}')) {
     console.error(`SMS_PROVIDER=jio needs ${missing.join(', ') || 'JIO_SMS_TEXT containing {code}'}`)
     process.exit(1)

@@ -15,9 +15,9 @@ import { badRequest, conflict, HttpError, notFound } from './errors.js'
 import { newId } from './ids.js'
 import { logger } from './logger.js'
 import { enqueuePreorder } from './notify.js'
-import { cancelOrder, createOrder, customerCancel, recordDuplicatePayment, SYSTEM } from './orders.js'
+import { cancelOrder, createOrder, customerCancel, LAZY_SWEEP_GATEWAY_GRACE_MS, recordDuplicatePayment, SYSTEM } from './orders.js'
 import { canStartCall } from './budget.js'
-import { applyCapture, claimRefund, GATEWAY_CALL_MS, createPaymentLink, fetchLinkPayments, gatewayRefund, refundOrder } from './payments.js'
+import { applyCapture, claimRefund, GATEWAY_CALL_MS, createPaymentLink, fetchLinkPayments, gatewayRefund, refundReceipt } from './payments.js'
 import { findProduct, sellable } from './products.js'
 
 /** A waitlisted customer whose spot opens has this long to pay. */
@@ -82,8 +82,66 @@ export function preorderView(p) {
     customerName: p.customer_name, phone: p.phone, channel: p.channel,
     paymentStatus: p.payment_status, paymentUrl: p.status === 'PAYMENT_PENDING' ? p.payment_link_url : null, holdExpiresAt: p.hold_expires_at,
     orderId: p.order_id, movedCount: p.moved_count, createdAt: p.created_at, bookedAt: p.booked_at,
-    refund: p.refund_requested_at ? { requestedAt: p.refund_requested_at, refundedAt: p.refunded_at, id: p.refund_id } : null,
+    refund: p.refund_requested_at ? { requestedAt: p.refund_requested_at, refundedAt: p.refunded_at, id: p.refund_id, status: p.refund_status ?? null } : null,
   }
+}
+
+/**
+ * INV-02 for Book ahead: one customer can't hold a week's capacity with unpaid
+ * bookings, on the web or in WhatsApp. Same rules as orders (maxUnpaidOrders,
+ * maxHeldBoxes), counted over bookings only: an unpaid order and an unpaid
+ * booking don't block each other. Locks the customer row, so two bookings by
+ * the same customer at once queue here. A booking whose hold has run out
+ * doesn't count.
+ */
+async function checkUnpaidPreorders(c, customerId, qty, at = now()) {
+  if (!customerId) return
+  await c.query('SELECT id FROM customers WHERE id = $1 FOR UPDATE', [customerId])
+  const { rows } = await c.query(
+    `SELECT id, number, qty, hold_expires_at FROM preorders
+      WHERE customer_id = $1 AND status = 'PAYMENT_PENDING' AND (hold_expires_at IS NULL OR hold_expires_at >= $2)
+      ORDER BY created_at DESC`,
+    [customerId, at],
+  )
+  const cfg = getConfig()
+  if (rows.length >= cfg.maxUnpaidOrders) {
+    throw new HttpError(409, 'UNPAID_PREORDER_EXISTS', `You have an unpaid booking (${rows[0].number}). Pay for it or cancel it first.`, {
+      preorderId: rows[0].id,
+      number: rows[0].number,
+      holdExpiresAt: rows[0].hold_expires_at,
+    })
+  }
+  if (rows.reduce((t, r) => t + r.qty, 0) + qty > cfg.maxHeldBoxes) {
+    throw new HttpError(409, 'HOLD_LIMIT', `You can reserve up to ${cfg.maxHeldBoxes} boxes at a time. Reduce the quantity.`, { maxHeldBoxes: cfg.maxHeldBoxes })
+  }
+}
+
+/**
+ * Lazy hold expiry for Book ahead (as INV-01 for orders): before a booking
+ * takes a week's capacity, unpaid bookings for that box and week whose hold ran
+ * out give theirs back, so a late or stopped maintenance job doesn't keep the
+ * week full. As PAY-B5: a booking is left alone until Razorpay has been asked
+ * about it after its hold, or for 2 minutes after the hold. A payment that
+ * lands later still books (processPreorderPayment takes the capacity back).
+ * Bounded and SKIP LOCKED, like the order sweep.
+ */
+async function expireWeekHolds(c, sku, week, at = now(), limit = 20) {
+  const { rows } = await c.query(
+    `SELECT * FROM preorders
+      WHERE status = 'PAYMENT_PENDING' AND sku = $1 AND week_start = $2 AND hold_expires_at < $3
+        AND (reconcile_checked_at >= hold_expires_at OR hold_expires_at < $4)
+      ORDER BY hold_expires_at LIMIT $5
+      FOR UPDATE SKIP LOCKED`,
+    [sku, week, at, new Date(at.getTime() - LAZY_SWEEP_GATEWAY_GRACE_MS), limit],
+  )
+  for (const p of rows) await cancelExpiredHold(c, p)
+  return rows.length
+}
+
+async function cancelExpiredHold(c, p) {
+  await release(c, p)
+  await c.query(`UPDATE preorders SET status = 'CANCELLED', payment_status = 'CANCELLED', hold_expires_at = NULL WHERE id = $1`, [p.id])
+  await event(c, p.id, 'CANCELLED', SYSTEM, 'Not paid in time')
 }
 
 /**
@@ -102,6 +160,8 @@ export async function bookPreorder(c, b, actor) {
     const { rows } = await c.query('SELECT 1 FROM delivery_slots WHERE id = $1 AND active', [b.slotId])
     if (!rows.length) throw badRequest('That delivery slot is not available', 'SLOT_INVALID')
   }
+  await checkUnpaidPreorders(c, b.customerId, b.qty)
+  await expireWeekHolds(c, b.sku, b.weekStart)
   const got = await reserve(c, b.sku, b.weekStart, b.qty)
   if (!got && !b.waitlist) throw conflict('That week is fully booked. Join the waitlist to get the next free spot.', 'PREORDER_FULL')
   const id = newId('pre')
@@ -129,6 +189,7 @@ export async function ensurePaymentLink(id) {
   const link = await createPaymentLink({
     amount: p.total, number: p.number, preorderId: p.id, name: p.customer_name, phone: p.phone,
     description: `MandiMangoes preorder ${p.number}`,
+    holdUntil: p.hold_expires_at,
   })
   const up = await query('UPDATE preorders SET payment_link_id = $2, payment_link_url = $3 WHERE id = $1 AND payment_link_url IS NULL RETURNING *', [
     p.id, link.id, link.url,
@@ -136,10 +197,19 @@ export async function ensurePaymentLink(id) {
   return up.rows[0] ?? (await query('SELECT * FROM preorders WHERE id = $1', [id])).rows[0]
 }
 
-export async function findPreorderId(c, entity, link) {
-  const { rows } = await c.query('SELECT id FROM preorders WHERE payment_link_id = $1 OR id = $2 OR id = $3 LIMIT 1', [
-    link?.id ?? null, link?.notes?.preorderId ?? null, entity?.notes?.preorderId ?? null,
-  ])
+/**
+ * Finds the booking a Razorpay payment link was paid for. PAY-B11: only what
+ * Razorpay itself sends for the link counts (the link's id, or the notes we
+ * set on the link when we made it); a payment's own notes can be set by
+ * whoever opens Checkout, so they are never trusted, as for orders.
+ */
+export async function findPreorderId(c, _entity, link) {
+  if (!link?.id && !link?.notes?.preorderId) return null
+  const noted = typeof link?.notes?.preorderId === 'string' ? link.notes.preorderId : null
+  const { rows } = await c.query(
+    'SELECT id FROM preorders WHERE payment_link_id = $1 OR (id = $2 AND payment_link_id IS NOT NULL) ORDER BY (payment_link_id = $1) DESC NULLS LAST LIMIT 1',
+    [link?.id ?? null, noted],
+  )
   return rows[0]?.id ?? null
 }
 
@@ -232,7 +302,9 @@ export async function staffCancelPreorder(c, id, actor, reason) {
 export async function refundPreorder(id) {
   const p = await claimRefund('preorders', id)
   if (!p) return null
-  const refundId = await gatewayRefund({ paymentId: p.payment_id, amount: p.paid_amount ?? p.total, receipt: p.number, notes: { preorderId: p.id } })
+  const refundId = await gatewayRefund({
+    paymentId: p.payment_id, amount: p.paid_amount ?? p.total, receipt: refundReceipt(p.number, p.refund_attempts), notes: { preorderId: p.id },
+  })
   if (!refundId) return null
   return tx(async (c) => {
     const r = await c.query(
@@ -253,11 +325,7 @@ export async function expirePreorderHolds(c, at = now()) {
     `SELECT * FROM preorders WHERE status = 'PAYMENT_PENDING' AND hold_expires_at < $1 ORDER BY hold_expires_at FOR UPDATE SKIP LOCKED`,
     [at],
   )
-  for (const p of rows) {
-    await release(c, p)
-    await c.query(`UPDATE preorders SET status = 'CANCELLED', payment_status = 'CANCELLED', hold_expires_at = NULL WHERE id = $1`, [p.id])
-    await event(c, p.id, 'CANCELLED', SYSTEM, 'Not paid in time')
-  }
+  for (const p of rows) await cancelExpiredHold(c, p)
   return rows.length
 }
 
@@ -276,9 +344,8 @@ export async function promoteWaitlist() {
     const ids = []
     for (const p of rows) {
       if (!(await reserve(c, p.sku, p.week_start, p.qty))) continue
-      await c.query(`UPDATE preorders SET status = 'PAYMENT_PENDING', payment_status = 'INITIATED', hold_expires_at = $2 WHERE id = $1`, [
-        p.id, new Date(now().getTime() + SPOT_HOLD_HOURS * 3_600_000),
-      ])
+      await c.query(`UPDATE preorders SET status = 'PAYMENT_PENDING', payment_status = 'INITIATED', hold_expires_at = $2, payment_started_at = $3
+          WHERE id = $1`, [p.id, new Date(now().getTime() + SPOT_HOLD_HOURS * 3_600_000), now()])
       await event(c, p.id, 'PAYMENT_PENDING', SYSTEM, 'A spot opened up from the waitlist')
       ids.push(p.id)
     }
@@ -308,13 +375,17 @@ export async function retryMissingLinks() {
   }
 }
 
-/** Catches missed link payments (webhook lost) for unpaid or just-expired preorders. */
+/**
+ * Catches missed link payments (webhook lost) for unpaid or just-expired preorders.
+ * The window starts when the payment window opened: a waitlist spot is often
+ * offered days after the booking was made.
+ */
 export async function reconcilePreorderPayments() {
   const at = now()
   const { rows } = await query(
     `SELECT id, payment_link_id FROM preorders WHERE payment_link_id IS NOT NULL AND payment_status IN ('INITIATED', 'CANCELLED')
-        AND created_at > $1 AND (reconcile_checked_at IS NULL OR reconcile_checked_at < $2)
-      ORDER BY (payment_status = 'INITIATED') DESC, reconcile_checked_at NULLS FIRST, created_at DESC LIMIT 100`,
+        AND COALESCE(payment_started_at, created_at) > $1 AND (reconcile_checked_at IS NULL OR reconcile_checked_at < $2)
+      ORDER BY (payment_status = 'INITIATED') DESC, reconcile_checked_at NULLS FIRST, COALESCE(payment_started_at, created_at) DESC LIMIT 100`,
     [new Date(at.getTime() - 3 * 86_400_000), new Date(at.getTime() - 15 * 60_000)],
   )
   let n = 0
@@ -356,7 +427,7 @@ async function attempt(c, fn) {
  * and tells the customer. Returns { converted, moved }.
  */
 export async function allocatePreorders() {
-  return tx(async (c) => {
+  return await tx(async (c) => {
     const horizon = addDays(await regularHorizon(c), 1)
     const earliest = await earliestDeliveryDate(c)
     const { rows } = await c.query(

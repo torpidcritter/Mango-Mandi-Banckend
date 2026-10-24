@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState, type FormEvent } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
@@ -6,7 +6,7 @@ import { RIPENESS_LABEL, date, dateTime } from '../format'
 import { canModerate, canSee } from '../permissions'
 import { useSession } from '../session'
 import type { ReviewFilters, ReviewFlag, ReviewStatus } from '../types'
-import { Badge, Dialog, EmptyState, FormError, QueryError, Spinner, scrollRegion, useToast } from '../ui'
+import { AuthedPhoto, Badge, Dialog, EmptyState, FormError, QueryError, ReasonDialog, Spinner, scrollRegion, useToast, usePageTitle } from '../ui'
 
 const STATUSES: { value: ReviewStatus; label: string }[] = [
   { value: 'PENDING', label: 'Waiting' },
@@ -37,6 +37,7 @@ function StarText({ n }: { n: number }) {
  * it is approved here; photos need their own tick.
  */
 export default function Reviews() {
+  usePageTitle('Reviews')
   const { me } = useSession()
   const moderator = canModerate(me?.role)
   return (
@@ -107,7 +108,7 @@ function Queue() {
       <h2 id="queue-title" className="sr-only">
         Moderation queue
       </h2>
-      <div className="segmented" role="group" aria-label="Review status" style={{ marginBottom: '0.75rem' }}>
+      <div className="segmented mb-3" role="group" aria-label="Review status">
         {STATUSES.map((s) => (
           <button key={s.value} type="button" className="btn btn-small" aria-pressed={filters.status === s.value} onClick={() => set({ status: s.value })}>
             {s.label}
@@ -256,64 +257,16 @@ function Queue() {
       {rejecting && (
         <ReasonDialog
           title={`Reject ${selected.size} ${selected.size === 1 ? 'review' : 'reviews'}`}
-          action="Reject"
-          pending={bulk.isPending}
+          label="Reason (the customer sees it on their account page)"
+          maxLength={500}
+          confirmLabel="Reject"
+          busy={bulk.isPending}
           error={bulk.error}
           onClose={() => setRejecting(false)}
           onSubmit={(reason) => bulk.mutate({ action: 'reject', reason })}
         />
       )}
     </section>
-  )
-}
-
-function ReasonDialog({
-  title,
-  action,
-  pending,
-  error,
-  onClose,
-  onSubmit,
-}: {
-  title: string
-  action: string
-  pending: boolean
-  error: unknown
-  onClose: () => void
-  onSubmit: (reason: string) => void
-}) {
-  const [reason, setReason] = useState('')
-  const [err, setErr] = useState<string | null>(null)
-  function submit(e: FormEvent) {
-    e.preventDefault()
-    if (reason.trim().length < 3) return setErr('Give a short reason.')
-    onSubmit(reason.trim())
-  }
-  return (
-    <Dialog
-      title={title}
-      onClose={onClose}
-      tone="danger"
-      footer={
-        <>
-          <button type="button" className="btn" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" form="reason-form" className="btn btn-danger" disabled={pending}>
-            {pending ? 'Saving…' : action}
-          </button>
-        </>
-      }
-    >
-      <form id="reason-form" onSubmit={submit}>
-        <div className="field">
-          <label htmlFor="reason">Reason (the customer sees it on their account page)</label>
-          <textarea id="reason" rows={3} maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)} data-autofocus />
-        </div>
-        {err && <p className="form-error">{err}</p>}
-        <FormError error={error} />
-      </form>
-    </Dialog>
   )
 }
 
@@ -368,6 +321,8 @@ function ReviewDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const [approvePhotos, setApprovePhotos] = useState<Set<string>>(new Set())
   const [ask, setAsk] = useState<'reject' | 'hide' | null>(null)
   const [reply, setReply] = useState<string | null>(null)
+  // Removing a public reply asks first, inline (this is already a dialog).
+  const [confirmRemove, setConfirmRemove] = useState(false)
 
   const done = (msg: string) => {
     toast.success(msg)
@@ -389,7 +344,14 @@ function ReviewDrawer({ id, onClose }: { id: string; onClose: () => void }) {
     },
     onError: (e) => toast.error(e),
   })
-  const removeReply = useMutation({ mutationFn: () => api.deleteReviewReply(id), onSuccess: () => done('Reply removed'), onError: (e) => toast.error(e) })
+  const removeReply = useMutation({
+    mutationFn: () => api.deleteReviewReply(id),
+    onSuccess: () => {
+      setConfirmRemove(false)
+      done('Reply removed')
+    },
+    onError: (e) => toast.error(e),
+  })
 
   const r = q.data
   return (
@@ -528,14 +490,28 @@ function ReviewDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                     <p className="muted small">
                       {r.reply.by ?? 'Staff'}, {dateTime(r.reply.at)}
                     </p>
-                    <div className="btn-row">
-                      <button type="button" className="btn btn-small" onClick={() => setReply(r.reply!.body)}>
-                        Change reply
-                      </button>
-                      <button type="button" className="btn btn-small" disabled={removeReply.isPending} onClick={() => removeReply.mutate()}>
-                        Remove reply
-                      </button>
-                    </div>
+                    {confirmRemove ? (
+                      <div className="notice notice-warn" role="group" aria-label="Remove reply?">
+                        <p className="mt-0">Remove this reply? Customers stop seeing it under the review.</p>
+                        <div className="btn-row">
+                          <button type="button" className="btn btn-small btn-danger" disabled={removeReply.isPending} onClick={() => removeReply.mutate()}>
+                            {removeReply.isPending ? 'Removing…' : 'Yes, remove reply'}
+                          </button>
+                          <button type="button" className="btn btn-small" onClick={() => setConfirmRemove(false)}>
+                            Keep reply
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="btn-row">
+                        <button type="button" className="btn btn-small" onClick={() => setReply(r.reply!.body)}>
+                          Change reply
+                        </button>
+                        <button type="button" className="btn btn-small" onClick={() => setConfirmRemove(true)}>
+                          Remove reply
+                        </button>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <button type="button" className="btn btn-small" onClick={() => setReply('')}>
@@ -596,31 +572,14 @@ function ReviewDrawer({ id, onClose }: { id: string; onClose: () => void }) {
 }
 
 function ReviewPhoto({ reviewId, photoId, n }: { reviewId: string; photoId: string; n: number }) {
-  const [url, setUrl] = useState<string | null>(null)
-  const [failed, setFailed] = useState(false)
-  useEffect(() => {
-    let made: string | null = null
-    let live = true
-    api
-      .reviewPhotoUrl(reviewId, photoId)
-      .then((u) => {
-        made = u
-        if (live) setUrl(u)
-        else URL.revokeObjectURL(u)
-      })
-      .catch(() => live && setFailed(true))
-    return () => {
-      live = false
-      if (made) URL.revokeObjectURL(made)
-    }
-  }, [reviewId, photoId])
-  if (failed) return <span className="small muted">Photo {n} could not be loaded.</span>
-  if (!url) return <span className="small muted">Loading photo {n}…</span>
   return (
-    <a href={url} target="_blank" rel="noopener noreferrer">
-      <img src={url} alt={`Customer's photo ${n}`} />
-      <span className="sr-only"> (opens in a new tab)</span>
-    </a>
+    <AuthedPhoto
+      photoKey={`${reviewId}/${photoId}`}
+      load={() => api.reviewPhotoUrl(reviewId, photoId)}
+      alt={`Customer's photo ${n}`}
+      what={`photo ${n}`}
+      openInTab
+    />
   )
 }
 
@@ -631,13 +590,13 @@ function Insights() {
   const { me } = useSession()
   const q = useQuery({ queryKey: ['review-insights', days], queryFn: () => api.reviewInsights(days) })
   return (
-    <section className="card" aria-labelledby="insights-title" style={{ marginTop: '1.5rem' }}>
+    <section className="card mt-6" aria-labelledby="insights-title">
       <div className="topbar">
-        <h2 id="insights-title" style={{ margin: 0 }}>
+        <h2 id="insights-title">
           What reviews say
         </h2>
         <span className="spacer" />
-        <div className="field" style={{ margin: 0 }}>
+        <div className="field m-0">
           <label htmlFor="ins-days" className="sr-only">
             Period
           </label>

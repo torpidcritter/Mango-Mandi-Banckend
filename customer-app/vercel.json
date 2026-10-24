@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "vite",
   "installCommand": "cd .. && npm ci",
-  "buildCommand": "cd .. && npm run shop:build",
+  "buildCommand": "cd .. && npm run shop:build && node scripts/scan-bundle.mjs customer-app/dist --forbid-localhost-in-production",
   "outputDirectory": "dist",
   "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
   "headers": [

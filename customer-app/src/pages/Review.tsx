@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, errorMessage, signedInProfile, type FollowUp, type MyReview, type Reviewable, type SubRatings } from '../api'
+import { api, signedInProfile, type FollowUp, type MyReview, type Reviewable, type SubRatings } from '../api'
 import { STAGE_LABEL, day, when } from '../format'
-import { shrinkPhoto } from '../photo'
+import { Field, PhotoPicker, usePhotoUploads } from '../forms'
 import { StarInput, Stars } from '../stars'
-import { Dialog, ErrorNote, Spinner } from '../ui'
+import { ConfirmDialog, ErrorNote, Spinner } from '../ui'
 
 const MAX_PHOTOS = 3
 const MAX_COMMENT = 1000
@@ -17,11 +17,6 @@ const SUBS: { key: keyof SubRatings; label: string }[] = [
 ]
 
 type SentResult = { review: MyReview; followUp: FollowUp }
-
-interface Pic {
-  id: string
-  preview: string | null
-}
 
 /** "Ravi Kumar" → "Ravi K.", as the API shows it. */
 function shownAs(name: string | null | undefined, anonymous: boolean) {
@@ -81,15 +76,17 @@ function ReviewForm({ item, existing, onSent }: { item?: Reviewable; existing?: 
   })
   const [comment, setComment] = useState(existing?.comment ?? '')
   const [anonymous, setAnonymous] = useState(existing?.anonymous ?? false)
-  const [photos, setPhotos] = useState<Pic[]>(existing?.photos.map((p) => ({ id: p.id, preview: null })) ?? [])
-  const [uploading, setUploading] = useState(false)
-  const [photoError, setPhotoError] = useState<string | null>(null)
+  const {
+    photos,
+    setPhotos,
+    uploading,
+    error: photoError,
+    add: addPhotos,
+    remove: removePhoto,
+  } = usePhotoUploads((photo) => api.uploadReviewPhoto(photo), MAX_PHOTOS, existing?.photos.map((p) => ({ id: p.id, preview: null })))
   const [formError, setFormError] = useState<string | null>(null)
   // One key per form: a retry after a dropped connection can't make a second review.
   const [idemKey] = useState(() => crypto.randomUUID())
-  const previews = useRef(photos)
-  previews.current = photos
-  useEffect(() => () => previews.current.forEach((p) => p.preview && URL.revokeObjectURL(p.preview)), [])
 
   // Photos already on a review being edited are fetched with the sign-in.
   useEffect(() => {
@@ -104,7 +101,7 @@ function ReviewForm({ item, existing, onSent }: { item?: Reviewable; existing?: 
     return () => {
       live = false
     }
-  }, [existing])
+  }, [existing, setPhotos])
 
   const productName = existing?.productName ?? item!.productName
   const stage = existing?.ripenessOrdered ?? item?.ripenessOrdered ?? null
@@ -123,31 +120,6 @@ function ReviewForm({ item, existing, onSent }: { item?: Reviewable; existing?: 
     },
   })
 
-  async function addPhotos(e: ChangeEvent<HTMLInputElement>) {
-    const files = [...(e.target.files ?? [])].slice(0, MAX_PHOTOS - photos.length)
-    e.target.value = ''
-    if (!files.length) return
-    setPhotoError(null)
-    setUploading(true)
-    try {
-      for (const file of files) {
-        const small = await shrinkPhoto(file)
-        const { id } = await api.uploadReviewPhoto(small)
-        setPhotos((p) => [...p, { id, preview: URL.createObjectURL(small) }])
-      }
-    } catch (err) {
-      setPhotoError(errorMessage(err))
-    } finally {
-      setUploading(false)
-    }
-  }
-  function removePhoto(id: string) {
-    setPhotos((p) => {
-      const gone = p.find((x) => x.id === id)
-      if (gone?.preview) URL.revokeObjectURL(gone.preview)
-      return p.filter((x) => x.id !== id)
-    })
-  }
   function submit(e: FormEvent) {
     e.preventDefault()
     setFormError(null)
@@ -157,7 +129,8 @@ function ReviewForm({ item, existing, onSent }: { item?: Reviewable; existing?: 
     send.mutate()
   }
 
-
+  // "Choose stars" shows under the stars; anything else above the button.
+  const starsError = formError?.startsWith('Choose') ? formError : null
   const left = MAX_COMMENT - comment.length
   return (
     <section className="card narrow" aria-labelledby="review-title">
@@ -171,71 +144,50 @@ function ReviewForm({ item, existing, onSent }: { item?: Reviewable; existing?: 
         <StarInput
           label="Your rating"
           value={rating}
+          describedBy={starsError ? 'rating-error' : undefined}
           onChange={(n) => {
             setRating(n)
             // A "choose stars" message is answered once stars are chosen.
             if (formError?.startsWith('Choose')) setFormError(null)
           }}
         />
+        {starsError && (
+          <p id="rating-error" className="field-error" role="alert">
+            {starsError}
+          </p>
+        )}
         <fieldset className="field sub-ratings">
           <legend>More detail (optional)</legend>
           {SUBS.map((s) => (
             <StarInput key={s.key} label={s.label} size="small" value={subs[s.key]} onChange={(n) => setSubs((v) => ({ ...v, [s.key]: n }))} />
           ))}
         </fieldset>
-        <div className="field">
-          <label htmlFor="review-text">Tell other buyers about them (optional)</label>
-          <textarea
-            id="review-text"
-            rows={4}
-            maxLength={MAX_COMMENT}
-            value={comment}
-            onChange={(e) => setComment(e.target.value)}
-            aria-describedby="review-count review-help"
-          />
-          <p id="review-count" className={left < 50 ? 'counter warn' : 'counter'} aria-live="polite">
-            {left} characters left
-          </p>
-          <p id="review-help" className="muted small">
-            Please leave out phone numbers, emails and links. Reviews are checked by our team before they appear.
-          </p>
-        </div>
-        <div className="field">
-          <span className="label" id="review-photos-label">
-            Photos (optional, up to {MAX_PHOTOS})
-          </span>
-          {photos.length > 0 && (
-            <ul className="claim-photos" aria-labelledby="review-photos-label">
-              {photos.map((p, i) => (
-                <li key={p.id}>
-                  {p.preview ? <img src={p.preview} alt={`Your photo ${i + 1}`} /> : <span className="photo-wait">Photo {i + 1}</span>}
-                  <button type="button" className="link-btn" onClick={() => removePhoto(p.id)}>
-                    Remove<span className="sr-only"> photo {i + 1}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
+        <Field
+          id="review-text"
+          label="Tell other buyers about them (optional)"
+          hint="Please leave out phone numbers, emails and links. Reviews are checked by our team before they appear."
+          describedBy="review-count"
+        >
+          {(control) => (
+            <>
+              <textarea {...control} rows={4} maxLength={MAX_COMMENT} value={comment} onChange={(e) => setComment(e.target.value)} />
+              <p id="review-count" className={left < 50 ? 'counter warn' : 'counter'} aria-live="polite">
+                {left} characters left
+              </p>
+            </>
           )}
-          {photos.length < MAX_PHOTOS && (
-            <label className="btn btn-quiet photo-pick">
-              {uploading ? 'Uploading…' : photos.length ? 'Add another photo' : 'Add a photo'}
-              <input
-                type="file"
-                accept="image/jpeg,image/png,image/webp"
-                multiple
-                className="sr-only"
-                disabled={uploading}
-                onChange={addPhotos}
-                aria-describedby={photoError ? 'review-photo-error' : 'review-photos-label'}
-              />
-            </label>
-          )}
-          {photoError && (
-            <p id="review-photo-error" className="field-error" role="alert">
-              {photoError}
-            </p>
-          )}
-        </div>
+        </Field>
+        <PhotoPicker
+          id="review-photos"
+          max={MAX_PHOTOS}
+          accept="image/jpeg,image/png,image/webp"
+          alt={(i) => `Your photo ${i + 1}`}
+          photos={photos}
+          uploading={uploading}
+          error={photoError}
+          onAdd={addPhotos}
+          onRemove={removePhoto}
+        />
         <label className="option">
           <input type="checkbox" checked={anonymous} onChange={(e) => setAnonymous(e.target.checked)} />
           <span>Post without my name</span>
@@ -244,7 +196,7 @@ function ReviewForm({ item, existing, onSent }: { item?: Reviewable; existing?: 
           Shown as <strong>{shownAs(signedInProfile()?.name, anonymous)}</strong>, with a “Verified purchase” badge. We never show your phone, email or
           address.
         </p>
-        {formError && (
+        {formError && !starsError && (
           <p className="field-error" role="alert">
             {formError}
           </p>
@@ -383,23 +335,18 @@ export function MyReviews() {
         ))}
       </ul>
       {deleting && (
-        <Dialog
+        <ConfirmDialog
           title="Delete this review?"
+          keepLabel="Keep it"
+          confirmLabel="Delete review"
+          busyLabel="Deleting…"
+          busy={del.isPending}
+          error={del.error}
+          onConfirm={() => del.mutate(deleting.id)}
           onClose={() => setDeleting(null)}
-          footer={
-            <>
-              <button type="button" className="btn" onClick={() => setDeleting(null)}>
-                Keep it
-              </button>
-              <button type="button" className="btn btn-danger" disabled={del.isPending} onClick={() => del.mutate(deleting.id)}>
-                {del.isPending ? 'Deleting…' : 'Delete review'}
-              </button>
-            </>
-          }
         >
           <p>Your review of {deleting.productName} and its photos will be removed. You can't write a new one for the same item.</p>
-          <ErrorNote error={del.error} />
-        </Dialog>
+        </ConfirmDialog>
       )}
     </section>
   )

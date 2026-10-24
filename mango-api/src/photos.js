@@ -95,8 +95,91 @@ export async function dropPhoto(row) {
 }
 
 /** Sends a stored photo as the response. */
-export async function sendPhoto(res, row) {
-  res.set('Content-Type', row.mime).set('Cache-Control', 'private, max-age=86400').send(await photoBytes(row))
+export async function sendPhoto(res, row, cache = 'private, max-age=86400') {
+  const bytes = await photoBytes(row)
+  res.set('Content-Type', row.mime).set('Cache-Control', cache).send(bytes)
+}
+
+// ---------------------------------------------------------------- thumbnails
+
+/**
+ * Widths a public photo (product or review) can be asked for with ?w=, so a
+ * 170 px tile or an 88 px review thumbnail does not download the full photo.
+ * A short list keeps the number of cached variants (here and at the CDN) small.
+ */
+export const PHOTO_WIDTHS = [160, 320, 480, 640, 960, 1200]
+
+/** The ?w= of a photo request: null when absent, else one of PHOTO_WIDTHS. Anything else is a 400 (INVALID_WIDTH). */
+export function photoWidth(raw) {
+  if (raw === undefined) return null
+  const w = typeof raw === 'string' && /^\d{1,4}$/.test(raw) ? Number(raw) : NaN
+  if (!PHOTO_WIDTHS.includes(w)) throw badRequest(`The photo width (w) must be one of ${PHOTO_WIDTHS.join(', ')}`, 'INVALID_WIDTH')
+  return w
+}
+
+/** Resized photos kept in memory, least recently used dropped first, at most this many bytes in all. */
+const VARIANT_CACHE_BYTES = 16 * 1024 * 1024
+const variants = new Map()
+const resizing = new Map()
+let variantBytes = 0
+
+function remember(key, bytes) {
+  if (bytes.length > VARIANT_CACHE_BYTES / 8) return
+  variants.set(key, bytes)
+  variantBytes += bytes.length
+  for (const [k, b] of variants) {
+    if (variantBytes <= VARIANT_CACHE_BYTES) break
+    variants.delete(k)
+    variantBytes -= b.length
+  }
+}
+
+/** Tests: empty the resized-photo cache. Returns how many variants it held. */
+export function clearPhotoVariants() {
+  const n = variants.size
+  variants.clear()
+  variantBytes = 0
+  return n
+}
+
+/**
+ * The photo at `width` px wide (never wider than it was stored) as a JPEG.
+ * `key` names the stored image and must change whenever its bytes do.
+ */
+export async function photoVariant(row, key, width) {
+  const id = `${key}@${width}`
+  const hit = variants.get(id)
+  if (hit) {
+    // Move to the back: most recently used.
+    variants.delete(id)
+    variants.set(id, hit)
+    return hit
+  }
+  if (resizing.has(id)) return resizing.get(id)
+  const job = (async () => {
+    const original = await photoBytes(row)
+    const out = await sharp(original, { failOn: 'none', limitInputPixels: 50_000_000 })
+      .resize({ width, withoutEnlargement: true })
+      .flatten({ background: '#ffffff' })
+      .jpeg({ quality: 72, mozjpeg: true })
+      .toBuffer()
+    remember(id, out)
+    return out
+  })().finally(() => resizing.delete(id))
+  resizing.set(id, job)
+  return await job
+}
+
+/** Sends a public photo, resized to `width` when one was asked for. */
+export async function sendPublicPhoto(res, row, { key, width, cache }) {
+  const bytes = width ? await photoVariant(row, key, width) : await photoBytes(row)
+  res
+    .set('Content-Type', width ? 'image/jpeg' : row.mime)
+    .set('Cache-Control', cache)
+    .set('X-Content-Type-Options', 'nosniff')
+    // Public by design: the shop and panel, on other origins, show it in an <img>.
+    .set('Cross-Origin-Resource-Policy', 'cross-origin')
+    .send(bytes)
 }
 
 // ---------------------------------------------------------------- review photos
@@ -113,11 +196,11 @@ export const UPLOAD_PREFIX = 'review-uploads/'
  * EXIF, GPS and any other metadata (and anything hidden after the image data)
  * is left behind. Throws PHOTO_INVALID for a file that only looks like an image.
  */
-export async function cleanImage(bytes) {
+export async function cleanImage(bytes, side = REVIEW_PHOTO_SIDE) {
   try {
     const { data, info } = await sharp(bytes, { failOn: 'error', limitInputPixels: 50_000_000 })
       .rotate() // apply the camera's orientation before the tag is dropped
-      .resize({ width: REVIEW_PHOTO_SIDE, height: REVIEW_PHOTO_SIDE, fit: 'inside', withoutEnlargement: true })
+      .resize({ width: side, height: side, fit: 'inside', withoutEnlargement: true })
       .flatten({ background: '#ffffff' })
       .jpeg({ quality: 82, mozjpeg: true })
       .toBuffer({ resolveWithObject: true })
@@ -136,7 +219,7 @@ export const blobUploadsOn = () => Boolean(env.BLOB_READ_WRITE_TOKEN && store ==
  * API (Vercel functions refuse bodies over 4.5 MB).
  */
 export async function reviewUploadToken(pathname) {
-  return generateClientTokenFromReadWriteToken({
+  return await generateClientTokenFromReadWriteToken({
     token: env.BLOB_READ_WRITE_TOKEN,
     pathname,
     allowedContentTypes: ['image/jpeg', 'image/png', 'image/webp'],
@@ -149,7 +232,7 @@ export async function reviewUploadToken(pathname) {
 /** The bytes of a direct upload, or null if nothing is there. */
 export async function readUpload(path) {
   if (!store) return null
-  return store.get(path)
+  return await store.get(path)
 }
 
 export async function deleteUpload(path) {
@@ -159,5 +242,5 @@ export async function deleteUpload(path) {
 /** Direct uploads older than `before` that were never finished (the phone gave up). */
 export async function staleUploads(before, limit) {
   if (!store?.listOld) return []
-  return store.listOld(UPLOAD_PREFIX, before, limit)
+  return await store.listOld(UPLOAD_PREFIX, before, limit)
 }
