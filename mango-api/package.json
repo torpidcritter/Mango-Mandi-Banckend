@@ -20,7 +20,7 @@
     "@sentry/node": "^11.8.0",
     "@vercel/blob": "^2.8.2",
     "@vercel/functions": "^3.10.1",
-    "bcryptjs": "^2.4.3",
+    "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "express": "^4.22.3",
