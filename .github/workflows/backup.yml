@@ -57,7 +57,7 @@ jobs:
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.check.outputs.ready == 'true'
       - name: Install pg_dump 17
         if: steps.check.outputs.ready == 'true'
@@ -72,7 +72,7 @@ jobs:
           PATH="/usr/lib/postgresql/17/bin:$PATH" DATABASE_URL="$BACKUP_DATABASE_URL" BACKUP_DIR=backups \
             BACKUP_GPG_RECIPIENT="$recipient" ./mango-api/ops/backup.sh
           ls backups/*.gpg >/dev/null # never upload an unencrypted dump
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.check.outputs.ready == 'true'
         with:
           name: mango-backup-${{ github.run_id }}
