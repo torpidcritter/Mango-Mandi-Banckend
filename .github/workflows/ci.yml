@@ -13,8 +13,8 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -53,7 +53,7 @@ jobs:
         env:
           CI: 'true'
           PW_WEBKIT: '1'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-report
@@ -78,8 +78,8 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U mango" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -144,10 +144,10 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U mango" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       # The old release's bill, gift and label tests read their PDFs with poppler too.
@@ -173,8 +173,8 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U mango" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -284,7 +284,7 @@ jobs:
       # A made-up help number for the image build check; production sets the real one in deploy/.env.
       VITE_SUPPORT_WHATSAPP: '910000000000'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: touch .env
       - name: Compose file is valid
         run: docker compose -f compose.yml config -q
