@@ -245,6 +245,13 @@ interface Draft {
 
 /** A whole number from a box, or null; no upper limit here: the API checks stock and group size. */
 const whole = (s: string) => (/^\d+$/.test(s.trim()) ? Number(s.trim()) : null)
+const plusDays = (day: string, n: number) => new Date(Date.parse(`${day}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10)
+/** The stay the customer has picked, or by default the visit day plus the farm's usual nights when anyone stays overnight. */
+function stayOf(f: FarmExperience, d: Draft) {
+  const from = d.arrivalDate || d.visitDate!
+  const nights = (whole(d.overnight) ?? 0) > 0 ? f.settings.stayNights : 0
+  return { from, to: d.departureDate || plusDays(d.visitDate!, nights) }
+}
 
 /** /farm-experience/book — variety, kilograms, date, group, details, summary; then Razorpay. */
 export function FarmBook() {
@@ -328,8 +335,8 @@ function BookingFlow({ f }: { f: FarmExperience }) {
         varietyId: d.varietyId!,
         kg: kg!,
         visitDate: d.visitDate!,
-        arrivalDate: d.arrivalDate || d.visitDate!,
-        departureDate: d.departureDate || d.visitDate!,
+        arrivalDate: stayOf(f, d).from,
+        departureDate: stayOf(f, d).to,
         adults: whole(d.adults)!,
         children: whole(d.children) ?? 0,
         overnightGuests: whole(d.overnight) ?? 0,
@@ -376,8 +383,7 @@ function BookingFlow({ f }: { f: FarmExperience }) {
       if (children == null || overnight == null) return t('farm.wholeNumbers')
       if (overnight > adults + children) return t('farm.overnightTooMany')
       for (const v of [d.veg, d.nonVeg, d.jain]) if (v.trim() && whole(v) == null) return t('farm.wholeNumbers')
-      const from = d.arrivalDate || d.visitDate!
-      const to = d.departureDate || d.visitDate!
+      const { from, to } = stayOf(f, d)
       if (from > d.visitDate! || to < d.visitDate!) return t('farm.stayDates')
       return null
     }
@@ -484,7 +490,7 @@ function BookingFlow({ f }: { f: FarmExperience }) {
                 <input type="date" max={d.visitDate ?? undefined} value={d.arrivalDate || d.visitDate || ''} onChange={(e) => set('arrivalDate', e.target.value)} />
               </Field>
               <Field id="farm-departure" label={t('farm.departure')}>
-                <input type="date" min={d.visitDate ?? undefined} value={d.departureDate || d.visitDate || ''} onChange={(e) => set('departureDate', e.target.value)} />
+                <input type="date" min={d.visitDate ?? undefined} value={d.visitDate ? stayOf(f, d).to : ''} onChange={(e) => set('departureDate', e.target.value)} />
               </Field>
             </div>
             <fieldset className="field">
@@ -590,8 +596,7 @@ function Summary({
   const t = useT()
   const en = english(t)
   const s = f.settings
-  const from = d.arrivalDate || d.visitDate!
-  const to = d.departureDate || d.visitDate!
+  const { from, to } = stayOf(f, d)
   return (
     <>
       <dl className="facts">

@@ -9,7 +9,7 @@ import { date, dateTime, rupees } from '../../format'
 import { MONEY_CHANGE_WHY, useStepUp } from '../../StepUp'
 import { Badge, BackLink, Dialog, FormError, ManagerOnlyNote, PhoneLink, QueryError, Spinner, scrollRegion, usePageTitle, useToast } from '../../ui'
 import { farm, type Booking, type MealDay } from './api'
-import { FarmBadge, HOSPITALITY_LABEL, MOVE_LABEL, useIsManager } from './shared'
+import { FARM_STATUS_LABEL, FarmBadge, HOSPITALITY_LABEL, MOVE_LABEL, useIsManager } from './shared'
 
 export default function FarmBookingDetail() {
   const { id = '' } = useParams()
@@ -346,7 +346,7 @@ function Detail({ b }: { b: Booking }) {
           {[...b.events].reverse().map((e) => (
             <li key={e.id}>
               <strong>{e.action.toLowerCase().replace(/_/g, ' ')}</strong>
-              {e.from !== e.to && e.from && <span className="muted small"> · {e.from.toLowerCase()} → {e.to.toLowerCase()}</span>}
+              {e.from !== e.to && e.from && <span className="muted small"> · {statusName(e.from)} → {statusName(e.to)}</span>}
               {e.detail && <div>{e.detail}</div>}
               <div className="muted small">
                 {dateTime(e.at)} · {e.actor}
@@ -491,6 +491,7 @@ function Detail({ b }: { b: Booking }) {
   )
 }
 
+const statusName = (s: string) => (FARM_STATUS_LABEL as Record<string, string>)[s]?.toLowerCase() ?? s.toLowerCase().replace(/_/g, ' ')
 const nextDay = (d: string) => new Date(Date.parse(`${d}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10)
 
 function Row({ label, children }: { label: string; children: ReactNode }) {

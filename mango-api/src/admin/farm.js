@@ -113,7 +113,7 @@ router.post(
 
 router.post(
   `${F}/bookings/:id/hospitality`,
-  onBooking(async (c, b, req) => {
+  onBooking((c, b, req) => {
     const p = parse(z.object({ action: z.enum(['APPROVE', 'PROPOSE']), text: z.string().trim().max(3000).optional() }).strict(), req.body)
     if (p.action === 'APPROVE') return approveHospitality(c, b, { plan: p.text, actor: actorOf(req) })
     if (!p.text || p.text.length < 10) throw new HttpError(400, 'VALIDATION_ERROR', 'Describe the arrangement you are proposing (10 characters or more).')
@@ -127,7 +127,7 @@ const allocation = z.object({
 
 router.put(
   `${F}/bookings/:id/rooms`,
-  onBooking(async (c, b, req) => {
+  onBooking((c, b, req) => {
     const { allocations } = parse(z.object({ allocations: z.array(allocation).max(200) }).strict(), req.body)
     return allocateRooms(c, b, allocations, { actor: actorOf(req) })
   }),
@@ -135,7 +135,7 @@ router.put(
 
 router.post(
   `${F}/bookings/:id/status`,
-  onBooking(async (c, b, req) => {
+  onBooking((c, b, req) => {
     const to = Object.values(STAFF_MOVES).flat()
     const p = parse(z.object({ to: z.enum([...new Set(to)]), note: z.string().trim().max(1000).optional() }).strict(), req.body)
     return staffMove(c, b, p.to, { actor: actorOf(req), note: p.note })
@@ -144,7 +144,7 @@ router.post(
 
 router.post(
   `${F}/bookings/:id/harvest`,
-  onBooking(async (c, b, req) => {
+  onBooking((c, b, req) => {
     const kg = z.number().min(0).max(1_000_000).multipleOf(0.01, 'Up to two decimals')
     const p = parse(
       z.object({
@@ -159,7 +159,7 @@ router.post(
 
 router.post(
   `${F}/bookings/:id/extras`,
-  onBooking(async (c, b, req) => {
+  onBooking((c, b, req) => {
     const p = parse(z.object({ kg: z.number().positive('More than 0 kg').max(1_000_000).multipleOf(0.01, 'Up to two decimals'), note: z.string().trim().max(500).optional() }).strict(), req.body)
     return requestExtra(c, b, { kg: p.kg, note: p.note, actor: actorOf(req) })
   }),
@@ -167,7 +167,7 @@ router.post(
 
 router.post(
   `${F}/bookings/:id/extras/:extraId/withdraw`,
-  onBooking(async (c, b, req) => withdrawExtra(c, b, parse(ID, req.params.extraId), { actor: actorOf(req) })),
+  onBooking((c, b, req) => withdrawExtra(c, b, parse(ID, req.params.extraId), { actor: actorOf(req) })),
 )
 
 // ---- managers only: dates, cancelling, money
@@ -175,7 +175,7 @@ router.post(
 router.post(
   `${F}/bookings/:id/move`,
   requireManager,
-  onBooking(async (c, b, req) => {
+  onBooking((c, b, req) => {
     const p = parse(z.object({ date: DAY, reason, outsideWindow: z.boolean().optional() }).strict(), req.body)
     return moveVisit(c, b, p.date, { actor: actorOf(req), reason: p.reason, window: !p.outsideWindow })
   }),
@@ -202,13 +202,13 @@ router.post(
 router.post(
   `${F}/bookings/:id/request/decline`,
   requireManager,
-  onBooking(async (c, b, req) => declineRequest(c, b, { reason: parse(z.object({ reason }).strict(), req.body).reason, actor: actorOf(req) })),
+  onBooking((c, b, req) => declineRequest(c, b, { reason: parse(z.object({ reason }).strict(), req.body).reason, actor: actorOf(req) })),
 )
 
 router.post(
   `${F}/bookings/:id/no-show`,
   requireManager,
-  onBooking(async (c, b, req) => markNoShow(c, b, { actor: actorOf(req), note: parse(z.object({ note: z.string().trim().max(1000).optional() }).strict(), req.body).note })),
+  onBooking((c, b, req) => markNoShow(c, b, { actor: actorOf(req), note: parse(z.object({ note: z.string().trim().max(1000).optional() }).strict(), req.body).note })),
 )
 
 router.post(

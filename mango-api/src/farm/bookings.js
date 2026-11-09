@@ -508,7 +508,7 @@ export async function approveHospitality(c, b, { plan, actor }) {
   })
 }
 
-export async function proposeAlternative(c, b, { proposal, actor }) {
+export function proposeAlternative(c, b, { proposal, actor }) {
   if (!['HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT'].includes(b.status)) throw conflict('Arrangements can only be changed before the visit.', 'BAD_STATUS_MOVE')
   return move(c, b, 'HOSPITALITY_REVIEW', {
     action: 'ALTERNATIVE_PROPOSED', detail: proposal, actor, fields: { hospitality_status: 'ALTERNATIVE_PROPOSED', alternative_proposal: proposal },
@@ -592,7 +592,7 @@ export async function staffMove(c, b, to, { actor, note }) {
 }
 
 /** Farm staff check a booking in by its QR code or reference, on its stay's days (a manager may override). */
-export async function checkIn(c, b, { actor, override = false, today = todayIST() }) {
+export function checkIn(c, b, { actor, override = false, today = todayIST() }) {
   if (ON_SITE.includes(b.status)) throw new HttpError(409, 'ALREADY_CHECKED_IN', `Already checked in (${STATUS_WORDS[b.status].toLowerCase()}).`)
   if (!CHECKIN_FROM.includes(b.status)) throw new HttpError(409, 'NOT_CHECKABLE', `This booking is ${STATUS_WORDS[b.status].toLowerCase()}, so it can’t be checked in.`, { status: b.status })
   if (!override && (today < b.arrival_date || today > b.departure_date)) {

@@ -54,7 +54,7 @@ export default function FarmCalendar() {
       ) : (
         <>
           <p className="muted small">
-            Farmhouse: {q.data.rooms} rooms in use, sleeping {q.data.beds}. Harvest per variety is set on <Link to="/farm/harvest">Harvest stock</Link>.
+            Farmhouse: {q.data.rooms} rooms in use, sleeping up to {q.data.beds} with extra beds. Harvest per variety is set on <Link to="/farm/harvest">Harvest stock</Link>.
           </p>
           <div {...scrollRegion('Farm calendar', { cards: true })}>
             <table className="pn-table">

@@ -198,7 +198,7 @@ function BookingView({ b }: { b: FarmBooking }) {
       )}
 
       {b.status === 'NEEDS_ATTENTION' && <p className="card note-card">{t('farm.attention')}</p>}
-      {b.status === 'HOSPITALITY_REVIEW' && b.hospitality.status !== 'ALTERNATIVE_PROPOSED' && <p className="card note-card">{t('farm.reviewing')}</p>}
+      {b.status === 'HOSPITALITY_REVIEW' && !thanks && b.hospitality.status !== 'ALTERNATIVE_PROPOSED' && <p className="card note-card">{t('farm.reviewing')}</p>}
       {b.status === 'CANCELLED' && (
         <p className="card note-card">
           {b.refundStatus === 'REFUNDED'
