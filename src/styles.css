@@ -385,8 +385,9 @@ h3 {
   background: transparent;
 }
 
-/* Narrower than 1100px the bar shows only the role; the email is still read out and is in the menu. */
-@media (max-width: 1099.98px) {
+/* Narrower than 1300px the bar shows only the role, so the menu groups fit on one row; the email
+   is still read out and is in the menu. */
+@media (max-width: 1299.98px) {
   .account-email {
     position: absolute;
     width: 1px;
@@ -455,8 +456,15 @@ h3 {
   .nav-group-label {
     display: none;
   }
+  /* The groups wrap onto a second row rather than push the page wider (more groups appear as
+     switches turn on, e.g. Bulk Orders with FARM_EXPERIENCE). */
+  .app-nav {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
   .nav-groups {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-1);
   }
