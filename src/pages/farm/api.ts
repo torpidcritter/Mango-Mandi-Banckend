@@ -13,9 +13,6 @@ export function qs(params: Record<string, string | number | boolean | undefined 
 }
 
 export type FarmStatus =
-  | 'PAYMENT_PENDING'
-  | 'EXPIRED'
-  | 'NEEDS_ATTENTION'
   | 'HOSPITALITY_REVIEW'
   | 'CONFIRMED'
   | 'PREPARING'
@@ -23,6 +20,7 @@ export type FarmStatus =
   | 'CHECKED_IN'
   | 'HARVESTING'
   | 'WEIGHING'
+  | 'PAYMENT_DUE'
   | 'PACKING'
   | 'COMPLETED'
   | 'CANCELLED'
@@ -47,8 +45,10 @@ export interface BookingRow {
   variety: string
   varietyId: string
   kg: number
+  /** The estimate at booking; billAmount is the bill after weighing (null until then). */
   total: number
-  paymentStatus: string | null
+  billAmount: number | null
+  paidAt: string | null
   paymentId: string | null
   visitDate: string
   arrivalDate: string
@@ -62,7 +62,7 @@ export interface BookingRow {
   foodSummary: { veg?: number; nonVeg?: number; jain?: number; allergies?: string; requests?: string }
   harvestStatus: string
   packingStatus: string
-  request: 'CANCEL' | 'MOVE' | null
+  request: 'CANCEL' | 'RESCHEDULE' | null
   refundStatus: string | null
   createdAt: string
 }
@@ -106,7 +106,9 @@ export interface Booking {
   variety: { id: string; name: string }
   kg: number
   pricePerKg: number
+  /** The estimate at booking. */
   total: number
+  bill: FarmBill | null
   visitDate: string
   guests: {
     adults: number
@@ -132,9 +134,7 @@ export interface Booking {
   }
   harvest: { status: string; harvestedKg: number | null; acceptedKg: number | null; inspectionNote: string | null; packingStatus: string }
   money: { paid: number; refunded: number; refunds: { id: string; amount: number; kind: string; reason: string | null; status: string; requestedAt: string; refundedAt: string | null }[] }
-  extras: { id: string; kg: number; pricePerKg: number; amount: number; status: string; note: string | null; createdAt: string; paidAt: string | null }[]
-  request: { kind: 'CANCEL' | 'MOVE'; date: string | null; note: string | null; at: string } | null
-  holdExpiresAt: string | null
+  request: { kind: 'CANCEL' | 'RESCHEDULE'; date: string | null; note: string | null; at: string } | null
   paidAt: string | null
   cancelledAt: string | null
   cancelReason: string | null
@@ -145,15 +145,37 @@ export interface Booking {
   customer: { id: string; name: string | null; phone: string | null; email: string | null } | null
   checkinCode: string
   kgReserved: boolean
-  attentionReason: string | null
-  paidKg: number
-  discrepancy: { shortKg: number; overKg: number } | null
   harvestDay: { estimatedKg: number; bookableKg: number; reservedKg: number; readiness: string; qcStatus: string } | null
-  payments: { id: string; kind: string; amount: number; status: string; razorpayOrderId: string | null; paymentId: string | null; method: string | null; failed: boolean; createdAt: string; paidAt: string | null }[]
+  payments: {
+    id: string
+    kind: 'ONLINE' | 'RECORDED'
+    amount: number
+    status: string
+    razorpayOrderId: string | null
+    paymentId: string | null
+    method: string | null
+    reference: string | null
+    recordedBy: string | null
+    failed: boolean
+    createdAt: string
+    paidAt: string | null
+  }[]
   events: { id: string; from: string | null; to: string; action: string; detail: string | null; actor: string; actorKind: string; at: string }[]
   notes: { id: string; body: string; author: string; at: string }[]
   nextMoves: string[]
 }
+/** The bill after weighing, in paise. */
+export interface FarmBill {
+  acceptedKg: number
+  bookedKg: number
+  pricePerKg: number
+  bookedPartKg: number
+  extraKg: number
+  extraPricePerKg: number | null
+  amount: number
+  at: string
+}
+export type RecordedMethod = 'UPI' | 'CARD' | 'CASH' | 'BANK_TRANSFER'
 export interface HarvestCell {
   varietyId: string
   name: string
@@ -174,7 +196,6 @@ export interface CalendarDay {
   note: string | null
   harvest: HarvestCell[]
   visits: { id: string; number: string; status: FarmStatus; name: string; variety: string; kg: number; guests: number; hospitalityStatus: HospitalityStatus; overCapacity: boolean }[]
-  pendingHolds: number
   overnightGuests: number
   roomsInUse: number
   overlaps: string[]
@@ -231,6 +252,7 @@ export interface Report {
   kgBooked: number
   kgHarvested: number
   revenue: number
+  paidBookings: number
   avgKg: number
   guestsHosted: number
   avgGroup: number
@@ -263,16 +285,16 @@ export const farm = {
     bookingId: string,
     body: { harvestedKg?: number; acceptedKg?: number; inspectionNote?: string; harvestStatus?: string; packingStatus?: string },
   ) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/harvest`, body),
-  extra: (bookingId: string, kg: number, note?: string) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/extras`, note ? { kg, note } : { kg }),
-  withdrawExtra: (bookingId: string, extraId: string) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/extras/${id(extraId)}/withdraw`, {}),
+  /** The bill after weighing (or a corrected one before it is paid). */
+  bill: (bookingId: string, acceptedKg?: number) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/bill`, acceptedKg == null ? {} : { acceptedKg }),
+  /** A manager records the bill paid at the farm (always confirmed with the manager's password). */
+  recordPayment: (bookingId: string, body: { method: RecordedMethod; reference: string }, confirmCode?: string) =>
+    apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/record-payment`, withCode(body, confirmCode)),
   move: (bookingId: string, date: string, reason: string, outsideWindow = false) =>
     apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/move`, { date, reason, ...(outsideWindow && { outsideWindow }) }),
-  cancel: (bookingId: string, body: { reason: string; refund: boolean; kind?: 'CANCELLED' | 'NOT_HOSTED' }, confirmCode?: string) =>
-    apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/cancel`, withCode(body, confirmCode)),
+  cancel: (bookingId: string, reason: string) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/cancel`, { reason }),
   declineRequest: (bookingId: string, reason: string) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/request/decline`, { reason }),
   noShow: (bookingId: string, note?: string) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/no-show`, note ? { note } : {}),
-  shortfall: (bookingId: string, kg: number, reason: string, confirmCode?: string) =>
-    apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/shortfall-refund`, withCode({ kg, reason }, confirmCode)),
   settleRefund: (refundId: string, reference: string, confirmCode?: string) =>
     apiRequest<Booking>('POST', `${F}/refunds/${id(refundId)}/settle`, withCode({ reference }, confirmCode)),
 

@@ -1,7 +1,7 @@
 // Farm Experience for staff (docs/farm-experience.md): bookings, the farm
 // calendar, harvest stock, rooms, settings and reports. Managers and operators
-// (access.js lists what operators may call; money, prices, dates, cancelling,
-// settings and exports are managers only). Every change is written to
+// (access.js lists what operators may call: they can weigh and send the bill;
+// recording a payment, prices, dates, cancelling, settings and exports are managers only). Every change is written to
 // staff_audit by access.js (auditStaffChanges) and to the booking's own events
 // in the same transaction as the change. While FARM_EXPERIENCE is off every
 // route answers 404.
@@ -14,11 +14,11 @@ import { asyncHandler, conflict, HttpError, notFound, parse } from '../errors.js
 import { isOn } from '../feature-switches.js'
 import { newId } from '../ids.js'
 import {
-  allocateRooms, approveHospitality, cancelBooking, checkIn, declineRequest, event, lockBooking, markNoShow, moveVisit, proposeAlternative,
-  recordHarvest, refundShortfall, requestExtra, staffActor, staffMove, staffView, withdrawExtra,
+  allocateRooms, approveHospitality, cancelBooking, checkIn, declineRequest, event, issueBill, lockBooking, markNoShow, moveVisit, proposeAlternative,
+  recordHarvest, recordPayment, staffActor, staffMove, staffView,
 } from '../farm/bookings.js'
-import { processDueFarmRefunds, settleFarmRefund } from '../farm/refunds.js'
-import { CHECKIN_CODE_RE, STAFF_MOVES, STATUSES } from '../farm/rules.js'
+import { settleFarmRefund } from '../farm/refunds.js'
+import { BEFORE_VISIT, CHECKIN_CODE_RE, STAFF_MOVES, STATUSES } from '../farm/rules.js'
 import { loadSettings, readinessProblems, saveSettings } from '../farm/settings.js'
 import { bookingsCsv, calendar, listBookings, overview, report, SORTS } from '../farm/staff.js'
 import { stepUp, withoutConfirm } from './step-up.js'
@@ -53,7 +53,7 @@ const listFilters = z.object({
   visitTo: DAY.optional(),
   createdFrom: DAY.optional(),
   createdTo: DAY.optional(),
-  payment: z.enum(['PAID', 'UNPAID', 'REFUNDED']).optional(),
+  payment: z.enum(['PAID', 'DUE', 'REFUNDED']).optional(),
   minKg: z.coerce.number().int().min(0).optional(),
   maxKg: z.coerce.number().int().min(0).optional(),
   minGuests: z.coerce.number().int().min(0).optional(),
@@ -90,7 +90,7 @@ router.patch(
       req.body,
     )
     if (p.version != null && p.version !== b.version) throw new HttpError(409, 'STALE_BOOKING', 'Someone else changed this booking. Reload to see their change.', { version: b.version })
-    if (['CANCELLED', 'NO_SHOW', 'COMPLETED', 'EXPIRED'].includes(b.status)) throw conflict('This booking is closed.', 'BOOKING_CLOSED')
+    if (['CANCELLED', 'NO_SHOW', 'COMPLETED'].includes(b.status)) throw conflict('This booking is closed.', 'BOOKING_CLOSED')
     const sets = []
     const args = [b.id]
     if (p.hospitalityPlan !== undefined) sets.push(`hospitality_plan = $${args.push(p.hospitalityPlan || null)}`)
@@ -157,17 +157,13 @@ router.post(
   }),
 )
 
+// The bill after weighing (or a corrected one before it is paid), for the kilograms accepted.
 router.post(
-  `${F}/bookings/:id/extras`,
+  `${F}/bookings/:id/bill`,
   onBooking((c, b, req) => {
-    const p = parse(z.object({ kg: z.number().positive('More than 0 kg').max(1_000_000).multipleOf(0.01, 'Up to two decimals'), note: z.string().trim().max(500).optional() }).strict(), req.body)
-    return requestExtra(c, b, { kg: p.kg, note: p.note, actor: actorOf(req) })
+    const p = parse(z.object({ acceptedKg: z.number().positive('More than 0 kg').max(1_000_000).multipleOf(0.01, 'Up to two decimals').optional() }).strict(), req.body ?? {})
+    return issueBill(c, b, { acceptedKg: p.acceptedKg, actor: actorOf(req) })
   }),
-)
-
-router.post(
-  `${F}/bookings/:id/extras/:extraId/withdraw`,
-  onBooking((c, b, req) => withdrawExtra(c, b, parse(ID, req.params.extraId), { actor: actorOf(req) })),
 )
 
 // ---- managers only: dates, cancelling, money
@@ -181,22 +177,11 @@ router.post(
   }),
 )
 
+// Before the visit nothing is paid, so cancelling moves no money.
 router.post(
   `${F}/bookings/:id/cancel`,
   requireManager,
-  asyncHandler(async (req, res) => {
-    const id = parse(ID, req.params.id)
-    const p = parse(
-      z.object({ reason, refund: z.boolean(), kind: z.enum(['CANCELLED', 'NOT_HOSTED']).default('CANCELLED') }).strict(),
-      withoutConfirm(req.body),
-    )
-    // A cancel that refunds moves money: the manager confirms it is them (STEP_UP_ROUTES).
-    const paid = (await query(`SELECT 1 FROM farm_booking_payments WHERE booking_id = $1 AND status = 'SUCCEEDED'`, [id])).rowCount > 0
-    if (p.refund && paid) await stepUp(req, { always: true })
-    const r = await tx(async (c) => cancelBooking(c, await lockBooking(c, id), { reason: p.reason, actor: actorOf(req), refund: p.refund, refundKind: p.kind }))
-    if (r.refunds.length) await processDueFarmRefunds(now(), { bookingId: id }).catch(() => {})
-    res.json(await fresh(id))
-  }),
+  onBooking((c, b, req) => cancelBooking(c, b, { reason: parse(z.object({ reason }).strict(), req.body).reason, actor: actorOf(req) })),
 )
 
 router.post(
@@ -211,15 +196,21 @@ router.post(
   onBooking((c, b, req) => markNoShow(c, b, { actor: actorOf(req), note: parse(z.object({ note: z.string().trim().max(1000).optional() }).strict(), req.body).note })),
 )
 
+// The customer paid the bill another way at the farm: money in, so the manager confirms it is them (STEP_UP_ROUTES).
 router.post(
-  `${F}/bookings/:id/shortfall-refund`,
+  `${F}/bookings/:id/record-payment`,
   requireManager,
   asyncHandler(async (req, res) => {
     const id = parse(ID, req.params.id)
-    const p = parse(z.object({ kg: z.number().positive().max(1_000_000).multipleOf(0.01), reason }).strict(), withoutConfirm(req.body))
+    const p = parse(
+      z.object({
+        method: z.enum(['UPI', 'CARD', 'CASH', 'BANK_TRANSFER']),
+        reference: z.string().trim().min(3, 'Give the receipt or UPI reference').max(100),
+      }).strict(),
+      withoutConfirm(req.body),
+    )
     await stepUp(req, { always: true })
-    await tx(async (c) => refundShortfall(c, await lockBooking(c, id), { kg: p.kg, reason: p.reason, actor: actorOf(req) }))
-    await processDueFarmRefunds(now(), { bookingId: id }).catch(() => {})
+    await tx(async (c) => recordPayment(c, await lockBooking(c, id), { method: p.method, reference: p.reference, actor: actorOf(req) }))
     res.json(await fresh(id))
   }),
 )
@@ -294,9 +285,9 @@ async function saveDay(c, day, d, admin) {
   )
 }
 
-/** Paid bookings on a day being closed: the manager is told, never silently left. */
+/** Open bookings on a day being closed: the manager is told, never silently left. */
 async function bookingsOnDay(c, day) {
-  const { rows } = await c.query(`SELECT number FROM farm_bookings WHERE visit_date = $1 AND status = ANY($2)`, [day, ['PAYMENT_PENDING', 'NEEDS_ATTENTION', 'HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT']])
+  const { rows } = await c.query(`SELECT number FROM farm_bookings WHERE visit_date = $1 AND status = ANY($2)`, [day, BEFORE_VISIT])
   return rows.map((r) => r.number)
 }
 

@@ -1,13 +1,14 @@
-// Farm Experience bookings (docs/farm-experience.md): availability, holds,
-// payments, hospitality, the day at the farm, cancelling, moving and refunds.
+// Farm Experience bookings (docs/farm-experience.md): availability, booking,
+// hospitality, the day at the farm, the bill and its payment, cancelling and moving.
 //
 // Stock: each variety has bookable kilograms per visit date (farm_harvest).
 // A booking takes its kilograms with one conditional UPDATE, in the same
 // transaction that checks the date, so two customers can never book the same
-// fruit. An unpaid booking holds them for settings.holdMinutes; then it
-// expires and gives them back. A payment that lands after that takes them
-// again if they are still there; if not, the booking goes to a manager
-// (NEEDS_ATTENTION) to move it or refund it. Nothing is confirmed unpaid.
+// fruit. Nothing is paid when booking: after picking, staff weigh the mangoes,
+// the bill is made for the kilograms accepted (billFor), and the customer pays
+// it online, or a manager records a payment made at the farm. Packing starts
+// once it is paid. A customer can hold only settings.maxOpenBookings upcoming
+// visits at a time.
 //
 // Every change writes a farm_booking_events row in the same transaction.
 import { randomInt } from 'node:crypto'
@@ -17,15 +18,13 @@ import { env } from '../env.js'
 import { newId } from '../ids.js'
 import { findProduct } from '../products.js'
 import {
-  BOOKING_NUMBER_RE, CHECKIN_FROM, CODE_CHARS, FINAL, MIN_KG, ON_SITE, PAID_OPEN, STATUS_WORDS, TAKES_A_VISIT,
-  assertStaffMove, cancelOption, extraAmount, groupSize, priceFor, rescheduleOption, suggestMealPlan,
+  BEFORE_VISIT, BOOKING_NUMBER_RE, CHECKIN_FROM, CODE_CHARS, FINAL, MIN_KG, ON_SITE, STATUS_WORDS, TAKES_A_VISIT,
+  assertStaffMove, billFor, cancelOption, groupSize, priceFor, rescheduleOption, suggestMealPlan,
 } from './rules.js'
 import { loadSettings } from './settings.js'
 import { queueFarmMessages } from './notify.js'
 
 export const SYSTEM_ACTOR = { kind: 'SYSTEM', label: 'system' }
-/** A payment Razorpay may still be about to confirm: a hold is left alone this long after it ends, unless Razorpay was asked. */
-export const GATEWAY_GRACE_MS = 2 * 60_000
 
 const code = (n) => Array.from({ length: n }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('')
 export const newBookingNumber = () => `MMF-${code(8)}`
@@ -86,13 +85,11 @@ export function bookingWindow(settings, today = todayIST()) {
   return { from, to }
 }
 
-/** Bookings counted against a day's visit cap: paid or held (an ended hold no longer counts). */
+/** Bookings counted against a day's visit cap: every booking not cancelled or missed. */
 async function visitsOn(c, day, excludeId = null) {
   const { rows } = await c.query(
-    `SELECT COUNT(*)::int AS n FROM farm_bookings
-      WHERE visit_date = $1 AND status = ANY($2) AND ($3::text IS NULL OR id <> $3)
-        AND NOT (status = 'PAYMENT_PENDING' AND hold_expires_at < $4)`,
-    [day, TAKES_A_VISIT, excludeId, now()],
+    `SELECT COUNT(*)::int AS n FROM farm_bookings WHERE visit_date = $1 AND status = ANY($2) AND ($3::text IS NULL OR id <> $3)`,
+    [day, TAKES_A_VISIT, excludeId],
   )
   return rows[0].n
 }
@@ -106,8 +103,7 @@ export async function openDates(c, { varietyId = null, kg = MIN_KG, settings, to
   if (w.from > w.to) return []
   const { rows } = await c.query(
     `SELECT d.day, d.max_bookings,
-            (SELECT COUNT(*)::int FROM farm_bookings b WHERE b.visit_date = d.day AND b.status = ANY($3)
-                AND NOT (b.status = 'PAYMENT_PENDING' AND b.hold_expires_at < $4)) AS visits,
+            (SELECT COUNT(*)::int FROM farm_bookings b WHERE b.visit_date = d.day AND b.status = ANY($3)) AS visits,
             COALESCE(json_agg(json_build_object('varietyId', h.variety_id, 'availableKg', h.bookable_kg - h.reserved_kg, 'readiness', h.readiness)
                      ORDER BY v.sort_order, v.name) FILTER (WHERE h.variety_id IS NOT NULL), '[]') AS varieties
        FROM farm_days d
@@ -115,7 +111,7 @@ export async function openDates(c, { varietyId = null, kg = MIN_KG, settings, to
        LEFT JOIN farm_varieties v ON v.id = h.variety_id AND v.active
       WHERE d.open AND d.day BETWEEN $1 AND $2 AND (h.variety_id IS NULL OR v.id IS NOT NULL)
       GROUP BY d.day, d.max_bookings ORDER BY d.day`,
-    [w.from, w.to, TAKES_A_VISIT, now()],
+    [w.from, w.to, TAKES_A_VISIT],
   )
   return rows
     .map((r) => ({
@@ -185,32 +181,6 @@ async function releaseKg(c, b) {
   return update(c, b.id, { kg_reserved: false })
 }
 
-/**
- * Unpaid bookings for this variety and day whose hold ran out give their
- * kilograms back before a new booking looks (as INV-01 for orders), so a late
- * maintenance run never keeps a day full. Left alone until Razorpay was asked
- * after the hold, or for GATEWAY_GRACE_MS after it. Bounded, SKIP LOCKED.
- */
-async function expireStaleHolds(c, varietyId, day, at = now()) {
-  const { rows } = await c.query(
-    `SELECT * FROM farm_bookings
-      WHERE status = 'PAYMENT_PENDING' AND variety_id = $1 AND visit_date = $2 AND hold_expires_at < $3
-        AND (hold_expires_at < $4 OR EXISTS (SELECT 1 FROM farm_booking_payments p WHERE p.booking_id = farm_bookings.id
-              AND p.kind = 'BOOKING' AND p.reconcile_checked_at >= farm_bookings.hold_expires_at))
-      ORDER BY hold_expires_at LIMIT 20 FOR UPDATE SKIP LOCKED`,
-    [varietyId, day, at, new Date(at.getTime() - GATEWAY_GRACE_MS)],
-  )
-  for (const b of rows) await expireHold(c, b)
-  return rows.length
-}
-
-/** An unpaid booking whose hold ran out: its kilograms go back. A payment that lands later is still honoured. */
-export async function expireHold(c, b, actor = SYSTEM_ACTOR) {
-  if (b.status !== 'PAYMENT_PENDING') return b
-  const released = await releaseKg(c, b)
-  return move(c, released, 'EXPIRED', { action: 'HOLD_EXPIRED', detail: 'Not paid in time; the mangoes were released', actor, fields: { hold_expires_at: null }, notify: false })
-}
-
 /** Beds at the farmhouse: what the active rooms sleep, extra beds included. */
 async function farmhouseBeds(c) {
   const { rows } = await c.query('SELECT COALESCE(SUM(sleeps + extra_beds), 0)::int AS n FROM farm_rooms WHERE active AND NOT maintenance')
@@ -220,9 +190,9 @@ async function farmhouseBeds(c) {
 // ---------------------------------------------------------------- booking
 
 /**
- * Creates a booking and holds its kilograms: everything checked on the server,
- * nothing taken from the shop but the choices. Returns { booking, payment }.
- * The Razorpay order is made after this transaction commits (startPayment).
+ * Creates a booking and takes its kilograms: everything checked on the server,
+ * nothing taken from the shop but the choices. Nothing is paid now: the stay
+ * goes to our team to arrange, and the bill comes after picking.
  */
 export async function createBooking(c, { customerId, input, today = todayIST() }) {
   const { settings } = await loadSettings(c)
@@ -230,19 +200,15 @@ export async function createBooking(c, { customerId, input, today = todayIST() }
   const v = await getVariety(c, input.varietyId, { lock: true })
   if (!v?.active) throw new HttpError(409, 'FARM_VARIETY_UNAVAILABLE', 'That variety isn’t available for farm visits. Pick another.')
   const price = priceFor(v, input.kg)
-  // One unpaid booking at a time: no customer can keep a day's fruit on hold with several.
+  // Nothing is paid up front, so one customer can hold only a few upcoming visits (and a day's fruit) at a time.
   await c.query('SELECT id FROM customers WHERE id = $1 FOR UPDATE', [customerId])
-  const unpaid = await c.query(
-    `SELECT id, number FROM farm_bookings WHERE customer_id = $1 AND status = 'PAYMENT_PENDING' AND hold_expires_at >= $2 LIMIT 1`,
-    [customerId, now()],
-  )
-  if (unpaid.rows.length) {
-    throw new HttpError(409, 'UNPAID_FARM_BOOKING', `You have an unpaid farm booking (${unpaid.rows[0].number}). Pay for it or cancel it first.`, {
-      bookingId: unpaid.rows[0].id, number: unpaid.rows[0].number,
+  const open = await c.query(`SELECT number FROM farm_bookings WHERE customer_id = $1 AND status = ANY($2) ORDER BY visit_date`, [customerId, BEFORE_VISIT])
+  if (open.rows.length >= settings.maxOpenBookings) {
+    throw new HttpError(409, 'TOO_MANY_FARM_BOOKINGS', `You already have ${open.rows.length} upcoming farm visit${open.rows.length === 1 ? '' : 's'} (${open.rows.map((r) => r.number).join(', ')}). Cancel one or wait until after your visit to book another.`, {
+      open: open.rows.length, max: settings.maxOpenBookings,
     })
   }
   await checkDay(c, input.visitDate, settings, { today })
-  await expireStaleHolds(c, v.id, input.visitDate)
   if (!(await reserveKg(c, v.id, input.visitDate, input.kg))) {
     const { rows } = await c.query('SELECT GREATEST(bookable_kg - reserved_kg, 0)::int AS left FROM farm_harvest WHERE variety_id = $1 AND day = $2', [v.id, input.visitDate])
     const left = rows[0]?.left ?? 0
@@ -252,40 +218,35 @@ export async function createBooking(c, { customerId, input, today = todayIST() }
   }
   const beds = await farmhouseBeds(c)
   const at = now()
-  const id = newId('fbk')
-  const holdUntil = new Date(at.getTime() + settings.holdMinutes * 60_000)
   const { rows } = await c.query(
     `INSERT INTO farm_bookings (id, number, customer_id, variety_id, variety_name, kg, price_per_kg, total, pricing, visit_date, arrival_date, departure_date,
         adults, children, overnight_guests, food, accessibility, customer_notes, guest_list, contact_name, contact_phone, contact_email, billing_name, billing_gstin,
-        status, kg_reserved, hold_expires_at, over_capacity, checkin_code, created_at, updated_at)
+        status, kg_reserved, over_capacity, checkin_code, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-        'PAYMENT_PENDING', TRUE, $25, $26, $27, $28, $28) RETURNING *`,
+        'HOSPITALITY_REVIEW', TRUE, $25, $26, $27, $27) RETURNING *`,
     [
-      id, newBookingNumber(), customerId, v.id, v.name, input.kg, price.pricePerKg, price.total,
+      newId('fbk'), newBookingNumber(), customerId, v.id, v.name, input.kg, price.pricePerKg, price.total,
       JSON.stringify({ basePricePerKg: v.price_per_kg, tier: price.tier, varietyVersion: v.version }),
       input.visitDate, input.arrivalDate, input.departureDate, input.adults, input.children, input.overnightGuests,
       JSON.stringify(input.food ?? {}), input.accessibility || null, input.notes || null, JSON.stringify(input.guestList ?? []),
       input.contactName, input.contactPhone, input.contactEmail || null, input.billingName || null, input.billingGstin || null,
-      holdUntil, input.overnightGuests > beds, newCheckinCode(), at,
+      input.overnightGuests > beds, newCheckinCode(), at,
     ],
   )
   const b = rows[0]
-  await c.query(
-    `INSERT INTO farm_booking_payments (id, booking_id, kind, amount, status, created_at) VALUES ($1, $2, 'BOOKING', $3, 'INITIATED', $4)`,
-    [newId('fbp'), b.id, b.total, at],
-  )
-  await event(c, { ...b, status: null }, { to: 'PAYMENT_PENDING', action: 'CREATED', detail: `${b.kg} kg of ${b.variety_name} for ${b.visit_date}`, actor: customerActor(customerId) })
+  await event(c, { ...b, status: null }, { to: b.status, action: 'CREATED', detail: `${b.kg} kg of ${b.variety_name} for ${b.visit_date}`, actor: customerActor(customerId) })
+  await queueFarmMessages(c, b, 'CREATED')
+  await queueFarmMessages(c, b, 'TEAM_NEW_BOOKING')
   return b
 }
 
 // ---------------------------------------------------------------- payments
 
 /**
- * Applies one Razorpay payment result to a farm payment, once however often it
+ * Applies one Razorpay payment result to a bill payment, once however often it
  * comes (webhook, reconcile, the page asking). The amount was checked already
- * (checkCapture). Returns { result, bookingId }:
- *   confirmed, confirmed_late, needs_attention, extra_paid, refund_due,
- *   duplicate_payment, already_paid, attempt_failed, ignored.
+ * (checkCapture). Returns { result, bookingId }: paid, refund_due,
+ * duplicate_payment, already_paid, attempt_failed, cancelled, ignored.
  */
 export async function processFarmPayment(c, { farmPaymentId, outcome, paymentId = null, method = null, amount = null }) {
   const { rows } = await c.query('SELECT * FROM farm_booking_payments WHERE id = $1 FOR UPDATE', [farmPaymentId])
@@ -313,12 +274,6 @@ export async function processFarmPayment(c, { farmPaymentId, outcome, paymentId 
   if (outcome === 'abandoned') {
     if (p.status !== 'INITIATED') return { result: 'ignored', bookingId: b.id }
     await c.query(`UPDATE farm_booking_payments SET status = 'CANCELLED' WHERE id = $1`, [p.id])
-    if (p.kind === 'BOOKING' && b.status === 'PAYMENT_PENDING') {
-      b = await releaseKg(c, b)
-      await move(c, b, 'CANCELLED', { action: 'PAYMENT_NOT_STARTED', detail: 'The payment could not be started', actor: SYSTEM_ACTOR, fields: { hold_expires_at: null, cancelled_at: now() }, notify: false })
-    } else if (p.kind === 'EXTRA') {
-      await c.query(`UPDATE farm_booking_extras SET status = 'REQUESTED' WHERE id = $1 AND status = 'PAYMENT_PENDING'`, [p.extra_id])
-    }
     return { result: 'cancelled', bookingId: b.id }
   }
   // Captured.
@@ -327,38 +282,15 @@ export async function processFarmPayment(c, { farmPaymentId, outcome, paymentId 
     [p.id, paymentId, method, now()],
   )
   const paid = `Payment ${paymentId ?? ''} received`.trim()
-  if (p.kind === 'EXTRA') {
-    await c.query(`UPDATE farm_booking_extras SET status = 'PAID', paid_at = $2 WHERE id = $1`, [p.extra_id, now()])
-    await event(c, b, { action: 'EXTRA_PAID', detail: paid, actor: SYSTEM_ACTOR })
-    await queueFarmMessages(c, b, 'EXTRA_PAID')
-    return { result: 'extra_paid', bookingId: b.id }
+  if (b.status === 'PAYMENT_DUE' && !b.paid_at && p.status === 'INITIATED' && p.amount === b.bill_amount) {
+    b = await move(c, b, 'PACKING', { action: 'PAID', detail: paid, actor: SYSTEM_ACTOR, fields: { paid_at: now() } })
+    await c.query(`UPDATE farm_booking_payments SET status = 'CANCELLED' WHERE booking_id = $1 AND status = 'INITIATED'`, [b.id])
+    return { result: 'paid', bookingId: b.id }
   }
-  if (b.status === 'CANCELLED' || b.status === 'NO_SHOW' || p.status === 'CANCELLED') {
-    // Paid after it was cancelled: nothing to host, so it all goes back.
-    await requestRefunds(c, b, { kind: 'LATE_PAYMENT', reason: 'Paid after the booking was cancelled', actor: SYSTEM_ACTOR })
-    await event(c, b, { action: 'LATE_PAYMENT_REFUND', detail: `${paid} after cancelling; refunding it in full`, actor: SYSTEM_ACTOR })
-    return { result: 'refund_due', bookingId: b.id }
-  }
-  if (b.status === 'PAYMENT_PENDING' && b.kg_reserved) {
-    b = await move(c, b, 'HOSPITALITY_REVIEW', { action: 'PAID', detail: paid, actor: SYSTEM_ACTOR, fields: { paid_at: now(), hold_expires_at: null } })
-    await queueFarmMessages(c, b, 'TEAM_NEW_BOOKING')
-    return { result: 'confirmed', bookingId: b.id }
-  }
-  // Paid after the hold ran out: take the kilograms again if they are still there.
-  if ((b.status === 'EXPIRED' || b.status === 'PAYMENT_PENDING') && !b.kg_reserved) {
-    if (await reserveKg(c, b.variety_id, b.visit_date, b.kg)) {
-      b = await update(c, b.id, { kg_reserved: true })
-      b = await move(c, b, 'HOSPITALITY_REVIEW', { action: 'PAID', detail: `${paid} after the hold ended; the mangoes were still available`, actor: SYSTEM_ACTOR, fields: { paid_at: now(), hold_expires_at: null } })
-      await queueFarmMessages(c, b, 'TEAM_NEW_BOOKING')
-      return { result: 'confirmed_late', bookingId: b.id }
-    }
-    const why = `Paid after the hold ended, and ${b.kg} kg of ${b.variety_name} is no longer free on ${b.visit_date}. Move the visit to a date with fruit, or cancel it with a full refund.`
-    b = await move(c, b, 'NEEDS_ATTENTION', { action: 'PAID_LATE', detail: why, actor: SYSTEM_ACTOR, fields: { paid_at: now(), hold_expires_at: null, attention_reason: why } })
-    await queueFarmMessages(c, b, 'TEAM_ATTENTION')
-    return { result: 'needs_attention', bookingId: b.id }
-  }
-  await event(c, b, { action: 'PAID', detail: paid, actor: SYSTEM_ACTOR })
-  return { result: 'already_paid', bookingId: b.id }
+  // Paid already (a manager recorded it, or another try went through), or for a bill since replaced: it all goes back.
+  await requestRefunds(c, b, { kind: 'OVERPAID', reason: 'Paid again for a bill already paid or replaced', actor: SYSTEM_ACTOR, farmPaymentId: p.id })
+  await event(c, b, { action: 'OVERPAID_REFUND', detail: `${paid}, but the bill was already paid or replaced; refunding it in full`, actor: SYSTEM_ACTOR })
+  return { result: 'refund_due', bookingId: b.id }
 }
 
 // ---------------------------------------------------------------- refunds
@@ -395,7 +327,6 @@ export async function requestRefunds(c, b, { kind, reason, actor, amount = null,
 export async function moneyOf(c, bookingId) {
   const { rows } = await c.query(
     `SELECT COALESCE(SUM(amount) FILTER (WHERE status = 'SUCCEEDED'), 0)::int AS paid,
-            COALESCE(SUM(amount) FILTER (WHERE status = 'SUCCEEDED' AND kind = 'BOOKING'), 0)::int AS paid_booking,
             (SELECT COALESCE(SUM(amount), 0)::int FROM farm_refunds WHERE booking_id = $1) AS refunded,
             (SELECT COALESCE(SUM(amount), 0)::int FROM farm_refunds WHERE booking_id = $1 AND refunded_at IS NOT NULL) AS refund_sent
        FROM farm_booking_payments WHERE booking_id = $1`,
@@ -406,20 +337,17 @@ export async function moneyOf(c, bookingId) {
 
 // ---------------------------------------------------------------- cancel and move
 
-/** Cancels a booking: its kilograms go back, open extras are withdrawn, and (refund) every payment is refunded. */
-export async function cancelBooking(c, b, { reason, actor, refund, refundKind = 'CANCELLED' }) {
-  if (FINAL.includes(b.status) && b.status !== 'NO_SHOW') throw conflict('This booking is already closed.', 'NOT_CANCELLABLE')
-  if (ON_SITE.includes(b.status)) throw conflict('This visit has started, so it can’t be cancelled.', 'NOT_CANCELLABLE')
+/** Cancels a booking before the visit: its kilograms go back. Nothing was paid, so nothing is refunded. */
+export async function cancelBooking(c, b, { reason, actor }) {
+  if (!BEFORE_VISIT.includes(b.status)) {
+    throw conflict(ON_SITE.includes(b.status) ? 'This visit has started, so it can’t be cancelled.' : 'This booking is already closed.', 'NOT_CANCELLABLE')
+  }
   let next = await releaseKg(c, b)
-  await c.query(`UPDATE farm_booking_extras SET status = 'WITHDRAWN', decided_at = $2 WHERE booking_id = $1 AND status IN ('REQUESTED', 'PAYMENT_PENDING')`, [b.id, now()])
-  await c.query(`UPDATE farm_booking_payments SET status = 'CANCELLED' WHERE booking_id = $1 AND status = 'INITIATED'`, [b.id])
-  const refunds = refund ? await requestRefunds(c, next, { kind: refundKind, reason, actor }) : []
-  const detail = `${reason}${refunds.length ? ' (refunding in full)' : ''}`
   next = await move(c, next, 'CANCELLED', {
-    action: 'CANCELLED', detail, actor,
-    fields: { cancelled_at: now(), cancel_reason: reason, hold_expires_at: null, request_kind: null, request_date: null, request_note: null, requested_at: null },
+    action: 'CANCELLED', detail: reason, actor,
+    fields: { cancelled_at: now(), cancel_reason: reason, request_kind: null, request_date: null, request_note: null, requested_at: null },
   })
-  return { booking: next, refunds }
+  return { booking: next }
 }
 
 /**
@@ -428,23 +356,21 @@ export async function cancelBooking(c, b, { reason, actor, refund, refundKind = 
  * failure leaves it as it was). Rooms are given up and the stay goes back to review.
  */
 export async function moveVisit(c, b, day, { actor, reason, window = true }) {
-  if (!PAID_OPEN.includes(b.status)) throw conflict('Only a paid booking that hasn’t started can be moved.', 'NOT_MOVABLE')
+  if (!BEFORE_VISIT.includes(b.status)) throw conflict('Only a booking whose visit hasn’t started can be moved.', 'NOT_MOVABLE')
   if (day === b.visit_date) throw conflict('That is already the visit date.', 'SAME_DATE')
   const { settings } = await loadSettings(c)
   await checkDay(c, day, settings, { excludeId: b.id, window })
-  await expireStaleHolds(c, b.variety_id, day)
   if (!(await reserveKg(c, b.variety_id, day, b.kg))) {
     throw new HttpError(409, 'FARM_NOT_ENOUGH_HARVEST', `There isn’t ${b.kg} kg of ${b.variety_name} free on that date. Pick another.`)
   }
   if (b.kg_reserved) await c.query('UPDATE farm_harvest SET reserved_kg = GREATEST(reserved_kg - $3, 0) WHERE variety_id = $1 AND day = $2', [b.variety_id, b.visit_date, b.kg])
   const shift = diffDays(day, b.visit_date)
   await c.query('DELETE FROM farm_room_allocations WHERE booking_id = $1', [b.id])
-  const paid = b.status !== 'PAYMENT_PENDING'
-  return move(c, b, paid ? 'HOSPITALITY_REVIEW' : b.status, {
+  return move(c, b, 'HOSPITALITY_REVIEW', {
     action: 'MOVED', detail: `Visit moved from ${b.visit_date} to ${day}${reason ? `: ${reason}` : ''}`, actor,
     fields: {
       visit_date: day, arrival_date: addDays(b.arrival_date, shift), departure_date: addDays(b.departure_date, shift), kg_reserved: true,
-      hospitality_status: 'PENDING', meal_plan: '[]', attention_reason: null,
+      hospitality_status: 'PENDING', meal_plan: '[]',
       request_kind: null, request_date: null, request_note: null, requested_at: null,
     },
   })
@@ -459,29 +385,26 @@ export async function recordRequest(c, b, { kind, date = null, note, customerId 
   return next
 }
 
-/** The customer cancels. Returns { booking, refunds, requested }. */
+/** The customer cancels. Returns { booking, requested }. */
 export async function customerCancel(c, b, { reason, customerId, today = todayIST() }) {
   const { settings } = await loadSettings(c)
   const option = cancelOptionFor(b, settings, today)
   const actor = customerActor(customerId)
   if (!option) throw conflict('This booking can no longer be cancelled.', 'NOT_CANCELLABLE')
-  if (option === 'REQUEST') return { booking: await recordRequest(c, b, { kind: 'CANCEL', note: reason, customerId }), refunds: [], requested: true }
+  if (option === 'REQUEST') return { booking: await recordRequest(c, b, { kind: 'CANCEL', note: reason, customerId }), requested: true }
   const why = reason ? `Cancelled by the customer: ${reason}` : 'Cancelled by the customer'
-  const r = await cancelBooking(c, b, { reason: why, actor, refund: option === 'REFUND' })
+  const r = await cancelBooking(c, b, { reason: why, actor })
   return { ...r, requested: false }
 }
 
 /**
- * cancelOption, plus: when we could not keep the booking as agreed (a paid booking
- * waiting for a new date, or a stay we proposed changing), the customer may
- * always cancel for a full refund.
+ * cancelOption, plus: when we could not keep the stay as agreed (we proposed
+ * changing it), the customer may always cancel at once.
  */
 export function cancelOptionFor(b, settings, today) {
   const o = cancelOption(b, settings, today)
   if (!o) return o
-  if (b.status === 'NEEDS_ATTENTION' || ['ALTERNATIVE_PROPOSED', 'CUSTOMER_DECLINED'].includes(b.hospitality_status)) {
-    return ['HOSPITALITY_REVIEW', 'NEEDS_ATTENTION', 'CONFIRMED'].includes(b.status) ? 'REFUND' : o
-  }
+  if (['ALTERNATIVE_PROPOSED', 'CUSTOMER_DECLINED'].includes(b.hospitality_status) && ['HOSPITALITY_REVIEW', 'CONFIRMED'].includes(b.status)) return 'CANCEL'
   return o
 }
 
@@ -497,7 +420,7 @@ export async function customerMove(c, b, { date, note, customerId, today = today
 // ---------------------------------------------------------------- hospitality
 
 export async function approveHospitality(c, b, { plan, actor }) {
-  if (b.status !== 'HOSPITALITY_REVIEW') throw conflict('Only a paid booking waiting for its stay to be arranged can be approved.', 'BAD_STATUS_MOVE')
+  if (b.status !== 'HOSPITALITY_REVIEW') throw conflict('Only a booking waiting for its stay to be arranged can be approved.', 'BAD_STATUS_MOVE')
   if (b.over_capacity && !(await allocatedBeds(c, b.id)) && !plan?.trim()) {
     throw new HttpError(409, 'HOSPITALITY_PLAN_REQUIRED', 'This group is larger than the farmhouse. Give rooms or write the arrangement before approving.')
   }
@@ -515,7 +438,7 @@ export function proposeAlternative(c, b, { proposal, actor }) {
   })
 }
 
-/** The customer answers a proposed arrangement. Accepting confirms the booking; declining leaves it for the team (and a full refund open). */
+/** The customer answers a proposed arrangement. Accepting confirms the booking; declining leaves it for the team (and cancelling open). */
 export async function answerAlternative(c, b, { accept, note, customerId }) {
   if (b.hospitality_status !== 'ALTERNATIVE_PROPOSED' || b.status !== 'HOSPITALITY_REVIEW') throw conflict('There is no proposed arrangement to answer.', 'NOTHING_TO_ANSWER')
   const actor = customerActor(customerId)
@@ -547,7 +470,7 @@ export async function defaultMealPlan(c, b) {
  * use. Rooms are locked in id order, so two allocations can't cross.
  */
 export async function allocateRooms(c, b, allocations, { actor }) {
-  if (FINAL.includes(b.status) || ['PAYMENT_PENDING', 'EXPIRED'].includes(b.status)) throw conflict('Rooms can be given only to a paid, open booking.', 'BAD_STATUS_MOVE')
+  if (FINAL.includes(b.status)) throw conflict('Rooms can be given only to an open booking.', 'BAD_STATUS_MOVE')
   const ids = [...new Set(allocations.map((a) => a.roomId))].sort()
   if (ids.length !== allocations.length) throw new HttpError(400, 'VALIDATION_ERROR', 'Each room can be listed once.')
   const { rows: rooms } = ids.length ? await c.query('SELECT * FROM farm_rooms WHERE id = ANY($1) ORDER BY id FOR UPDATE', [ids]) : { rows: [] }
@@ -559,7 +482,7 @@ export async function allocateRooms(c, b, allocations, { actor }) {
     const clash = await c.query(
       `SELECT fb.number FROM farm_room_allocations a JOIN farm_bookings fb ON fb.id = a.booking_id
         WHERE a.room_id = $1 AND a.booking_id <> $2 AND a.from_date < $4 AND $3 < a.to_date AND NOT (fb.status = ANY($5)) LIMIT 1`,
-      [a.roomId, b.id, a.fromDate, a.toDate, ['CANCELLED', 'NO_SHOW', 'EXPIRED', 'COMPLETED']],
+      [a.roomId, b.id, a.fromDate, a.toDate, ['CANCELLED', 'NO_SHOW', 'COMPLETED']],
     )
     if (clash.rows.length) throw new HttpError(409, 'ROOM_TAKEN', `${r.name} is already given to ${clash.rows[0].number} for some of those nights.`)
   }
@@ -576,14 +499,12 @@ export async function allocateRooms(c, b, allocations, { actor }) {
 
 // ---------------------------------------------------------------- the day at the farm
 
-export async function staffMove(c, b, to, { actor, note }) {
+export function staffMove(c, b, to, { actor, note }) {
   assertStaffMove(b.status, to)
   const fields = {}
   if (to === 'COMPLETED') {
+    if (!b.paid_at) throw conflict('The bill isn’t paid yet.', 'NOT_PAID')
     if (!['PACKED', 'COLLECTED'].includes(b.packing_status)) throw conflict('Record the mangoes as packed or collected first.', 'NOT_PACKED')
-    if (b.accepted_kg == null) throw conflict('Record the final weight first.', 'NOT_WEIGHED')
-    const open = await c.query(`SELECT 1 FROM farm_booking_extras WHERE booking_id = $1 AND status IN ('REQUESTED', 'PAYMENT_PENDING')`, [b.id])
-    if (open.rowCount) throw conflict('An extra-mangoes request is still open. Wait for the payment or withdraw it.', 'EXTRA_OPEN')
     fields.completed_at = now()
     fields.harvest_status = 'DONE'
   }
@@ -601,9 +522,12 @@ export function checkIn(c, b, { actor, override = false, today = todayIST() }) {
   return move(c, b, 'CHECKED_IN', { action: 'CHECKED_IN', detail: override ? 'Checked in outside the booked days (manager override)' : null, actor, fields: { checked_in_at: now(), checked_in_by: actor.label } })
 }
 
-/** Weights and progress on the day. Allowed only at the farm. */
+/** Weights and progress on the day. Allowed only at the farm; the weights only until the bill is made. */
 export async function recordHarvest(c, b, f, { actor }) {
   if (!ON_SITE.includes(b.status) || b.status === 'COMPLETED') throw conflict('Harvest details are recorded once the customer is checked in.', 'NOT_ON_SITE')
+  if ((f.acceptedKg !== undefined || f.harvestedKg !== undefined) && ['PAYMENT_DUE', 'PACKING'].includes(b.status)) {
+    throw conflict('The bill is made from these weights. To change them, make a new bill with the right weight.', 'BILL_MADE')
+  }
   const fields = {}
   if (f.harvestedKg !== undefined) fields.harvested_kg = f.harvestedKg
   if (f.acceptedKg !== undefined) fields.accepted_kg = f.acceptedKg
@@ -618,80 +542,50 @@ export async function recordHarvest(c, b, f, { actor }) {
   return update(c, b.id, fields)
 }
 
-/** The kilograms paid for: the booking and every paid extra. */
-export async function paidKg(c, b) {
-  const { rows } = await c.query(`SELECT COALESCE(SUM(kg), 0) AS kg FROM farm_booking_extras WHERE booking_id = $1 AND status = 'PAID'`, [b.id])
-  return b.kg + Number(rows[0].kg)
-}
-
-/** Staff ask the customer to pay for extra kilograms picked. */
-export async function requestExtra(c, b, { kg, note, actor }) {
-  if (!['CHECKED_IN', 'HARVESTING', 'WEIGHING', 'PACKING'].includes(b.status)) throw conflict('Extra mangoes can be added only during the visit.', 'NOT_ON_SITE')
-  const open = await c.query(`SELECT 1 FROM farm_booking_extras WHERE booking_id = $1 AND status IN ('REQUESTED', 'PAYMENT_PENDING')`, [b.id])
-  if (open.rowCount) throw conflict('There is already an extra-mangoes request waiting for the customer.', 'EXTRA_OPEN')
-  const { settings } = await loadSettings(c)
-  const price = settings.extraPricePerKg ?? b.price_per_kg
-  const amount = extraAmount(kg, price)
-  if (amount < 100) throw new HttpError(400, 'VALIDATION_ERROR', 'That is too little to charge for.')
-  const { rows } = await c.query(
-    `INSERT INTO farm_booking_extras (id, booking_id, kg, price_per_kg, amount, status, note, requested_by, created_at) VALUES ($1, $2, $3, $4, $5, 'REQUESTED', $6, $7, $8) RETURNING *`,
-    [newId('fbx'), b.id, kg, price, amount, note || null, actor.label, now()],
-  )
-  await event(c, b, { action: 'EXTRA_REQUESTED', detail: `${kg} kg extra at ${price / 100} rupees a kg`, actor })
-  await queueFarmMessages(c, b, 'EXTRA_REQUESTED')
-  return rows[0]
-}
-
-/** Staff withdraw an extra the customer has not paid. */
-export async function withdrawExtra(c, b, extraId, { actor }) {
-  const { rows } = await c.query(`UPDATE farm_booking_extras SET status = 'WITHDRAWN', decided_at = $3 WHERE id = $1 AND booking_id = $2 AND status IN ('REQUESTED', 'PAYMENT_PENDING') RETURNING *`, [extraId, b.id, now()])
-  if (!rows.length) throw conflict('That request is no longer open.', 'EXTRA_CLOSED')
-  await c.query(`UPDATE farm_booking_payments SET status = 'CANCELLED' WHERE extra_id = $1 AND status = 'INITIATED'`, [extraId])
-  await event(c, b, { action: 'EXTRA_WITHDRAWN', detail: `${rows[0].kg} kg`, actor })
-  return rows[0]
-}
-
 /**
- * The customer agrees to pay an extra: a payment row is made (its Razorpay order
- * after commit). Declining closes the request. Returns the payment row, or null.
+ * The bill after weighing: from WEIGHING (or again while PAYMENT_DUE and unpaid,
+ * e.g. with a corrected weight). An open online payment for an older bill is
+ * cancelled; if it is paid anyway, it is refunded (processFarmPayment).
  */
-export async function answerExtra(c, b, extraId, { accept, customerId }) {
-  const { rows } = await c.query('SELECT * FROM farm_booking_extras WHERE id = $1 AND booking_id = $2 FOR UPDATE', [extraId, b.id])
-  const x = rows[0]
-  if (!x) throw notFound('Request not found')
-  const actor = customerActor(customerId)
-  if (!accept) {
-    if (x.status !== 'REQUESTED') throw conflict('This request is no longer open.', 'EXTRA_CLOSED')
-    await c.query(`UPDATE farm_booking_extras SET status = 'DECLINED', decided_at = $2 WHERE id = $1`, [x.id, now()])
-    await event(c, b, { action: 'EXTRA_DECLINED', detail: `${x.kg} kg`, actor })
-    return null
-  }
-  if (x.status === 'PAYMENT_PENDING') {
-    const p = await c.query(`SELECT * FROM farm_booking_payments WHERE extra_id = $1 AND status = 'INITIATED' ORDER BY created_at DESC LIMIT 1`, [x.id])
-    if (p.rows[0]) return p.rows[0]
-  } else if (x.status !== 'REQUESTED') throw conflict('This request is no longer open.', 'EXTRA_CLOSED')
-  await c.query(`UPDATE farm_booking_extras SET status = 'PAYMENT_PENDING', decided_at = $2 WHERE id = $1`, [x.id, now()])
+export async function issueBill(c, b, { acceptedKg, actor }) {
+  if (!['WEIGHING', 'PAYMENT_DUE'].includes(b.status)) throw conflict('The bill is made after weighing.', 'BAD_STATUS_MOVE')
+  if (b.paid_at) throw conflict('This booking is already paid.', 'ALREADY_PAID')
+  const accepted = acceptedKg ?? (b.accepted_kg == null ? null : Number(b.accepted_kg))
+  if (accepted == null) throw conflict('Record the accepted weight first.', 'NOT_WEIGHED')
+  if (b.harvested_kg != null && accepted > Number(b.harvested_kg)) throw new HttpError(400, 'VALIDATION_ERROR', 'The accepted weight can’t be more than what was picked.')
+  const { settings } = await loadSettings(c)
+  const bill = billFor(b, accepted, settings.extraPricePerKg)
+  await c.query(`UPDATE farm_booking_payments SET status = 'CANCELLED' WHERE booking_id = $1 AND status = 'INITIATED'`, [b.id])
+  await c.query(`INSERT INTO farm_booking_payments (id, booking_id, kind, amount, status, created_at) VALUES ($1, $2, 'ONLINE', $3, 'INITIATED', $4)`, [newId('fbp'), b.id, bill.amount, now()])
+  const words = `${bill.acceptedKg} kg accepted: ${bill.bookedPartKg} kg at ${bill.pricePerKg / 100} rupees${bill.extraKg ? ` and ${bill.extraKg} kg extra at ${bill.extraPricePerKg / 100} rupees` : ''} = ${bill.amount / 100} rupees`
+  return move(c, b, 'PAYMENT_DUE', {
+    action: b.status === 'PAYMENT_DUE' ? 'BILL_REVISED' : 'BILL_ISSUED', detail: words, actor,
+    fields: { accepted_kg: accepted, bill: JSON.stringify(bill), bill_amount: bill.amount, billed_at: now() },
+  })
+}
+
+/** The open online payment for a bill (made again if an earlier try could not start). */
+export async function billPayment(c, b) {
+  if (b.status !== 'PAYMENT_DUE' || b.paid_at) throw conflict('There is nothing to pay on this booking now.', 'NOTHING_TO_PAY')
+  const { rows } = await c.query(`SELECT * FROM farm_booking_payments WHERE booking_id = $1 AND kind = 'ONLINE' AND status = 'INITIATED' ORDER BY created_at DESC LIMIT 1`, [b.id])
+  if (rows[0]) return rows[0]
   const ins = await c.query(
-    `INSERT INTO farm_booking_payments (id, booking_id, kind, extra_id, amount, status, created_at) VALUES ($1, $2, 'EXTRA', $3, $4, 'INITIATED', $5) RETURNING *`,
-    [newId('fbp'), b.id, x.id, x.amount, now()],
+    `INSERT INTO farm_booking_payments (id, booking_id, kind, amount, status, created_at) VALUES ($1, $2, 'ONLINE', $3, 'INITIATED', $4) RETURNING *`,
+    [newId('fbp'), b.id, b.bill_amount, now()],
   )
-  await event(c, b, { action: 'EXTRA_ACCEPTED', detail: `${x.kg} kg`, actor })
   return ins.rows[0]
 }
 
-/** A manager refunds kilograms the farm could not supply (only what was paid and not refunded yet). */
-export async function refundShortfall(c, b, { kg, reason, actor }) {
-  if (!ON_SITE.includes(b.status)) throw conflict('A shortfall is refunded after the visit has started.', 'NOT_ON_SITE')
-  if (b.accepted_kg == null) throw conflict('Record the final weight first.', 'NOT_WEIGHED')
-  const short = (await paidKg(c, b)) - Number(b.accepted_kg)
-  if (kg > short + 1e-9) throw new HttpError(409, 'SHORTFALL_TOO_LARGE', `Only ${Math.max(short, 0)} kg is short of what was paid for.`, { shortKg: Math.max(short, 0) })
-  const amount = Math.round(kg * b.price_per_kg)
-  const { rows } = await c.query(`SELECT id FROM farm_booking_payments WHERE booking_id = $1 AND kind = 'BOOKING' AND status = 'SUCCEEDED' LIMIT 1`, [b.id])
-  const refunds = await requestRefunds(c, b, { kind: 'SHORTFALL', reason, actor, amount, farmPaymentId: rows[0]?.id ?? null })
-  if (!refunds.length) throw conflict('Nothing is left to refund on this booking.', 'NOTHING_TO_REFUND')
-  await event(c, b, { action: 'SHORTFALL_REFUND', detail: `${kg} kg (${refunds[0].amount / 100} rupees): ${reason}`, actor })
-  await queueFarmMessages(c, b, 'SHORTFALL_REFUND')
-  return refunds
+/** A manager records that the customer paid the bill another way at the farm (UPI to the farm, card machine, cash). */
+export async function recordPayment(c, b, { method, reference, actor }) {
+  if (b.status !== 'PAYMENT_DUE' || b.paid_at) throw conflict('There is no unpaid bill on this booking.', 'NOTHING_TO_PAY')
+  await c.query(`UPDATE farm_booking_payments SET status = 'CANCELLED' WHERE booking_id = $1 AND status = 'INITIATED'`, [b.id])
+  await c.query(
+    `INSERT INTO farm_booking_payments (id, booking_id, kind, amount, status, payment_method, reference, recorded_by, created_at, paid_at)
+     VALUES ($1, $2, 'RECORDED', $3, 'SUCCEEDED', $4, $5, $6, $7, $7)`,
+    [newId('fbp'), b.id, b.bill_amount, method, reference, actor.label, now()],
+  )
+  return move(c, b, 'PACKING', { action: 'PAID', detail: `${b.bill_amount / 100} rupees paid by ${method.toLowerCase().replace(/_/g, ' ')} (${reference}), recorded by staff`, actor, fields: { paid_at: now() } })
 }
 
 export async function markNoShow(c, b, { actor, note, today = todayIST() }) {
@@ -714,15 +608,14 @@ export async function declineRequest(c, b, { reason, actor }) {
 
 /** Each step the customer sees: what happened and when, never which staff member. */
 const CUSTOMER_STEPS = new Set([
-  'CREATED', 'PAID', 'PAID_LATE', 'HOSPITALITY_APPROVED', 'ALTERNATIVE_PROPOSED', 'ALTERNATIVE_ACCEPTED', 'ALTERNATIVE_DECLINED', 'MOVED',
+  'CREATED', 'HOSPITALITY_APPROVED', 'ALTERNATIVE_PROPOSED', 'ALTERNATIVE_ACCEPTED', 'ALTERNATIVE_DECLINED', 'MOVED',
   'CANCEL_REQUESTED', 'MOVE_REQUESTED', 'REQUEST_DECLINED', 'CANCELLED', 'TO_PREPARING', 'TO_READY_FOR_VISIT', 'CHECKED_IN', 'TO_HARVESTING',
-  'TO_WEIGHING', 'TO_PACKING', 'TO_COMPLETED', 'EXTRA_REQUESTED', 'EXTRA_PAID', 'SHORTFALL_REFUND', 'NO_SHOW', 'HOLD_EXPIRED', 'LATE_PAYMENT_REFUND',
+  'TO_WEIGHING', 'BILL_ISSUED', 'BILL_REVISED', 'PAID', 'TO_COMPLETED', 'NO_SHOW', 'OVERPAID_REFUND',
 ])
 
 async function parts(c, b) {
-  const [payments, extras, refunds, rooms, events] = await Promise.all([
+  const [payments, refunds, rooms, events] = await Promise.all([
     c.query('SELECT * FROM farm_booking_payments WHERE booking_id = $1 ORDER BY created_at', [b.id]),
-    c.query('SELECT * FROM farm_booking_extras WHERE booking_id = $1 ORDER BY created_at', [b.id]),
     c.query('SELECT * FROM farm_refunds WHERE booking_id = $1 ORDER BY requested_at', [b.id]),
     c.query(
       `SELECT a.*, r.name, r.description FROM farm_room_allocations a JOIN farm_rooms r ON r.id = a.room_id WHERE a.booking_id = $1 ORDER BY r.sort_order, r.name`,
@@ -730,7 +623,7 @@ async function parts(c, b) {
     ),
     c.query('SELECT * FROM farm_booking_events WHERE booking_id = $1 ORDER BY created_at, id', [b.id]),
   ])
-  return { payments: payments.rows, extras: extras.rows, refunds: refunds.rows, rooms: rooms.rows, events: events.rows }
+  return { payments: payments.rows, refunds: refunds.rows, rooms: rooms.rows, events: events.rows }
 }
 
 const refundView = (r) => ({
@@ -738,7 +631,6 @@ const refundView = (r) => ({
   status: r.refunded_at ? (r.refund_status === 'processed' ? 'REFUNDED' : 'SENT') : r.refund_gave_up_at ? 'NEEDS_A_MANAGER' : 'PENDING',
   refundedAt: r.refunded_at,
 })
-const extraView = (x) => ({ id: x.id, kg: Number(x.kg), pricePerKg: x.price_per_kg, amount: x.amount, status: x.status, note: x.note, createdAt: x.created_at, paidAt: x.paid_at })
 const guestsView = (b) => ({
   adults: b.adults, children: b.children, total: groupSize(b), overnight: b.overnight_guests, arrivalDate: b.arrival_date, departureDate: b.departure_date,
   food: b.food ?? {}, accessibility: b.accessibility, notes: b.customer_notes, list: b.guest_list ?? [],
@@ -750,7 +642,9 @@ function common(b, p) {
   const refundState = !p.refunds.length ? null : p.refunds.every((r) => r.refunded_at) ? 'REFUNDED' : 'REFUND_PENDING'
   return {
     id: b.id, number: b.number, status: b.status, statusLabel: STATUS_WORDS[b.status], refundStatus: refundState,
+    // total: the estimate at booking. bill: what is owed after weighing (null until then).
     variety: { id: b.variety_id, name: b.variety_name }, kg: b.kg, pricePerKg: b.price_per_kg, total: b.total,
+    bill: b.bill ? { ...b.bill, at: b.billed_at } : null,
     visitDate: b.visit_date, guests: guestsView(b),
     contact: { name: b.contact_name, phone: b.contact_phone, email: b.contact_email },
     billing: b.billing_name || b.billing_gstin ? { name: b.billing_name, gstin: b.billing_gstin } : null,
@@ -764,9 +658,7 @@ function common(b, p) {
       inspectionNote: b.inspection_note, packingStatus: b.packing_status,
     },
     money: { paid, refunded, refunds: p.refunds.map(refundView) },
-    extras: p.extras.map(extraView),
     request: b.request_kind ? { kind: b.request_kind, date: b.request_date, note: b.request_note, at: b.requested_at } : null,
-    holdExpiresAt: b.status === 'PAYMENT_PENDING' ? b.hold_expires_at : null,
     paidAt: b.paid_at, cancelledAt: b.cancelled_at, cancelReason: b.cancel_reason, completedAt: b.completed_at, checkedInAt: b.checked_in_at,
     createdAt: b.created_at, updatedAt: b.updated_at, version: b.version,
   }
@@ -776,19 +668,19 @@ function common(b, p) {
 export async function customerView(c, b, { today = todayIST() } = {}) {
   const p = await parts(c, b)
   const { settings } = await loadSettings(c)
-  const pay = p.payments.find((x) => x.kind === 'BOOKING')
-  const extraPay = p.payments.find((x) => x.kind === 'EXTRA' && x.status === 'INITIATED' && x.razorpay_order_id)
-  const confirmed = !['PAYMENT_PENDING', 'EXPIRED', 'CANCELLED'].includes(b.status)
+  const open = [...p.payments].reverse().find((x) => x.kind === 'ONLINE' && x.status === 'INITIATED')
+  const done = p.payments.find((x) => x.status === 'SUCCEEDED')
   return {
     ...common(b, p),
-    // The QR and its code only once the booking is paid and open.
-    checkinCode: confirmed && !FINAL.includes(b.status) ? b.checkin_code : null,
-    payment: pay ? { status: pay.status, razorpayOrderId: pay.status === 'INITIATED' ? pay.razorpay_order_id : null, paymentId: pay.payment_id, paidAt: pay.paid_at, failed: Boolean(pay.last_failure) } : null,
-    extraPayment: extraPay ? { id: extraPay.id, extraId: extraPay.extra_id, amount: extraPay.amount, razorpayOrderId: extraPay.razorpay_order_id } : null,
+    // The QR and its code while the booking is open (before and during the visit).
+    checkinCode: !FINAL.includes(b.status) ? b.checkin_code : null,
+    payment: b.status === 'PAYMENT_DUE' && open
+      ? { status: 'DUE', amount: open.amount, razorpayOrderId: open.razorpay_order_id, failed: Boolean(open.last_failure) }
+      : done ? { status: 'PAID', amount: done.amount, paidAt: done.paid_at, method: done.kind === 'RECORDED' ? done.payment_method : 'ONLINE' } : null,
     razorpayKeyId: env.RAZORPAY_KEY_ID || null,
+    canPay: b.status === 'PAYMENT_DUE' && !b.paid_at,
     canCancel: cancelOptionFor(b, settings, today),
     canMove: rescheduleOption(b, settings, today),
-    canRenew: b.status === 'EXPIRED' && !p.payments.some((x) => x.status === 'SUCCEEDED'),
     steps: p.events.filter((e) => CUSTOMER_STEPS.has(e.action)).map((e) => ({
       action: e.action, status: e.to_status, at: e.created_at,
       // Customers see the words of what was proposed or why something moved, not internal reasons.
@@ -800,29 +692,26 @@ export async function customerView(c, b, { today = todayIST() } = {}) {
       checkOutTime: settings.checkOutTime || null, meals: settings.meals, mealNotes: settings.mealNotes || null,
       transportIncluded: settings.transportIncluded, transportPolicy: settings.transportPolicy || null,
     },
-    policy: { cancelDays: settings.cancelDays, rescheduleDays: settings.rescheduleDays },
+    policy: { cancelDays: settings.cancelDays, rescheduleDays: settings.rescheduleDays, extraPricePerKg: settings.extraPricePerKg },
   }
 }
 
 /** Staff see everything, internal notes included. */
 export async function staffView(c, b) {
   const p = await parts(c, b)
-  const [notes, cust, kgPaid, harvest] = await Promise.all([
+  const [notes, cust, harvest] = await Promise.all([
     c.query('SELECT * FROM farm_booking_notes WHERE booking_id = $1 ORDER BY created_at DESC', [b.id]),
     c.query('SELECT id, name, phone, email FROM customers WHERE id = $1', [b.customer_id]),
-    paidKg(c, b),
     c.query('SELECT * FROM farm_harvest WHERE variety_id = $1 AND day = $2', [b.variety_id, b.visit_date]),
   ])
   return {
     ...common(b, p),
     customer: cust.rows[0] ?? null,
-    checkinCode: b.checkin_code, kgReserved: b.kg_reserved, pricing: b.pricing, attentionReason: b.attention_reason,
-    paidKg: kgPaid,
-    discrepancy: b.accepted_kg == null ? null : { shortKg: Math.max(kgPaid - Number(b.accepted_kg), 0), overKg: Math.max(Number(b.accepted_kg) - kgPaid, 0) },
+    checkinCode: b.checkin_code, kgReserved: b.kg_reserved, pricing: b.pricing,
     harvestDay: harvest.rows[0] ? { estimatedKg: harvest.rows[0].estimated_kg, bookableKg: harvest.rows[0].bookable_kg, reservedKg: harvest.rows[0].reserved_kg, readiness: harvest.rows[0].readiness, qcStatus: harvest.rows[0].qc_status } : null,
     payments: p.payments.map((x) => ({
       id: x.id, kind: x.kind, amount: x.amount, status: x.status, razorpayOrderId: x.razorpay_order_id, paymentId: x.payment_id, method: x.payment_method,
-      failed: Boolean(x.last_failure), createdAt: x.created_at, paidAt: x.paid_at,
+      reference: x.reference, recordedBy: x.recorded_by, failed: Boolean(x.last_failure), createdAt: x.created_at, paidAt: x.paid_at,
     })),
     events: p.events.map((e) => ({ id: e.id, from: e.from_status, to: e.to_status, action: e.action, detail: e.detail, actor: e.actor, actorKind: e.actor_kind, at: e.created_at })),
     notes: notes.rows.map((n) => ({ id: n.id, body: n.body, author: n.author_name, at: n.created_at })),
@@ -832,21 +721,20 @@ export async function staffView(c, b) {
 
 /** What the panel offers next for each status (the routes still check). */
 const STAFF_NEXT = {
-  NEEDS_ATTENTION: ['MOVE', 'CANCEL'],
   HOSPITALITY_REVIEW: ['APPROVE', 'PROPOSE', 'ROOMS', 'MOVE', 'CANCEL'],
   CONFIRMED: ['PREPARING', 'READY_FOR_VISIT', 'CHECK_IN', 'PROPOSE', 'ROOMS', 'MOVE', 'CANCEL', 'NO_SHOW'],
   PREPARING: ['READY_FOR_VISIT', 'CHECK_IN', 'PROPOSE', 'ROOMS', 'MOVE', 'CANCEL', 'NO_SHOW'],
   READY_FOR_VISIT: ['CHECK_IN', 'PROPOSE', 'ROOMS', 'MOVE', 'CANCEL', 'NO_SHOW'],
-  CHECKED_IN: ['HARVESTING', 'HARVEST', 'EXTRA'],
-  HARVESTING: ['WEIGHING', 'HARVEST', 'EXTRA'],
-  WEIGHING: ['PACKING', 'HARVEST', 'EXTRA', 'SHORTFALL'],
-  PACKING: ['COMPLETED', 'HARVEST', 'EXTRA', 'SHORTFALL'],
-  COMPLETED: ['SHORTFALL'],
+  CHECKED_IN: ['HARVESTING', 'HARVEST'],
+  HARVESTING: ['WEIGHING', 'HARVEST'],
+  WEIGHING: ['HARVEST', 'BILL'],
+  PAYMENT_DUE: ['BILL', 'RECORD_PAYMENT', 'HARVEST'],
+  PACKING: ['COMPLETED', 'HARVEST'],
 }
 
 export const listRow = (b) => ({
   id: b.id, number: b.number, status: b.status, statusLabel: STATUS_WORDS[b.status], customerName: b.contact_name, phone: b.contact_phone, email: b.contact_email,
-  variety: b.variety_name, varietyId: b.variety_id, kg: b.kg, total: b.total, paymentStatus: b.payment_status ?? null, paymentId: b.payment_id ?? null,
+  variety: b.variety_name, varietyId: b.variety_id, kg: b.kg, total: b.total, billAmount: b.bill_amount, paidAt: b.paid_at, paymentId: b.payment_id ?? null,
   visitDate: b.visit_date, arrivalDate: b.arrival_date, departureDate: b.departure_date,
   adults: b.adults, children: b.children, guests: groupSize(b), overnight: b.overnight_guests,
   hospitalityStatus: b.hospitality_status, overCapacity: b.over_capacity, foodSummary: b.food ?? {}, harvestStatus: b.harvest_status, packingStatus: b.packing_status,

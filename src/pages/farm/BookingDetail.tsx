@@ -1,14 +1,15 @@
-// One Farm Experience booking (docs/farm-experience.md): everything the customer gave, the money,
+// One Farm Experience booking (docs/farm-experience.md): everything the customer gave, the bill,
 // and every action the booking's status allows (the API sends nextMoves and checks each again).
-// Managers move dates, cancel, refund and mark no-shows; refunds and cancelling a paid booking
-// ask the manager to confirm it is them. Every action lands in the booking's history.
+// Customers pay after picking: staff weigh, send the bill, and the customer pays online, or a
+// manager records a payment taken at the farm (confirming it is them). Managers move dates,
+// cancel and mark no-shows. Every action lands in the booking's history.
 import { useEffect, useId, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { date, dateTime, rupees } from '../../format'
 import { MONEY_CHANGE_WHY, useStepUp } from '../../StepUp'
 import { Badge, BackLink, Dialog, FormError, ManagerOnlyNote, PhoneLink, QueryError, Spinner, scrollRegion, usePageTitle, useToast } from '../../ui'
-import { farm, type Booking, type MealDay } from './api'
+import { farm, type Booking, type MealDay, type RecordedMethod } from './api'
 import { FARM_STATUS_LABEL, FarmBadge, HOSPITALITY_LABEL, MOVE_LABEL, useIsManager } from './shared'
 
 export default function FarmBookingDetail() {
@@ -23,7 +24,7 @@ export default function FarmBookingDetail() {
   )
 }
 
-type Open = null | 'propose' | 'approve' | 'rooms' | 'harvest' | 'extra' | 'shortfall' | 'move' | 'cancel' | 'noShow' | 'decline' | 'checkIn' | { settle: string }
+type Open = null | 'propose' | 'approve' | 'rooms' | 'harvest' | 'bill' | 'recordPayment' | 'move' | 'cancel' | 'noShow' | 'decline' | 'checkIn' | { settle: string }
 
 function Detail({ b }: { b: Booking }) {
   const manager = useIsManager()
@@ -45,7 +46,6 @@ function Detail({ b }: { b: Booking }) {
   const next = new Set(b.nextMoves)
   const g = b.guests
   const food = g.food ?? {}
-  const openExtras = b.extras.filter((x) => x.status === 'REQUESTED' || x.status === 'PAYMENT_PENDING')
   const dialog = (kind: Exclude<Open, null | { settle: string }>) => open === kind
 
   return (
@@ -57,17 +57,12 @@ function Detail({ b }: { b: Booking }) {
         <FarmBadge status={b.status} />
       </div>
 
-      {b.attentionReason && b.status === 'NEEDS_ATTENTION' && (
-        <div className="notice notice-warn" role="note">
-          <strong>Needs attention.</strong> {b.attentionReason}
-        </div>
-      )}
       {b.request && (
         <div className="notice notice-warn" role="note">
           <strong>{b.request.kind === 'CANCEL' ? 'The customer asks to cancel.' : `The customer asks to move the visit to ${b.request.date ? date(b.request.date) : 'another date'}.`}</strong>{' '}
           {b.request.note && <q>{b.request.note}</q>} <span className="muted small">({dateTime(b.request.at)})</span>
           <div className="farm-actions mt-2">
-            {b.request.kind === 'MOVE' && b.request.date && (
+            {b.request.kind === 'RESCHEDULE' && b.request.date && (
               <button type="button" className="btn btn-primary btn-small" disabled={!manager} onClick={() => setOpen('move')}>
                 Move to {date(b.request.date)}
               </button>
@@ -89,11 +84,15 @@ function Detail({ b }: { b: Booking }) {
           <strong>Larger than the farmhouse.</strong> {g.overnight} people stay overnight. Assign rooms or write how you will host them before approving, or propose an alternative.
         </div>
       )}
-      {b.discrepancy && (b.discrepancy.shortKg > 0 || b.discrepancy.overKg > 0) && (
+      {b.status === 'WEIGHING' && (
+        <div className="notice" role="note">
+          Record the harvested and accepted kg, then send the bill. The customer pays it before packing.
+        </div>
+      )}
+      {b.status === 'PAYMENT_DUE' && b.bill && (
         <div className="notice notice-warn" role="note">
-          {b.discrepancy.shortKg > 0
-            ? `${b.discrepancy.shortKg} kg less was accepted than was paid for (${b.paidKg} kg paid). A manager can refund the shortfall.`
-            : `${b.discrepancy.overKg} kg more was accepted than was paid for. Ask the customer to approve extra mangoes.`}
+          <strong>Bill of {rupees(b.bill.amount)} waiting to be paid.</strong> The customer pays it on their booking page, or a manager records a payment taken at the
+          farm. Packing starts once it is paid.
         </div>
       )}
 
@@ -132,14 +131,14 @@ function Detail({ b }: { b: Booking }) {
               Record harvest and packing
             </button>
           )}
-          {next.has('EXTRA') && (
-            <button type="button" className="btn" onClick={() => setOpen('extra')}>
-              Ask for extra kg
+          {next.has('BILL') && (
+            <button type="button" className={b.status === 'WEIGHING' ? 'btn btn-primary' : 'btn'} onClick={() => setOpen('bill')}>
+              {b.status === 'PAYMENT_DUE' ? 'Correct the bill' : 'Send the bill'}
             </button>
           )}
-          {next.has('SHORTFALL') && (
-            <button type="button" className="btn" disabled={!manager} onClick={() => setOpen('shortfall')}>
-              Refund a shortfall
+          {next.has('RECORD_PAYMENT') && (
+            <button type="button" className="btn btn-primary" disabled={!manager} onClick={() => setOpen('recordPayment')}>
+              Record payment at the farm
             </button>
           )}
           {next.has('MOVE') && (
@@ -158,7 +157,9 @@ function Detail({ b }: { b: Booking }) {
             </button>
           )}
         </div>
-        {!manager && ['SHORTFALL', 'MOVE', 'NO_SHOW', 'CANCEL'].some((m) => next.has(m)) && <ManagerOnlyNote what="Moving dates, cancelling, refunds and no-shows" />}
+        {!manager && ['RECORD_PAYMENT', 'MOVE', 'NO_SHOW', 'CANCEL'].some((m) => next.has(m)) && (
+          <ManagerOnlyNote what="Recording payments taken at the farm, moving dates, cancelling and no-shows" />
+        )}
         {!b.nextMoves.length && <p className="muted">No actions are open for a booking in this state.</p>}
         <FormError error={open === null ? act.error : null} />
       </section>
@@ -190,10 +191,21 @@ function Detail({ b }: { b: Booking }) {
           <dl className="farm-facts">
             <Row label="Variety">{b.variety.name}</Row>
             <Row label="Booked">
-              {b.kg} kg at {rupees(b.pricePerKg)}/kg = {rupees(b.total)}
+              {b.kg} kg at {rupees(b.pricePerKg)}/kg = {rupees(b.total)} (estimate; paid after picking)
+            </Row>
+            <Row label="Bill">
+              {b.bill ? (
+                <>
+                  {b.bill.bookedPartKg} kg at {rupees(b.bill.pricePerKg)}/kg
+                  {b.bill.extraKg > 0 && b.bill.extraPricePerKg != null && ` + ${b.bill.extraKg} kg extra at ${rupees(b.bill.extraPricePerKg)}/kg`} = <strong>{rupees(b.bill.amount)}</strong>
+                  <span className="muted small"> · {dateTime(b.bill.at)}</span>
+                </>
+              ) : (
+                <span className="muted">Made after weighing</span>
+              )}
             </Row>
             <Row label="Paid">
-              {rupees(b.money.paid)}
+              {b.paidAt ? rupees(b.money.paid) : 'Not yet'}
               {b.paidAt && <span className="muted small"> · {dateTime(b.paidAt)}</span>}
             </Row>
             {b.money.refunded > 0 && <Row label="Refunded">{rupees(b.money.refunded)}</Row>}
@@ -203,7 +215,6 @@ function Detail({ b }: { b: Booking }) {
                 {b.harvestDay.bookableKg} kg bookable, {b.harvestDay.reservedKg} kg booked · {b.harvestDay.readiness.toLowerCase().replace(/_/g, ' ')}
               </Row>
             )}
-            {b.holdExpiresAt && <Row label="Hold until">{dateTime(b.holdExpiresAt)}</Row>}
           </dl>
         </section>
       </div>
@@ -267,29 +278,10 @@ function Detail({ b }: { b: Booking }) {
         <dl className="farm-facts">
           <Row label="Harvest">{b.harvest.status.toLowerCase().replace(/_/g, ' ')}</Row>
           <Row label="Harvested">{b.harvest.harvestedKg != null ? `${b.harvest.harvestedKg} kg` : '—'}</Row>
-          <Row label="Accepted">{b.harvest.acceptedKg != null ? `${b.harvest.acceptedKg} kg (paid for ${b.paidKg} kg)` : '—'}</Row>
+          <Row label="Accepted">{b.harvest.acceptedKg != null ? `${b.harvest.acceptedKg} kg (booked ${b.kg} kg)` : '—'}</Row>
           <Row label="Packing">{b.harvest.packingStatus.toLowerCase().replace(/_/g, ' ')}</Row>
           {b.harvest.inspectionNote && <Row label="Inspection">{b.harvest.inspectionNote}</Row>}
         </dl>
-        {b.extras.length > 0 && (
-          <>
-            <h3>Extra kg</h3>
-            <ul>
-              {b.extras.map((x) => (
-                <li key={x.id}>
-                  {x.kg} kg at {rupees(x.pricePerKg)}/kg = {rupees(x.amount)} · {x.status.toLowerCase().replace(/_/g, ' ')}
-                  {(x.status === 'REQUESTED' || x.status === 'PAYMENT_PENDING') && (
-                    <button type="button" className="link-btn" onClick={() => run(() => farm.withdrawExtra(b.id, x.id))}>
-                      {' '}
-                      Withdraw
-                    </button>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
-        {openExtras.length > 0 && <p className="muted small">The customer approves and pays for extra kg on their booking page. A booking can't be completed while a request is open.</p>}
       </section>
 
       <section className="card">
@@ -298,7 +290,7 @@ function Detail({ b }: { b: Booking }) {
           <table className="pn-table">
             <thead>
               <tr>
-                <th scope="col">For</th>
+                <th scope="col">How</th>
                 <th scope="col">Amount</th>
                 <th scope="col">Status</th>
                 <th scope="col">Razorpay</th>
@@ -308,19 +300,24 @@ function Detail({ b }: { b: Booking }) {
             <tbody>
               {b.payments.map((p) => (
                 <tr key={p.id}>
-                  <td>{p.kind === 'EXTRA' ? 'Extra kg' : 'Booking'}</td>
+                  <td>
+                    {p.kind === 'RECORDED' ? `At the farm: ${(p.method ?? '').toLowerCase().replace(/_/g, ' ')}` : 'Online'}
+                    {p.reference && <div className="muted small">Ref {p.reference}</div>}
+                    {p.recordedBy && <div className="muted small">Recorded by {p.recordedBy}</div>}
+                  </td>
                   <td>{rupees(p.amount)}</td>
                   <td>
                     {p.status.toLowerCase()}
                     {p.failed && ' (a try failed)'}
                   </td>
-                  <td className="mono small">{p.paymentId ?? p.razorpayOrderId ?? '—'}</td>
+                  <td className="mono small">{p.kind === 'ONLINE' ? (p.paymentId ?? p.razorpayOrderId ?? '—') : '—'}</td>
                   <td>{dateTime(p.paidAt ?? p.createdAt)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+        {!b.payments.length && <p className="muted">Nothing paid yet: the customer pays the bill after picking.</p>}
         {b.money.refunds.length > 0 && (
           <ul className="mt-2">
             {b.money.refunds.map((r) => (
@@ -381,7 +378,7 @@ function Detail({ b }: { b: Booking }) {
           onClose={() => setOpen(null)}
           onSubmit={(text) => run(() => farm.hospitality(b.id, 'PROPOSE', text))}
         >
-          <p>The customer accepts or declines on their booking page. If they decline, they can cancel for a full refund.</p>
+          <p>The customer accepts or declines on their booking page. If they decline, they can cancel at no charge.</p>
         </TextDialog>
       )}
       {dialog('rooms') && <RoomsDialog b={b} busy={act.isPending} error={act.error} onClose={() => setOpen(null)} onSave={(a) => run(() => farm.rooms(b.id, a))} />}
@@ -412,39 +409,35 @@ function Detail({ b }: { b: Booking }) {
         </Dialog>
       )}
       {dialog('harvest') && <HarvestDialog b={b} busy={act.isPending} error={act.error} onClose={() => setOpen(null)} onSave={(body) => run(() => farm.harvest(b.id, body))} />}
-      {dialog('extra') && (
-        <NumberDialog
-          title="Ask the customer to approve extra kg"
-          label="Extra kg"
-          noteLabel="Note to the customer (optional)"
-          confirm="Send request"
-          busy={act.isPending}
-          error={act.error}
-          onClose={() => setOpen(null)}
-          onSubmit={(kg, note) => run(() => farm.extra(b.id, kg, note || undefined))}
-        >
-          <p>Priced at the farm's extra price per kg (or this booking's price). The customer approves and pays online; nothing is charged until then.</p>
-        </NumberDialog>
+      {dialog('bill') && (
+        <BillDialog b={b} busy={act.isPending} error={act.error} onClose={() => setOpen(null)} onSave={(kg) => run(() => farm.bill(b.id, kg))} />
       )}
-      {dialog('shortfall') && (
-        <NumberDialog
-          title="Refund a shortfall"
-          label="Kg short"
-          noteLabel="Reason (kept in the history)"
-          noteRequired
-          confirm="Refund"
+      {dialog('recordPayment') && b.bill && (
+        <RecordPaymentDialog
+          amount={b.bill.amount}
           busy={act.isPending}
           error={act.error}
           onClose={() => setOpen(null)}
-          onSubmit={(kg, reason) => run((c) => farm.shortfall(b.id, kg, reason, c))}
-        >
-          <p>
-            Refunds {rupees(b.pricePerKg)} per kg to the customer's payment, up to what was paid and not accepted ({b.discrepancy?.shortKg ?? 0} kg now). You will be asked to confirm it's you.
-          </p>
-        </NumberDialog>
+          onSave={(body) => run((c) => farm.recordPayment(b.id, body, c))}
+        />
       )}
       {dialog('move') && <MoveDialog b={b} busy={act.isPending} error={act.error} onClose={() => setOpen(null)} onSave={(d, reason, outside) => run(() => farm.move(b.id, d, reason, outside))} />}
-      {dialog('cancel') && <CancelDialog b={b} busy={act.isPending} error={act.error} onClose={() => setOpen(null)} onSave={(body) => run((c) => farm.cancel(b.id, body, c))} />}
+      {dialog('cancel') && (
+        <TextDialog
+          title="Cancel the booking"
+          label="Reason (kept in the history)"
+          initial={b.request?.kind === 'CANCEL' ? 'The customer asked to cancel.' : ''}
+          required
+          minLength={5}
+          confirm="Cancel booking"
+          busy={act.isPending}
+          error={act.error}
+          onClose={() => setOpen(null)}
+          onSubmit={(text) => run(() => farm.cancel(b.id, text))}
+        >
+          <p>The held kg go back on sale and the customer is told. Nothing was paid before the visit, so nothing is refunded.</p>
+        </TextDialog>
+      )}
       {dialog('noShow') && (
         <TextDialog
           title="Mark as no-show"
@@ -455,7 +448,7 @@ function Detail({ b }: { b: Booking }) {
           onClose={() => setOpen(null)}
           onSubmit={(text) => run(() => farm.noShow(b.id, text || undefined))}
         >
-          <p>Only after the visit date has passed. No refund is made automatically: if one is due by your no-show policy, cancel with a refund instead.</p>
+          <p>Only on or after the visit date. Nothing was paid, so nothing is refunded; the held kg go back.</p>
         </TextDialog>
       )}
       {dialog('decline') && (
@@ -558,72 +551,6 @@ function TextDialog({
           <label htmlFor={`${id}-text`}>{label}</label>
           <textarea id={`${id}-text`} rows={4} maxLength={3000} value={text} onChange={(e) => setText(e.target.value)} data-autofocus />
           {required && minLength > 1 && <p className="muted small">At least {minLength} characters.</p>}
-        </div>
-        <FormError error={error} />
-      </form>
-    </Dialog>
-  )
-}
-
-function NumberDialog({
-  title,
-  label,
-  noteLabel,
-  noteRequired = false,
-  confirm,
-  busy,
-  error,
-  onClose,
-  onSubmit,
-  children,
-}: {
-  title: string
-  label: string
-  noteLabel: string
-  noteRequired?: boolean
-  confirm: string
-  busy: boolean
-  error: unknown
-  onClose: () => void
-  onSubmit: (kg: number, note: string, confirmCode?: string) => void
-  children?: ReactNode
-}) {
-  const id = useId()
-  const [kg, setKg] = useState('')
-  const [note, setNote] = useState('')
-  const n = Number(kg)
-  const ok = kg !== '' && n > 0 && Math.round(n * 100) === n * 100 && (!noteRequired || note.trim().length >= 5)
-  return (
-    <Dialog
-      title={title}
-      onClose={onClose}
-      footer={
-        <>
-          <button type="button" className="btn" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" form={id} className="btn btn-primary" disabled={busy || !ok}>
-            {busy ? 'Saving…' : confirm}
-          </button>
-        </>
-      }
-    >
-      <form
-        id={id}
-        onSubmit={(e) => {
-          e.preventDefault()
-          if (ok) onSubmit(n, note.trim())
-        }}
-      >
-        {children}
-        <div className="field">
-          <label htmlFor={`${id}-kg`}>{label}</label>
-          <input id={`${id}-kg`} type="number" min={0.01} step={0.01} inputMode="decimal" value={kg} onChange={(e) => setKg(e.target.value)} data-autofocus />
-        </div>
-        <div className="field">
-          <label htmlFor={`${id}-note`}>{noteLabel}</label>
-          <textarea id={`${id}-note`} rows={2} maxLength={1000} value={note} onChange={(e) => setNote(e.target.value)} />
-          {noteRequired && <p className="muted small">At least 5 characters.</p>}
         </div>
         <FormError error={error} />
       </form>
@@ -762,6 +689,8 @@ function HarvestDialog({
   const [note, setNote] = useState(b.harvest.inspectionNote ?? '')
   const [hs, setHs] = useState(b.harvest.status)
   const [ps, setPs] = useState(b.harvest.packingStatus)
+  // Once billed, the weights are fixed (the API refuses changes): only progress and packing are saved.
+  const billed = b.status === 'PAYMENT_DUE' || b.status === 'PACKING'
   return (
     <Dialog
       title="Harvest, weighing and packing"
@@ -777,8 +706,8 @@ function HarvestDialog({
             disabled={busy}
             onClick={() =>
               onSave({
-                ...(harvested !== '' && { harvestedKg: Number(harvested) }),
-                ...(accepted !== '' && { acceptedKg: Number(accepted) }),
+                ...(!billed && harvested !== '' && { harvestedKg: Number(harvested) }),
+                ...(!billed && accepted !== '' && { acceptedKg: Number(accepted) }),
                 ...(note.trim() && { inspectionNote: note.trim() }),
                 harvestStatus: hs,
                 packingStatus: ps,
@@ -790,8 +719,12 @@ function HarvestDialog({
         </>
       }
     >
-      <p>Paid for: {b.paidKg} kg. Record the weights after weighing with the customer.</p>
-      <div className="field-row">
+      {billed ? (
+        <p>The weights are on the bill. To change them, correct the bill.</p>
+      ) : (
+        <p>Booked: {b.kg} kg. Record the weights after weighing with the customer, then send the bill.</p>
+      )}
+      <div className="field-row" hidden={billed}>
         <div className="field">
           <label htmlFor={`${id}-h`}>Harvested kg</label>
           <input id={`${id}-h`} type="number" min={0} step={0.01} value={harvested} onChange={(e) => setHarvested(e.target.value)} />
@@ -843,8 +776,8 @@ function MoveDialog({
   onSave: (date: string, reason: string, outsideWindow: boolean) => void
 }) {
   const id = useId()
-  const [day, setDay] = useState(b.request?.kind === 'MOVE' && b.request.date ? b.request.date : '')
-  const [reason, setReason] = useState(b.request?.kind === 'MOVE' ? 'The customer asked to move the visit.' : '')
+  const [day, setDay] = useState(b.request?.kind === 'RESCHEDULE' && b.request.date ? b.request.date : '')
+  const [reason, setReason] = useState(b.request?.kind === 'RESCHEDULE' ? 'The customer asked to move the visit.' : '')
   const [outside, setOutside] = useState(false)
   const ok = /^\d{4}-\d{2}-\d{2}$/.test(day) && reason.trim().length >= 5
   return (
@@ -881,62 +814,123 @@ function MoveDialog({
   )
 }
 
-function CancelDialog({
-  b,
+function BillDialog({ b, busy, error, onClose, onSave }: { b: Booking; busy: boolean; error: unknown; onClose: () => void; onSave: (acceptedKg: number) => void }) {
+  const id = useId()
+  const [kg, setKg] = useState(b.bill ? String(b.bill.acceptedKg) : b.harvest.acceptedKg != null ? String(b.harvest.acceptedKg) : '')
+  const n = Number(kg)
+  const ok = kg !== '' && n > 0 && Math.round(n * 100) === n * 100
+  // A preview only: the API makes the bill (and uses the farm's extra price for kg above the booking, if one is set).
+  const booked = Math.min(n || 0, b.kg)
+  const extra = Math.max((n || 0) - b.kg, 0)
+  return (
+    <Dialog
+      title={b.status === 'PAYMENT_DUE' ? 'Correct the bill' : 'Send the bill'}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" form={id} className="btn btn-primary" disabled={busy || !ok}>
+            {busy ? 'Saving…' : b.status === 'PAYMENT_DUE' ? 'Send the corrected bill' : 'Send the bill'}
+          </button>
+        </>
+      }
+    >
+      <form
+        id={id}
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (ok) onSave(n)
+        }}
+      >
+        <p>
+          The customer pays for the kg accepted after inspection: up to {b.kg} kg at {rupees(b.pricePerKg)}/kg, and any kg above that at the farm's extra price (or the same
+          price if none is set).
+          {b.harvest.harvestedKg != null && ` ${b.harvest.harvestedKg} kg were picked.`}
+        </p>
+        {b.status === 'PAYMENT_DUE' && <p>The earlier bill is replaced. If the customer pays the old one anyway, that payment is refunded in full.</p>}
+        <div className="field">
+          <label htmlFor={`${id}-kg`}>Accepted kg</label>
+          <input id={`${id}-kg`} type="number" min={0.01} step={0.01} inputMode="decimal" value={kg} onChange={(e) => setKg(e.target.value)} data-autofocus />
+        </div>
+        {ok && (
+          <p className="muted small">
+            {booked} kg at {rupees(b.pricePerKg)}/kg{extra > 0 ? ` + ${Math.round(extra * 100) / 100} kg extra` : ''}
+          </p>
+        )}
+        <FormError error={error} />
+      </form>
+    </Dialog>
+  )
+}
+
+const METHODS = [
+  ['UPI', 'UPI to the farm'],
+  ['CARD', 'Card machine'],
+  ['CASH', 'Cash'],
+  ['BANK_TRANSFER', 'Bank transfer'],
+] as const
+
+function RecordPaymentDialog({
+  amount,
   busy,
   error,
   onClose,
   onSave,
 }: {
-  b: Booking
+  amount: number
   busy: boolean
   error: unknown
   onClose: () => void
-  onSave: (body: { reason: string; refund: boolean; kind: 'CANCELLED' | 'NOT_HOSTED' }) => void
+  onSave: (body: { method: RecordedMethod; reference: string }) => void
 }) {
   const id = useId()
-  const paid = b.money.paid - b.money.refunded
-  const [reason, setReason] = useState(b.request?.kind === 'CANCEL' ? 'The customer asked to cancel.' : '')
-  const [refund, setRefund] = useState(paid > 0)
-  const [kind, setKind] = useState<'CANCELLED' | 'NOT_HOSTED'>('CANCELLED')
-  const ok = reason.trim().length >= 5
+  const [method, setMethod] = useState<RecordedMethod>('UPI')
+  const [reference, setReference] = useState('')
+  const ok = reference.trim().length >= 3
   return (
     <Dialog
-      title="Cancel the booking"
-      tone="danger"
+      title="Record payment at the farm"
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn" onClick={onClose} data-autofocus>
-            Keep the booking
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
           </button>
-          <button type="button" className="btn btn-danger" disabled={busy || !ok} onClick={() => onSave({ reason: reason.trim(), refund: refund && paid > 0, kind })}>
-            {busy ? 'Cancelling…' : refund && paid > 0 ? `Cancel and refund ${rupees(paid)}` : 'Cancel booking'}
+          <button type="submit" form={id} className="btn btn-primary" disabled={busy || !ok}>
+            {busy ? 'Saving…' : `Record ${rupees(amount)} paid`}
           </button>
         </>
       }
     >
-      <p>The held kg go back on sale and the customer is told.</p>
-      {paid > 0 && (
-        <>
-          <label className="check">
-            <input type="checkbox" checked={refund} onChange={(e) => setRefund(e.target.checked)} /> Refund {rupees(paid)} in full to the customer's payment (you will be asked to confirm it's you)
-          </label>
-          <div className="field">
-            <label htmlFor={`${id}-k`}>Why</label>
-            <select id={`${id}-k`} value={kind} onChange={(e) => setKind(e.target.value as 'CANCELLED' | 'NOT_HOSTED')}>
-              <option value="CANCELLED">Cancelled (customer or team)</option>
-              <option value="NOT_HOSTED">We can't host them as agreed</option>
-            </select>
-          </div>
-        </>
-      )}
-      <div className="field">
-        <label htmlFor={`${id}-r`}>Reason (kept in the history)</label>
-        <textarea id={`${id}-r`} rows={2} value={reason} onChange={(e) => setReason(e.target.value)} />
-        <p className="muted small">At least 5 characters.</p>
-      </div>
-      <FormError error={error} />
+      <form
+        id={id}
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (ok) onSave({ method, reference: reference.trim() })
+        }}
+      >
+        <p>
+          Only once the full bill of {rupees(amount)} is in the farm's account or cash box. The booking moves to packing. You will be asked to confirm it's you.
+        </p>
+        <div className="field">
+          <label htmlFor={`${id}-m`}>How they paid</label>
+          <select id={`${id}-m`} value={method} onChange={(e) => setMethod(e.target.value as RecordedMethod)}>
+            {METHODS.map(([v, label]) => (
+              <option key={v} value={v}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label htmlFor={`${id}-r`}>Receipt or UPI reference</label>
+          <input id={`${id}-r`} value={reference} maxLength={100} onChange={(e) => setReference(e.target.value)} data-autofocus />
+          <p className="muted small">At least 3 characters.</p>
+        </div>
+        <FormError error={error} />
+      </form>
     </Dialog>
   )
 }

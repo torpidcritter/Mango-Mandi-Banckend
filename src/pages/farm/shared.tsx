@@ -6,9 +6,6 @@ import { Badge } from '../../ui'
 import type { FarmStatus, HospitalityStatus } from './api'
 
 export const FARM_STATUS_LABEL: Record<FarmStatus, string> = {
-  PAYMENT_PENDING: 'Payment pending',
-  EXPIRED: 'Hold expired',
-  NEEDS_ATTENTION: 'Needs attention',
   HOSPITALITY_REVIEW: 'Stay to arrange',
   CONFIRMED: 'Confirmed',
   PREPARING: 'Preparing',
@@ -16,7 +13,8 @@ export const FARM_STATUS_LABEL: Record<FarmStatus, string> = {
   CHECKED_IN: 'Checked in',
   HARVESTING: 'Harvesting',
   WEIGHING: 'Weighing',
-  PACKING: 'Packing',
+  PAYMENT_DUE: 'Bill to pay',
+  PACKING: 'Paid: packing',
   COMPLETED: 'Completed',
   CANCELLED: 'Cancelled',
   NO_SHOW: 'No-show',
@@ -41,8 +39,8 @@ export const MOVE_LABEL: Record<string, string> = {
 }
 
 function tone(s: FarmStatus): Tone {
-  if (s === 'NEEDS_ATTENTION' || s === 'HOSPITALITY_REVIEW') return 'warn'
-  if (s === 'PAYMENT_PENDING') return 'info'
+  if (s === 'HOSPITALITY_REVIEW') return 'warn'
+  if (s === 'PAYMENT_DUE') return 'info'
   if (s === 'CONFIRMED' || s === 'READY_FOR_VISIT' || s === 'COMPLETED') return 'good'
   if (s === 'NO_SHOW') return 'bad'
   return 'neutral'

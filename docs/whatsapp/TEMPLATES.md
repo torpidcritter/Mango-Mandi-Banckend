@@ -405,7 +405,7 @@ Suggested wording: (write it in WhatsApp Manager)
 - Template: `mandi_farm_booking_update`
 - Category: UTILITY
 - Who may receive it: Order and service update: sent unless the number sent STOP
-- Sent when: A Farm Experience booking is paid, confirmed, moved, cancelled, refunded, ready for the visit, reminded two days before, or asks the customer to approve extra mangoes (FARM_EXPERIENCE, docs/farm-experience.md).
+- Sent when: A Farm Experience booking is made, confirmed, moved, cancelled, ready for the visit, reminded two days before, billed after weighing, paid, or a double payment refunded (FARM_EXPERIENCE, docs/farm-experience.md).
 - Only with `WHATSAPP_FARM_UPDATES=true`
 - Button: none
 - If it can't be sent: Not sent: the booking page in the shop shows the same status.
@@ -422,12 +422,12 @@ Suggested wording: (write it in WhatsApp Manager)
 - Template: `mandi_farm_team_alert`
 - Category: UTILITY
 - Who may receive it: Asked for by the person: sent unless the number sent STOP
-- Sent when: To the numbers in FARM_ALERT_PHONES: a new paid booking, one that needs a manager, a customer request, or a declined stay proposal.
+- Sent when: To the numbers in FARM_ALERT_PHONES: a new booking, a customer request, or a declined stay proposal.
 - Only with `WHATSAPP_FARM_UPDATES=true`
 - Button: none
 - If it can't be sent: Not sent: the Farm Experience Bookings list shows the same.
 - Variables:
-  1. what happened (example: New paid farm booking)
+  1. what happened (example: New farm booking)
   2. booking number (example: MMF-7K2QXD9T)
   3. detail (example: 300 kg Alphonso, Sat, 10 Apr, 6 guests)
   4. panel link (example: https://ops.mandimangoes.in/farm/bookings/fbk_1)

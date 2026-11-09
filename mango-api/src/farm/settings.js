@@ -73,9 +73,10 @@ export const settingsSchema = z
     seasonEnd: date,
     leadDays: z.number().int().min(0).max(60).default(3),
     maxDaysAhead: z.number().int().min(1).max(365).default(120),
-    holdMinutes: z.number().int().min(5).max(60).default(15),
-    // A paid booking cancelled by the customer this many days or more before the visit is refunded in full on its own;
-    // later, the request goes to a manager. Changing the visit date: the same, with its own number.
+    // Nothing is paid before the visit, so this caps how many upcoming visits one customer can hold at a time.
+    maxOpenBookings: z.number().int().min(1).max(20).default(2),
+    // A customer may cancel online this many days or more before the visit (nothing is charged);
+    // later, the request goes to our team. Changing the visit date: the same, with its own number.
     cancelDays: z.number().int().min(0).max(120).default(7),
     rescheduleDays: z.number().int().min(0).max(120).default(3),
     // Extra mangoes picked on the day: price per kg from the variety unless this is set (paise).
@@ -155,6 +156,6 @@ export async function saveSettings(c, patch, version, admin) {
 
 /** What the shop may see: everything here is public information. */
 export function publicSettings(s) {
-  const { bookingsOpen: _b, extraPricePerKg: _e, ...rest } = s
+  const { bookingsOpen: _b, ...rest } = s
   return { ...rest, faqs: s.faqs.filter((f) => f.a) }
 }

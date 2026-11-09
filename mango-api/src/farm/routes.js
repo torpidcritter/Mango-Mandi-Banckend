@@ -6,19 +6,18 @@
 //   GET  /farm-experience/dates      visit dates with enough of a variety (?varietyId=&kg=)
 //   POST /farm-experience/quote      the price for a variety and kilograms (worked out here)
 // Signed in, the caller's own bookings only (someone else's answers 404):
-//   POST /farm-bookings                          book (Idempotency-Key): holds the mangoes, starts the payment
+//   POST /farm-bookings                          book (Idempotency-Key): takes the mangoes; nothing is paid until after picking
 //   GET  /farm-bookings, /farm-bookings/:id      list, and one booking with its itinerary
 //   GET  /farm-bookings/:id/qr.svg               the check-in QR (the code only, nothing personal)
+//   POST /farm-bookings/:id/pay                  pay the bill made after weighing (starts Razorpay Checkout)
 //   POST /farm-bookings/:id/verify-payment       Checkout's reply, checked as for an order (PAY-B3)
-//   POST /farm-bookings/:id/renew                a hold that ran out, taken again when the mangoes are still there
-//   POST /farm-bookings/:id/cancel               cancel (refund, or a request to the team, by the policy)
+//   POST /farm-bookings/:id/cancel               cancel (at once, or a request to the team, by the policy)
 //   POST /farm-bookings/:id/reschedule           move the visit (at once, or a request to the team)
 //   POST /farm-bookings/:id/hospitality          accept or decline a proposed arrangement
-//   POST /farm-bookings/:id/extras/:extraId      approve and pay for, or decline, extra mangoes
 import express from 'express'
 import QRCode from 'qrcode'
 import { z } from 'zod'
-import { addDays, diffDays, now, todayIST } from '../clock.js'
+import { diffDays, now } from '../clock.js'
 import { query, tx } from '../db.js'
 import { env } from '../env.js'
 import { asyncHandler, badRequest, HttpError, notFound, parse } from '../errors.js'
@@ -30,10 +29,9 @@ import { gstinProblem, normaliseGstin } from '../gstin.js'
 // Function declarations and lazily read constants only: customer.js imports this file.
 import { requestHash } from '../customer.js'
 import {
-  answerAlternative, answerExtra, createBooking, customerActor, customerCancel, customerMove, customerView, event, lockBooking, openDates,
-  processFarmPayment, reserveKg, varietyAvailability, varietyView,
+  answerAlternative, billPayment, createBooking, customerCancel, customerMove, customerView, lockBooking, openDates,
+  processFarmPayment, varietyAvailability, varietyView,
 } from './bookings.js'
-import { processDueFarmRefunds } from './refunds.js'
 import { MIN_KG, priceFor, STATUS_WORDS } from './rules.js'
 import { loadSettings, publicSettings } from './settings.js'
 
@@ -136,32 +134,20 @@ function checkInput(b) {
 }
 
 const replayBooking = async (key) =>
-  (
-    await query(
-      `SELECT k.request_hash AS idem_hash, b.*, p.id AS pay_id, p.razorpay_order_id FROM idempotency_keys k
-         JOIN farm_bookings b ON b.id = k.order_id JOIN farm_booking_payments p ON p.booking_id = b.id AND p.kind = 'BOOKING' WHERE k.key = $1`,
-      [key],
-    )
-  ).rows[0] ?? null
+  (await query(`SELECT k.request_hash AS idem_hash, b.* FROM idempotency_keys k JOIN farm_bookings b ON b.id = k.order_id WHERE k.key = $1`, [key])).rows[0] ?? null
 
-const created = (b, razorpayOrderId) => ({
-  bookingId: b.id, number: b.number, status: b.status, total: b.total, kg: b.kg, visitDate: b.visit_date, holdExpiresAt: b.hold_expires_at,
-  razorpayOrderId, razorpayKeyId: env.RAZORPAY_KEY_ID || null,
-})
+const created = (b) => ({ bookingId: b.id, number: b.number, status: b.status, estimate: b.total, kg: b.kg, visitDate: b.visit_date })
 
-/** Creates the Razorpay order for a payment row; if the gateway fails, the hold is given back. */
-async function startPayment(payRow, b, key = null) {
+/** Creates the Razorpay order for a bill payment; if the gateway fails, the try is closed and the customer can tap Pay again. */
+async function startPayment(payRow, b) {
+  if (payRow.razorpay_order_id) return payRow.razorpay_order_id
   try {
-    const receipt = payRow.kind === 'BOOKING' ? b.number : `${b.number}-${payRow.id.slice(-6)}`
-    const rzp = await createGatewayOrder({ amount: payRow.amount, receipt, orderId: b.id })
+    const rzp = await createGatewayOrder({ amount: payRow.amount, receipt: `${b.number}-${payRow.id.slice(-6)}`, orderId: b.id })
     const { rows } = await query('UPDATE farm_booking_payments SET razorpay_order_id = $2 WHERE id = $1 AND razorpay_order_id IS NULL RETURNING razorpay_order_id', [payRow.id, rzp])
     return rows[0]?.razorpay_order_id ?? (await query('SELECT razorpay_order_id FROM farm_booking_payments WHERE id = $1', [payRow.id])).rows[0].razorpay_order_id
   } catch (err) {
     logger.error({ err, farmPaymentId: payRow.id }, 'could not create the gateway order for a farm payment')
-    await tx(async (c) => {
-      await processFarmPayment(c, { farmPaymentId: payRow.id, outcome: 'abandoned' })
-      if (key) await c.query('DELETE FROM idempotency_keys WHERE key = $1', [key])
-    })
+    await tx((c) => processFarmPayment(c, { farmPaymentId: payRow.id, outcome: 'abandoned' }))
     throw new HttpError(502, 'PAYMENT_GATEWAY_ERROR', 'Could not start the payment. Please try again.')
   }
 }
@@ -181,27 +167,25 @@ farmCustomer.post(
       if (replay.idem_hash && replay.idem_hash !== hash) {
         throw new HttpError(422, 'IDEMPOTENCY_KEY_REUSED', 'This request does not match the one first sent with this Idempotency-Key. Use a new key for a new booking.')
       }
-      if (replay.razorpay_order_id || replay.status !== 'PAYMENT_PENDING') return res.status(200).json(created(replay, replay.razorpay_order_id))
-      throw new HttpError(409, 'PAYMENT_STARTING', 'Your payment is still being set up. Please try again in a moment.', { retryAfterSeconds: 2 })
+      return res.status(200).json(created(replay))
     }
-    const out = await tx(async (c) => {
+    const b = await tx(async (c) => {
       const ins = await c.query('INSERT INTO idempotency_keys (key, order_id, created_at, request_hash) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING', [key, 'pending', now(), hash])
       if (!ins.rowCount) return null
       const { rows: cust } = await c.query('SELECT name, phone FROM customers WHERE id = $1', [req.customer.id])
       if (!cust[0]?.phone) throw new HttpError(409, 'PHONE_REQUIRED', 'Add your mobile number first, so the farm team can reach you.')
-      const b = await createBooking(c, { customerId: req.customer.id, input: { ...input, contactPhone: cust[0].phone } })
+      const made = await createBooking(c, { customerId: req.customer.id, input: { ...input, contactPhone: cust[0].phone } })
       if (!cust[0].name) await c.query('UPDATE customers SET name = $2 WHERE id = $1', [req.customer.id, input.contactName])
-      await c.query('UPDATE idempotency_keys SET order_id = $2 WHERE key = $1', [key, b.id])
-      const pay = (await c.query(`SELECT * FROM farm_booking_payments WHERE booking_id = $1 AND kind = 'BOOKING'`, [b.id])).rows[0]
-      return { b, pay }
+      await c.query('UPDATE idempotency_keys SET order_id = $2 WHERE key = $1', [key, made.id])
+      return made
     })
-    if (!out) {
+    if (!b) {
+      // The same key at the same moment: the first request's transaction has committed by now.
       const first = await replayBooking(key)
-      if (!first?.razorpay_order_id && first?.status === 'PAYMENT_PENDING') throw new HttpError(409, 'PAYMENT_STARTING', 'Your payment is still being set up. Please try again in a moment.', { retryAfterSeconds: 2 })
-      return res.status(200).json(created(first, first.razorpay_order_id))
+      if (!first) throw new HttpError(409, 'BOOKING_IN_PROGRESS', 'Your booking is still being made. Please try again in a moment.', { retryAfterSeconds: 2 })
+      return res.status(200).json(created(first))
     }
-    const rzp = await startPayment(out.pay, out.b, key)
-    res.status(201).json(created(out.b, rzp))
+    res.status(201).json(created(b))
   }),
 )
 
@@ -217,7 +201,7 @@ farmCustomer.get(
     const { rows } = await query('SELECT * FROM farm_bookings WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50', [req.customer.id])
     res.json(rows.map((b) => ({
       id: b.id, number: b.number, status: b.status, statusLabel: STATUS_WORDS[b.status], variety: b.variety_name, kg: b.kg, total: b.total,
-      visitDate: b.visit_date, guests: b.adults + b.children, createdAt: b.created_at,
+      billAmount: b.bill_amount, paidAt: b.paid_at, visitDate: b.visit_date, guests: b.adults + b.children, createdAt: b.created_at,
     })))
   }),
 )
@@ -238,7 +222,7 @@ farmCustomer.get(
   '/farm-bookings/:id/qr.svg',
   asyncHandler(async (req, res) => {
     const b = await own({ query }, req)
-    if (['PAYMENT_PENDING', 'EXPIRED', 'CANCELLED', 'NO_SHOW', 'COMPLETED'].includes(b.status)) throw notFound('No check-in code for this booking')
+    if (['CANCELLED', 'NO_SHOW', 'COMPLETED'].includes(b.status)) throw notFound('No check-in code for this booking')
     // The QR holds only the check-in code: staff look the booking up with it in the panel.
     const svg = await QRCode.toString(`MMF:${b.checkin_code}`, { type: 'svg', margin: 1, errorCorrectionLevel: 'M' })
     res.set('Content-Type', 'image/svg+xml')
@@ -248,6 +232,19 @@ farmCustomer.get(
 )
 
 const VERIFY_PER_MINUTE = 6
+
+/** Pay the bill made after weighing: starts (or reuses) its Razorpay order. */
+farmCustomer.post(
+  '/farm-bookings/:id/pay',
+  asyncHandler(async (req, res) => {
+    const out = await tx(async (c) => {
+      const b = await own(c, req, { lock: true })
+      return { b, pay: await billPayment(c, b) }
+    })
+    const rzp = await startPayment(out.pay, out.b)
+    res.json({ bookingId: out.b.id, number: out.b.number, amount: out.pay.amount, razorpayOrderId: rzp, razorpayKeyId: env.RAZORPAY_KEY_ID || null })
+  }),
+)
 
 farmCustomer.post(
   '/farm-bookings/:id/verify-payment',
@@ -271,34 +268,10 @@ farmCustomer.post(
 )
 
 farmCustomer.post(
-  '/farm-bookings/:id/renew',
-  asyncHandler(async (req, res) => {
-    const out = await tx(async (c) => {
-      const b = await own(c, req, { lock: true })
-      if (b.status !== 'EXPIRED') throw new HttpError(409, 'NOT_EXPIRED', 'This booking’s hold has not run out.')
-      const { settings } = await loadSettings(c)
-      if (!settings.bookingsOpen) throw new HttpError(409, 'FARM_BOOKINGS_CLOSED', 'Farm Experience bookings aren’t open at the moment.')
-      if (b.visit_date < addDays(todayIST(), settings.leadDays)) throw new HttpError(409, 'FARM_DATE_UNAVAILABLE', 'That visit date is too close now. Please book again for another date.')
-      const pay = (await c.query(`SELECT * FROM farm_booking_payments WHERE booking_id = $1 AND kind = 'BOOKING' FOR UPDATE`, [b.id])).rows[0]
-      if (pay.status === 'SUCCEEDED') throw new HttpError(409, 'ALREADY_PAID', 'This booking is already paid.')
-      if (!(await reserveKg(c, b.variety_id, b.visit_date, b.kg))) throw new HttpError(409, 'FARM_NOT_ENOUGH_HARVEST', 'Those mangoes have been booked by someone else. Please book again for another date.')
-      const hold = new Date(now().getTime() + settings.holdMinutes * 60_000)
-      await event(c, b, { to: 'PAYMENT_PENDING', action: 'HOLD_RENEWED', actor: customerActor(req.customer.id) })
-      await c.query(`UPDATE farm_bookings SET status = 'PAYMENT_PENDING', kg_reserved = TRUE, hold_expires_at = $2, version = version + 1, updated_at = $3 WHERE id = $1`, [b.id, hold, now()])
-      await c.query(`UPDATE farm_booking_payments SET status = 'INITIATED' WHERE id = $1 AND status = 'CANCELLED'`, [pay.id])
-      return { b: (await c.query('SELECT * FROM farm_bookings WHERE id = $1', [b.id])).rows[0], pay: (await c.query('SELECT * FROM farm_booking_payments WHERE id = $1', [pay.id])).rows[0] }
-    })
-    const rzp = out.pay.razorpay_order_id ?? (await startPayment(out.pay, out.b))
-    res.json(created(out.b, rzp))
-  }),
-)
-
-farmCustomer.post(
   '/farm-bookings/:id/cancel',
   asyncHandler(async (req, res) => {
     const { reason } = parse(z.object({ reason: z.string().trim().max(1000).optional() }).strict(), req.body ?? {})
     const r = await tx(async (c) => customerCancel(c, await own(c, req, { lock: true }), { reason, customerId: req.customer.id }))
-    if (r.refunds.length) await processDueFarmRefunds(now(), { bookingId: r.booking.id }).catch((err) => logger.error({ err }, 'farm refund failed; maintenance will retry'))
     res.json({ requested: r.requested, booking: await customerView({ query }, await own({ query }, req)) })
   }),
 )
@@ -321,30 +294,15 @@ farmCustomer.post(
   }),
 )
 
-farmCustomer.post(
-  '/farm-bookings/:id/extras/:extraId',
-  asyncHandler(async (req, res) => {
-    const body = parse(z.object({ accept: z.boolean() }).strict(), req.body)
-    const extraId = parse(ID, req.params.extraId)
-    const out = await tx(async (c) => {
-      const b = await own(c, req, { lock: true })
-      return { b, pay: await answerExtra(c, b, extraId, { accept: body.accept, customerId: req.customer.id }) }
-    })
-    if (!out.pay) return res.json({ declined: true })
-    const rzp = out.pay.razorpay_order_id ?? (await startPayment(out.pay, out.b))
-    res.json({ farmPaymentId: out.pay.id, amount: out.pay.amount, razorpayOrderId: rzp, razorpayKeyId: env.RAZORPAY_KEY_ID || null })
-  }),
-)
-
 /** /v1/dev (ENABLE_DEV_ROUTES, never in production): pays or fails a farm payment, as the Razorpay webhook would. */
 export const devFarm = express.Router()
 devFarm.post(
   '/pay-farm',
   asyncHandler(async (req, res) => {
-    const b = parse(z.object({ bookingId: ID, outcome: z.enum(['captured', 'failed']), extra: z.boolean().optional() }), req.body)
+    const b = parse(z.object({ bookingId: ID, outcome: z.enum(['captured', 'failed']) }), req.body)
     const { rows } = await query(
-      `SELECT * FROM farm_booking_payments WHERE booking_id = $1 AND kind = $2 AND status IN ('INITIATED', 'CANCELLED') ORDER BY created_at DESC LIMIT 1`,
-      [b.bookingId, b.extra ? 'EXTRA' : 'BOOKING'],
+      `SELECT * FROM farm_booking_payments WHERE booking_id = $1 AND kind = 'ONLINE' AND status IN ('INITIATED', 'CANCELLED') ORDER BY created_at DESC LIMIT 1`,
+      [b.bookingId],
     )
     if (!rows.length) throw notFound('No unpaid farm payment')
     const r = await tx((c) => processFarmPayment(c, { farmPaymentId: rows[0].id, outcome: b.outcome, paymentId: `pay_dev_${rows[0].id.slice(4, 18)}`, amount: rows[0].amount, method: 'dev' }))

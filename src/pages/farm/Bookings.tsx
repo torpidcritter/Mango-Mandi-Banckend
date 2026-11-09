@@ -54,10 +54,13 @@ export default function FarmBookings() {
             [
               ['Need action', overview.data.needsAction, { needsAction: 'true' }],
               ['Stay to arrange', overview.data.byStatus.HOSPITALITY_REVIEW, { status: 'HOSPITALITY_REVIEW' }],
-              ['Needs attention', overview.data.byStatus.NEEDS_ATTENTION, { status: 'NEEDS_ATTENTION' }],
               ['Confirmed', overview.data.byStatus.CONFIRMED, { status: 'CONFIRMED' }],
-              ['On the farm today', overview.data.byStatus.CHECKED_IN + overview.data.byStatus.HARVESTING + overview.data.byStatus.WEIGHING + overview.data.byStatus.PACKING, { status: 'CHECKED_IN,HARVESTING,WEIGHING,PACKING' }],
-              ['Payment pending', overview.data.byStatus.PAYMENT_PENDING, { status: 'PAYMENT_PENDING' }],
+              [
+                'On the farm today',
+                overview.data.byStatus.CHECKED_IN + overview.data.byStatus.HARVESTING + overview.data.byStatus.WEIGHING + overview.data.byStatus.PAYMENT_DUE + overview.data.byStatus.PACKING,
+                { status: 'CHECKED_IN,HARVESTING,WEIGHING,PAYMENT_DUE,PACKING' },
+              ],
+              ['Bill to pay', overview.data.byStatus.PAYMENT_DUE, { status: 'PAYMENT_DUE' }],
               ['Refunds not finished', overview.data.refundsPending, null],
             ] as [string, number, Record<string, string> | null][]
           ).map(([label, n, f]) => (
@@ -106,8 +109,8 @@ export default function FarmBookings() {
           <label htmlFor={`${uid}-payment`}>Payment</label>
           <select id={`${uid}-payment`} value={params.get('payment') ?? ''} onChange={(e) => update({ payment: e.target.value })}>
             <option value="">All</option>
-            <option value="PAID">Paid</option>
-            <option value="UNPAID">Not paid</option>
+            <option value="PAID">Bill paid</option>
+            <option value="DUE">Bill to pay</option>
             <option value="REFUNDED">Refunded (any)</option>
           </select>
         </div>
@@ -199,7 +202,7 @@ export default function FarmBookings() {
                       {b.overCapacity && <Badge tone="warn">Over farmhouse capacity</Badge>}
                     </td>
                     <td data-label="Payment">
-                      {b.paymentStatus === 'SUCCEEDED' ? 'Paid' : b.paymentStatus === 'INITIATED' ? 'Waiting' : (b.paymentStatus ?? '—')}
+                      {b.paidAt ? `Paid ${rupees(b.billAmount ?? 0)}` : b.billAmount != null ? `Bill ${rupees(b.billAmount)} to pay` : 'After picking'}
                       {b.refundStatus && <div className="muted small">{b.refundStatus === 'REFUNDED' ? 'Refunded' : 'Refund pending'}</div>}
                     </td>
                     <td data-label="Stay">{HOSPITALITY_LABEL[b.hospitalityStatus]}</td>

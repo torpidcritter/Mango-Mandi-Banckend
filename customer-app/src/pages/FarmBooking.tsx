@@ -1,22 +1,20 @@
-// My farm visits (FARM_EXPERIENCE): the list, and one booking as its itinerary: payment, the
-// check-in QR, the stay and meals the farm team planned, extra mangoes to approve, and cancel or
-// change of date by the rules the API sends (canCancel, canMove). The API decides every outcome.
+// My farm visits (FARM_EXPERIENCE): the list, and one booking as its itinerary: the check-in
+// QR, the stay and meals the farm team planned, the bill after picking (paid here online, or at
+// the farm), and cancel or change of date by the rules the API sends (canCancel, canMove, canPay).
+// Nothing is paid at booking. The API decides every outcome.
 import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, signedInPhone, type FarmBooking, type FarmExtra, type FarmStatus } from '../api'
+import { api, signedInPhone, type FarmBooking, type FarmStatus } from '../api'
 import { clock, day, rupees, when } from '../format'
 import { DayChips, Field } from '../forms'
-import { MIN_PAY_SECONDS, openRazorpay } from '../payment'
+import { openRazorpay } from '../payment'
 import { ConfirmDialog, DocTitle, ErrorNote, PageHeader, Spinner } from '../ui'
 import { useT, type T } from '../i18n'
 import type { Key } from '../i18n-core.ts'
 import { mealsText } from './Farm'
 
 const TONE: Record<FarmStatus, string> = {
-  PAYMENT_PENDING: 'warn',
-  EXPIRED: 'muted',
-  NEEDS_ATTENTION: 'warn',
   HOSPITALITY_REVIEW: 'info',
   CONFIRMED: 'good',
   PREPARING: 'good',
@@ -24,6 +22,7 @@ const TONE: Record<FarmStatus, string> = {
   CHECKED_IN: 'info',
   HARVESTING: 'info',
   WEIGHING: 'info',
+  PAYMENT_DUE: 'warn',
   PACKING: 'info',
   COMPLETED: 'good',
   CANCELLED: 'muted',
@@ -64,7 +63,7 @@ export default function FarmBookings() {
               </Link>{' '}
               <StatusPill status={b.status} />
               <p className="small muted">
-                {t('farm.listLine', { kg: b.kg, variety: b.variety, day: day(b.visitDate), total: rupees(b.total) })}
+                {t('farm.listLine', { kg: b.kg, variety: b.variety, day: day(b.visitDate), total: rupees(b.billAmount ?? b.total) })}
               </p>
             </li>
           ))}
@@ -74,7 +73,7 @@ export default function FarmBookings() {
   )
 }
 
-/** /farm-bookings/:id — one booking. While payment is on its way it asks again on its own. */
+/** /farm-bookings/:id — one booking. While the bill is due it asks again on its own (a payment may land, or staff record one). */
 export function FarmBookingPage() {
   const { id } = useParams()
   const t = useT()
@@ -83,7 +82,7 @@ export function FarmBookingPage() {
     queryFn: () => api.farmBooking(id!),
     refetchInterval: (query) => {
       const b = query.state.data
-      return b && (b.status === 'PAYMENT_PENDING' || b.extraPayment) ? 5_000 : false
+      return b && b.status === 'PAYMENT_DUE' ? 5_000 : false
     },
   })
   if (q.isPending) return <Spinner label={t('farm.loading')} />
@@ -99,37 +98,16 @@ function BookingView({ b }: { b: FarmBooking }) {
     void queryClient.invalidateQueries({ queryKey: ['farm-booking', b.id] })
     void queryClient.invalidateQueries({ queryKey: ['farm-bookings'] })
   }
-  const arrived = useLocation().state as { payError?: string; placed?: boolean } | null
-  const holdLeftMs = b.holdExpiresAt ? new Date(b.holdExpiresAt).getTime() - Date.now() : 0
-  const rzp = b.payment?.razorpayOrderId ?? null
-  const canPay = b.status === 'PAYMENT_PENDING' && Boolean(b.razorpayKeyId && rzp) && holdLeftMs > MIN_PAY_SECONDS * 1000
-  const pay = useMutation({
-    mutationFn: () =>
-      openRazorpay({ orderId: b.id, key: b.razorpayKeyId!, rzp: rzp!, total: b.total, number: b.number, holdExpiresAt: b.holdExpiresAt }, signedInPhone(), api.verifyFarmPayment),
-    onSettled: refresh,
-  })
-  const renew = useMutation({
-    mutationFn: async () => {
-      const r = await api.renewFarmBooking(b.id)
-      if (r.razorpayKeyId && r.razorpayOrderId) {
-        await openRazorpay(
-          { orderId: b.id, key: r.razorpayKeyId, rzp: r.razorpayOrderId, total: r.total, number: r.number, holdExpiresAt: r.holdExpiresAt },
-          signedInPhone(),
-          api.verifyFarmPayment,
-        )
-      }
-    },
-    onSettled: refresh,
-  })
-  const devPay = useMutation({ mutationFn: (x: { outcome: 'captured' | 'failed'; extra?: boolean }) => api.devPayFarm(b.id, x.outcome, x.extra), onSettled: refresh })
+  const arrived = useLocation().state as { placed?: boolean } | null
+  const devPay = useMutation({ mutationFn: (outcome: 'captured' | 'failed') => api.devPayFarm(b.id, outcome), onSettled: refresh })
   const answer = useMutation({ mutationFn: (accept: boolean) => api.answerFarmArrangement(b.id, accept), onSettled: refresh })
 
-  const paid = b.money.paid > 0
-  const [thanks, setThanks] = useState(() => Boolean(arrived?.placed) && paid)
+  // "Booked" once, right after the booking form; "Paid" when the bill turns paid while the page is open.
+  const [thanks, setThanks] = useState<Key | null>(() => (arrived?.placed && b.status === 'HOSPITALITY_REVIEW' ? 'farm.thanks' : null))
   const was = useRef(b.status)
   const thanksNote = useRef<HTMLElement>(null)
   useEffect(() => {
-    if (was.current === 'PAYMENT_PENDING' && b.status !== 'PAYMENT_PENDING' && b.status !== 'EXPIRED' && b.status !== 'CANCELLED') setThanks(true)
+    if (was.current === 'PAYMENT_DUE' && b.status === 'PACKING') setThanks('farm.paidThanks')
     was.current = b.status
   }, [b.status])
   useEffect(() => {
@@ -148,66 +126,18 @@ function BookingView({ b }: { b: FarmBooking }) {
         <StatusPill status={b.status} />
       </PageHeader>
 
-      {thanks && paid && (
+      {thanks && (
         <section className="card note-card thanks-card" ref={thanksNote} tabIndex={-1}>
           <p>
-            <strong>{t('farm.thanks')}</strong> {t('farm.thanksBody')}
+            <strong>{t(thanks)}</strong> {thanks === 'farm.thanks' && t('farm.thanksBody')}
           </p>
         </section>
       )}
 
-      {b.status === 'PAYMENT_PENDING' && (
-        <section className="card note-card" aria-live="polite">
-          <p>
-            <strong>{t('order.waitingPay')}</strong> {t('order.updatesItself')}
-            {holdLeftMs > 0 && b.holdExpiresAt && ` ${t('farm.heldUntil', { when: when(b.holdExpiresAt) })}`}
-          </p>
-          {b.payment?.failed && <p className="small">{t('farm.payFailed')}</p>}
-          {canPay && (
-            <button type="button" className="btn btn-primary" disabled={pay.isPending} onClick={() => pay.mutate()}>
-              {t('checkout.pay', { total: rupees(b.total) })}
-            </button>
-          )}
-          {import.meta.env.DEV && !b.razorpayKeyId && (
-            <div className="dev-pay">
-              <p className="small muted">{t('order.devPay')}</p>
-              <div className="row">
-                <button type="button" className="btn btn-primary" disabled={devPay.isPending} onClick={() => devPay.mutate({ outcome: 'captured' })}>
-                  {t('order.devSucceeds')}
-                </button>
-                <button type="button" className="btn" disabled={devPay.isPending} onClick={() => devPay.mutate({ outcome: 'failed' })}>
-                  {t('order.devFails')}
-                </button>
-              </div>
-            </div>
-          )}
-          <ErrorNote error={pay.error ?? devPay.error ?? (pay.isIdle ? (arrived?.payError ?? null) : null)} />
-        </section>
-      )}
+      {b.bill && <Bill b={b} onDone={refresh} devPay={(o) => devPay.mutate(o)} devBusy={devPay.isPending} devError={devPay.error} />}
 
-      {b.status === 'EXPIRED' && (
-        <section className="card note-card">
-          <p>{t('farm.expired')}</p>
-          {b.canRenew && (
-            <button type="button" className="btn btn-primary" disabled={renew.isPending} onClick={() => renew.mutate()}>
-              {t('farm.renew')}
-            </button>
-          )}
-          <ErrorNote error={renew.error} />
-        </section>
-      )}
-
-      {b.status === 'NEEDS_ATTENTION' && <p className="card note-card">{t('farm.attention')}</p>}
       {b.status === 'HOSPITALITY_REVIEW' && !thanks && b.hospitality.status !== 'ALTERNATIVE_PROPOSED' && <p className="card note-card">{t('farm.reviewing')}</p>}
-      {b.status === 'CANCELLED' && (
-        <p className="card note-card">
-          {b.refundStatus === 'REFUNDED'
-            ? t('farm.cancelledRefunded', { amount: rupees(b.money.refunded) })
-            : b.refundStatus === 'REFUND_PENDING'
-              ? t('farm.cancelledRefunding')
-              : t('farm.cancelledUnpaid')}
-        </p>
-      )}
+      {b.status === 'CANCELLED' && <p className="card note-card">{t('farm.cancelledUnpaid')}</p>}
       {b.status === 'NO_SHOW' && <p className="card note-card">{t('farm.noShowNote')}</p>}
 
       {b.hospitality.status === 'ALTERNATIVE_PROPOSED' && b.hospitality.alternative && (
@@ -229,8 +159,6 @@ function BookingView({ b }: { b: FarmBooking }) {
       {b.hospitality.status === 'CUSTOMER_DECLINED' && b.status !== 'CANCELLED' && <p className="card note-card">{t('farm.declinedNote')}</p>}
 
       {b.request && <p className="card note-card">{t(b.request.kind === 'CANCEL' ? 'farm.cancelRequested' : 'farm.moveRequested')}</p>}
-
-      <Extras b={b} onDone={refresh} devPay={(o) => devPay.mutate({ outcome: o, extra: true })} />
 
       {b.checkinCode && <CheckIn b={b} />}
 
@@ -263,18 +191,12 @@ function BookingView({ b }: { b: FarmBooking }) {
             <dt>{t('farm.mangoes')}</dt>
             <dd>{t('farm.kgAt', { kg: b.kg, price: rupees(b.pricePerKg) })}</dd>
           </div>
-          <div>
-            <dt>{t('farm.total')}</dt>
-            <dd>
-              <strong className="price">{rupees(b.total)}</strong>
-              {paid && ` · ${t('farm.paidAmount', { amount: rupees(b.money.paid) })}`}
-              {b.money.refunded > 0 && ` · ${t('farm.refundedAmount', { amount: rupees(b.money.refunded) })}`}
-            </dd>
-          </div>
-          {b.harvest.acceptedKg != null && (
+          {!b.bill && (
             <div>
-              <dt>{t('farm.weighed')}</dt>
-              <dd>{t('farm.kgOnly', { kg: b.harvest.acceptedKg })}</dd>
+              <dt>{t('farm.estimate')}</dt>
+              <dd>
+                <strong className="price">{rupees(b.total)}</strong> · {t('farm.payAfter')}
+              </dd>
             </div>
           )}
           <div>
@@ -397,49 +319,86 @@ function CheckIn({ b }: { b: FarmBooking }) {
   )
 }
 
-function Extras({ b, onDone, devPay }: { b: FarmBooking; onDone: () => void; devPay: (o: 'captured' | 'failed') => void }) {
+/** The bill after weighing: what was accepted, what it costs, and Pay (or that it is paid). */
+function Bill({
+  b,
+  onDone,
+  devPay,
+  devBusy,
+  devError,
+}: {
+  b: FarmBooking
+  onDone: () => void
+  devPay: (o: 'captured' | 'failed') => void
+  devBusy: boolean
+  devError: unknown
+}) {
   const t = useT()
-  const answer = useMutation({
-    mutationFn: async ({ x, accept }: { x: FarmExtra; accept: boolean }) => {
-      const r = await api.answerFarmExtra(b.id, x.id, accept)
-      if (accept && r.razorpayKeyId && r.razorpayOrderId && r.farmPaymentId) {
-        await openRazorpay({ orderId: b.id, key: r.razorpayKeyId, rzp: r.razorpayOrderId, total: r.amount ?? x.amount, number: b.number }, signedInPhone(), api.verifyFarmPayment)
+  const bill = b.bill!
+  const pay = useMutation({
+    mutationFn: async () => {
+      const r = await api.payFarm(b.id)
+      if (r.razorpayKeyId) {
+        await openRazorpay({ orderId: b.id, key: r.razorpayKeyId, rzp: r.razorpayOrderId, total: r.amount, number: b.number }, signedInPhone(), api.verifyFarmPayment)
       }
     },
     onSettled: onDone,
   })
-  const open = b.extras.filter((x) => x.status === 'REQUESTED' || x.status === 'PAYMENT_PENDING')
-  const paid = b.extras.filter((x) => x.status === 'PAID')
-  if (!open.length && !paid.length) return null
+  const due = b.payment?.status === 'DUE' ? b.payment : null
+  const paid = b.payment?.status === 'PAID' ? b.payment : null
   return (
-    <section className="card">
-      <h2>{t('farm.extraTitle')}</h2>
-      {open.map((x) => (
-        <div key={x.id} className="note-card">
-          <p>{t('farm.extraOffer', { kg: x.kg, price: rupees(x.pricePerKg), amount: rupees(x.amount) })}</p>
-          <div className="row">
-            <button type="button" className="btn btn-primary" disabled={answer.isPending} onClick={() => answer.mutate({ x, accept: true })}>
-              {t('farm.extraAccept', { amount: rupees(x.amount) })}
-            </button>
-            {x.status === 'REQUESTED' && (
-              <button type="button" className="btn" disabled={answer.isPending} onClick={() => answer.mutate({ x, accept: false })}>
-                {t('farm.extraDecline')}
-              </button>
-            )}
+    <section className={`card${b.canPay ? ' note-card' : ''}`} aria-live="polite">
+      <h2>{t('farm.billTitle')}</h2>
+      {b.canPay && <p>{t('farm.billDue')}</p>}
+      <dl className="facts">
+        <div>
+          <dt>{t('farm.weighed')}</dt>
+          <dd>{t('farm.kgOnly', { kg: bill.acceptedKg })}</dd>
+        </div>
+        <div>
+          <dt>{t('farm.mangoes')}</dt>
+          <dd>{t('farm.kgAt', { kg: bill.bookedPartKg, price: rupees(bill.pricePerKg) })}</dd>
+        </div>
+        {bill.extraKg > 0 && bill.extraPricePerKg != null && (
+          <div>
+            <dt>{t('farm.billExtra')}</dt>
+            <dd>{t('farm.kgAt', { kg: bill.extraKg, price: rupees(bill.extraPricePerKg) })}</dd>
           </div>
-          {import.meta.env.DEV && !b.razorpayKeyId && x.status === 'PAYMENT_PENDING' && (
-            <button type="button" className="btn" onClick={() => devPay('captured')}>
-              {t('order.devSucceeds')}
+        )}
+        <div>
+          <dt>{t('farm.billTotal')}</dt>
+          <dd>
+            <strong className="price">{rupees(bill.amount)}</strong>
+            {paid && ` · ${t('farm.paidOn', { when: when(paid.paidAt) })}`}
+            {b.money.refunded > 0 && ` · ${t('farm.refundedAmount', { amount: rupees(b.money.refunded) })}`}
+          </dd>
+        </div>
+      </dl>
+      {due?.failed && <p className="small">{t('farm.payFailed')}</p>}
+      {b.canPay && (
+        <>
+          {b.razorpayKeyId && (
+            <button type="button" className="btn btn-primary" disabled={pay.isPending} onClick={() => pay.mutate()}>
+              {t('farm.payBill', { amount: rupees(bill.amount) })}
             </button>
           )}
-        </div>
-      ))}
-      {paid.map((x) => (
-        <p key={x.id} className="small">
-          {t('farm.extraPaid', { kg: x.kg, amount: rupees(x.amount) })}
-        </p>
-      ))}
-      <ErrorNote error={answer.error} />
+          <p className="small muted">{t('farm.payAtFarm')}</p>
+          {import.meta.env.DEV && !b.razorpayKeyId && (
+            <div className="dev-pay">
+              <p className="small muted">{t('order.devPay')}</p>
+              <div className="row">
+                <button type="button" className="btn btn-primary" disabled={devBusy} onClick={() => devPay('captured')}>
+                  {t('order.devSucceeds')}
+                </button>
+                <button type="button" className="btn" disabled={devBusy} onClick={() => devPay('failed')}>
+                  {t('order.devFails')}
+                </button>
+              </div>
+            </div>
+          )}
+          <ErrorNote error={pay.error ?? devError} />
+        </>
+      )}
     </section>
   )
 }
@@ -533,18 +492,10 @@ function Changes({ b, onDone }: { b: FarmBooking; onDone: () => void }) {
           onConfirm={() => cancel.mutate()}
           onClose={() => setCancelling(false)}
         >
-          <p>
-            {b.canCancel === 'UNPAID'
-              ? t('farm.cancelUnpaid')
-              : b.canCancel === 'REFUND'
-                ? t('farm.cancelRefund', { amount: rupees(b.money.paid - b.money.refunded) })
-                : t('farm.cancelReview')}
-          </p>
-          {b.canCancel !== 'UNPAID' && (
-            <Field id="farm-cancel-reason" label={t('farm.reason')}>
-              <textarea rows={2} maxLength={1000} value={reason} onChange={(e) => setReason(e.target.value)} />
-            </Field>
-          )}
+          <p>{b.canCancel === 'CANCEL' ? t('farm.cancelUnpaid') : t('farm.cancelReview')}</p>
+          <Field id="farm-cancel-reason" label={t('farm.reason')}>
+            <textarea rows={2} maxLength={1000} value={reason} onChange={(e) => setReason(e.target.value)} />
+          </Field>
         </ConfirmDialog>
       )}
     </section>

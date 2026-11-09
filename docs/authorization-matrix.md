@@ -12,7 +12,7 @@ It is generated from the reviewed role snapshot (`mango-api/test/fixtures/role-p
 - **Audit.** Every successful change is written to `staff_audit` (who, route, target, body without secrets). The table is append-only.
   Views marked here record who looked at customer details. See [authorization.md](authorization.md).
 
-272 routes; 29 ask for step-up.
+271 routes; 28 ask for step-up.
 
 ## Your account
 
@@ -307,17 +307,16 @@ It is generated from the reviewed role snapshot (`mango-api/test/fixtures/role-p
 | `GET /farm/bookings` | ✓ | ✓ |  |  |  |  |  |
 | `GET /farm/bookings/:id` | ✓ | ✓ |  |  |  |  | Views (STAFF_AUDIT_TRAIL) |
 | `PATCH /farm/bookings/:id` | ✓ | ✓ |  |  |  |  | Each change |
-| `POST /farm/bookings/:id/cancel` | ✓ |  |  |  |  | Always: cancelling a paid farm booking with a refund | Each change |
-| `POST /farm/bookings/:id/extras` | ✓ | ✓ |  |  |  |  | Each change |
-| `POST /farm/bookings/:id/extras/:extraId/withdraw` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/bill` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/cancel` | ✓ |  |  |  |  |  | Each change |
 | `POST /farm/bookings/:id/harvest` | ✓ | ✓ |  |  |  |  | Each change |
 | `POST /farm/bookings/:id/hospitality` | ✓ | ✓ |  |  |  |  | Each change |
 | `POST /farm/bookings/:id/move` | ✓ |  |  |  |  |  | Each change |
 | `POST /farm/bookings/:id/no-show` | ✓ |  |  |  |  |  | Each change |
 | `POST /farm/bookings/:id/notes` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/record-payment` | ✓ |  |  |  |  | Always: recording a farm bill paid at the farm (UPI, card, cash, bank) | Each change |
 | `POST /farm/bookings/:id/request/decline` | ✓ |  |  |  |  |  | Each change |
 | `PUT /farm/bookings/:id/rooms` | ✓ | ✓ |  |  |  |  | Each change |
-| `POST /farm/bookings/:id/shortfall-refund` | ✓ |  |  |  |  | Always: refunding farm mangoes we could not supply | Each change |
 | `POST /farm/bookings/:id/status` | ✓ | ✓ |  |  |  |  | Each change |
 | `GET /farm/calendar` | ✓ | ✓ |  |  |  |  |  |
 | `POST /farm/check-in` | ✓ | ✓ |  |  |  |  | Each change |

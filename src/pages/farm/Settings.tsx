@@ -1,6 +1,6 @@
 // Farm Settings (docs/farm-experience.md): what customers read about the farm (name, place,
 // contact, the stay, meals, transport, policies, FAQs) and the booking rules (season, notice,
-// hold, cancel and move days). Nothing is made up: empty fields show "our team will confirm"
+// open bookings per customer, cancel and move days). Nothing is made up: empty fields show "our team will confirm"
 // in the shop. Bookings can be opened only when the list of what is missing is empty.
 // Saving asks the manager to confirm it is them (the policies are what customers agree to).
 import { useEffect, useId, useState } from 'react'
@@ -50,8 +50,12 @@ const SECTIONS: { title: string; fields: Text[] }[] = [
 const NUMBERS: { key: string; label: string; hint?: string }[] = [
   { key: 'leadDays', label: 'Days of notice before a visit', hint: 'The first bookable date is today plus this many days.' },
   { key: 'maxDaysAhead', label: 'Book up to this many days ahead' },
-  { key: 'holdMinutes', label: 'Minutes the mangoes are held while paying (5 to 60)' },
-  { key: 'cancelDays', label: 'Full refund when the customer cancels this many days or more before', hint: 'Closer to the visit, the request comes to a manager.' },
+  {
+    key: 'maxOpenBookings',
+    label: 'Upcoming visits one customer may book at a time (1 to 20)',
+    hint: 'Nothing is paid at booking (customers pay after picking), so this stops one customer holding a lot of fruit.',
+  },
+  { key: 'cancelDays', label: 'The customer may cancel at once this many days or more before', hint: 'Nothing is charged. Closer to the visit, the request comes to a manager.' },
   { key: 'rescheduleDays', label: 'The customer may move the date this many days or more before' },
   { key: 'stayNights', label: 'Usual nights of stay (0 for a day visit)' },
 ]

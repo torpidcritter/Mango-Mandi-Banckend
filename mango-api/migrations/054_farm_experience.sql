@@ -1,6 +1,6 @@
--- Farm Experience (docs/farm-experience.md): a customer buys 250 kg or more of
--- mangoes, pays in full online, and visits the farm to pick them, with a stay
--- and meals arranged by MandiMangoes. Bookings have their own tables, as Book
+-- Farm Experience (docs/farm-experience.md): a customer books 250 kg or more of
+-- mangoes, visits the farm to pick them, with a stay and meals arranged by
+-- MandiMangoes, and pays after picking for the kilograms weighed and accepted. Bookings have their own tables, as Book
 -- ahead and gift orders do: farm fruit is picked off the trees, so it never
 -- becomes warehouse boxes or a delivery order.
 --
@@ -107,6 +107,7 @@ CREATE TABLE farm_bookings (
   variety_name         TEXT NOT NULL,
   kg                   INTEGER NOT NULL CHECK (kg >= 250),
   price_per_kg         INTEGER NOT NULL CHECK (price_per_kg > 0),
+  -- The estimate at booking (kg x price per kg). What is paid is the bill, made after weighing.
   total                INTEGER NOT NULL CHECK (total > 0),
   pricing              JSONB NOT NULL DEFAULT '{}'::jsonb,
   visit_date           DATE NOT NULL,
@@ -128,11 +129,14 @@ CREATE TABLE farm_bookings (
   billing_name         TEXT CHECK (billing_name IS NULL OR length(billing_name) <= 120),
   billing_gstin        TEXT CHECK (billing_gstin IS NULL OR billing_gstin ~ '^[0-9]{2}[A-Z0-9]{13}$'),
   status               TEXT NOT NULL CHECK (status IN (
-                         'PAYMENT_PENDING', 'EXPIRED', 'NEEDS_ATTENTION', 'HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING',
-                         'READY_FOR_VISIT', 'CHECKED_IN', 'HARVESTING', 'WEIGHING', 'PACKING', 'COMPLETED', 'CANCELLED', 'NO_SHOW')),
+                         'HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT', 'CHECKED_IN', 'HARVESTING', 'WEIGHING',
+                         'PAYMENT_DUE', 'PACKING', 'COMPLETED', 'CANCELLED', 'NO_SHOW')),
   -- Whether this booking holds its kilograms in farm_harvest right now.
   kg_reserved          BOOLEAN NOT NULL DEFAULT FALSE,
-  hold_expires_at      TIMESTAMPTZ,
+  -- The bill, made after weighing: { acceptedKg, bookedKg, pricePerKg, bookedPartKg, extraKg, extraPricePerKg, amount }.
+  bill                 JSONB,
+  bill_amount          INTEGER CHECK (bill_amount IS NULL OR bill_amount > 0),
+  billed_at            TIMESTAMPTZ,
   paid_at              TIMESTAMPTZ,
   hospitality_status   TEXT NOT NULL DEFAULT 'PENDING' CHECK (hospitality_status IN (
                          'PENDING', 'APPROVED', 'ALTERNATIVE_PROPOSED', 'CUSTOMER_ACCEPTED', 'CUSTOMER_DECLINED')),
@@ -159,7 +163,6 @@ CREATE TABLE farm_bookings (
   cancel_reason        TEXT,
   cancelled_at         TIMESTAMPTZ,
   completed_at         TIMESTAMPTZ,
-  attention_reason     TEXT,
   version              INTEGER NOT NULL DEFAULT 1,
   created_at           TIMESTAMPTZ NOT NULL,
   updated_at           TIMESTAMPTZ NOT NULL,
@@ -168,54 +171,40 @@ CREATE TABLE farm_bookings (
 CREATE INDEX farm_bookings_customer_idx ON farm_bookings (customer_id, created_at DESC);
 CREATE INDEX farm_bookings_visit_idx ON farm_bookings (visit_date, status);
 CREATE INDEX farm_bookings_status_idx ON farm_bookings (status, created_at DESC);
-CREATE INDEX farm_bookings_holds_idx ON farm_bookings (hold_expires_at) WHERE status = 'PAYMENT_PENDING';
 
--- Every payment for a booking: the first (the whole mango order) and any
--- extra kilograms picked on the day. Each has its own Razorpay order.
+-- Payments for a booking's bill: online (each try is its own Razorpay order), or
+-- recorded by a manager when the customer paid the farm another way.
 CREATE TABLE farm_booking_payments (
   id                   TEXT PRIMARY KEY,
   booking_id           TEXT NOT NULL REFERENCES farm_bookings (id),
-  kind                 TEXT NOT NULL CHECK (kind IN ('BOOKING', 'EXTRA')),
-  extra_id             TEXT,
+  kind                 TEXT NOT NULL CHECK (kind IN ('ONLINE', 'RECORDED')),
   amount               INTEGER NOT NULL CHECK (amount > 0),
   razorpay_order_id    TEXT UNIQUE,
   status               TEXT NOT NULL CHECK (status IN ('INITIATED', 'SUCCEEDED', 'FAILED', 'CANCELLED')),
   payment_id           TEXT UNIQUE,
   payment_method       TEXT,
+  -- RECORDED only: the receipt or UPI reference, and the manager who recorded it.
+  reference            TEXT CHECK (reference IS NULL OR length(reference) <= 100),
+  recorded_by          TEXT,
   last_failure         TEXT,
   reconcile_checked_at TIMESTAMPTZ,
   created_at           TIMESTAMPTZ NOT NULL,
-  paid_at              TIMESTAMPTZ
+  paid_at              TIMESTAMPTZ,
+  CHECK (kind = 'ONLINE' OR (status = 'SUCCEEDED' AND reference IS NOT NULL AND recorded_by IS NOT NULL))
 );
 CREATE INDEX farm_booking_payments_booking_idx ON farm_booking_payments (booking_id, created_at);
 CREATE INDEX farm_booking_payments_pending_idx ON farm_booking_payments (created_at) WHERE status = 'INITIATED';
 
--- Extra kilograms picked beyond what was paid: staff ask, the customer agrees and pays.
-CREATE TABLE farm_booking_extras (
-  id            TEXT PRIMARY KEY,
-  booking_id    TEXT NOT NULL REFERENCES farm_bookings (id),
-  kg            NUMERIC(10, 2) NOT NULL CHECK (kg > 0),
-  price_per_kg  INTEGER NOT NULL CHECK (price_per_kg > 0),
-  amount        INTEGER NOT NULL CHECK (amount > 0),
-  status        TEXT NOT NULL CHECK (status IN ('REQUESTED', 'PAYMENT_PENDING', 'PAID', 'DECLINED', 'WITHDRAWN')),
-  note          TEXT CHECK (note IS NULL OR length(note) <= 500),
-  requested_by  TEXT NOT NULL,
-  created_at    TIMESTAMPTZ NOT NULL,
-  decided_at    TIMESTAMPTZ,
-  paid_at       TIMESTAMPTZ
-);
-CREATE INDEX farm_booking_extras_booking_idx ON farm_booking_extras (booking_id, created_at);
-ALTER TABLE farm_booking_payments ADD CONSTRAINT farm_booking_payments_extra_fk FOREIGN KEY (extra_id) REFERENCES farm_booking_extras (id);
-
--- Refunds, one row per payment refunded (or part of one: a harvest shortfall).
--- Sent and retried like order refunds: a lease, back-off, a cap on attempts.
+-- Refunds: only money taken twice for one bill (paid online after a manager
+-- recorded a payment, or a second online payment). Sent and retried like order
+-- refunds: a lease, back-off, a cap on attempts.
 CREATE TABLE farm_refunds (
   id                     TEXT PRIMARY KEY,
   booking_id             TEXT NOT NULL REFERENCES farm_bookings (id),
   farm_payment_id        TEXT NOT NULL REFERENCES farm_booking_payments (id),
   payment_id             TEXT NOT NULL,
   amount                 INTEGER NOT NULL CHECK (amount > 0),
-  kind                   TEXT NOT NULL CHECK (kind IN ('CANCELLED', 'SHORTFALL', 'NOT_HOSTED', 'LATE_PAYMENT')),
+  kind                   TEXT NOT NULL CHECK (kind IN ('OVERPAID')),
   reason                 TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 1000),
   requested_by           TEXT NOT NULL,
   requested_at           TIMESTAMPTZ NOT NULL,

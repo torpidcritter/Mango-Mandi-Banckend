@@ -111,8 +111,8 @@ const ISOLATION_CASES = [
   'GET /v1/me/subscriptions/:id', 'POST /v1/me/subscriptions/:id/pause', 'POST /v1/me/subscriptions/:id/resume', 'POST /v1/me/subscriptions/:id/cancel',
   'POST /v1/me/subscriptions/:id/skip', 'POST /v1/me/subscriptions/:id/cycles/:cycleId/pay', 'POST /v1/me/subscriptions',
   // Farm Experience (FARM_EXPERIENCE, docs/farm-experience.md): switched on for the cases below.
-  'GET /v1/farm-bookings/:id', 'GET /v1/farm-bookings/:id/qr.svg', 'POST /v1/farm-bookings/:id/verify-payment', 'POST /v1/farm-bookings/:id/renew',
-  'POST /v1/farm-bookings/:id/cancel', 'POST /v1/farm-bookings/:id/reschedule', 'POST /v1/farm-bookings/:id/hospitality', 'POST /v1/farm-bookings/:id/extras/:extraId',
+  'GET /v1/farm-bookings/:id', 'GET /v1/farm-bookings/:id/qr.svg', 'POST /v1/farm-bookings/:id/pay', 'POST /v1/farm-bookings/:id/verify-payment',
+  'POST /v1/farm-bookings/:id/cancel', 'POST /v1/farm-bookings/:id/reschedule', 'POST /v1/farm-bookings/:id/hospitality',
 ]
 const EXEMPT = ['DELETE /v1/cart/items/:sku', 'DELETE /v1/cart/bulk/:listingId', 'PUT /v1/me/favourites/:sku', 'DELETE /v1/me/favourites/:sku']
 
@@ -206,7 +206,7 @@ async function deliveredWithPhoto(cust, body = {}) {
   return { ...o, photoId: pic.body.id }
 }
 
-/** A ready farm (one variety, an open day 10 days out, a room, settings filled) and a paid booking for `cust`. */
+/** A ready farm (one variety, an open day 10 days out, a room, settings filled) and a booking for `cust` (paid for after picking, so nothing paid yet). */
 async function farmBookingFor(cust) {
   const as = { token: manager }
   const day = addDays(todayIST(), 10)
@@ -228,8 +228,7 @@ async function farmBookingFor(cust) {
   const body = { varietyId: v.body.id, kg: 250, visitDate: day, adults: 2, children: 0, overnightGuests: 0, contactName: 'Asha', acceptPolicies: true }
   const b = await api.post('/v1/farm-bookings', body, { token: cust.accessToken, headers: { 'Idempotency-Key': newId('k') } })
   assert.equal(b.status, 201, JSON.stringify(b.body))
-  assert.equal((await api.post('/v1/dev/pay-farm', { bookingId: b.body.bookingId, outcome: 'captured' })).body.result, 'confirmed')
-  return { id: b.body.bookingId, number: b.body.number, rzp: b.body.razorpayOrderId }
+  return { id: b.body.bookingId, number: b.body.number, rzp: 'order_dev_farm_test' }
 }
 
 describe('customer to customer', () => {
@@ -280,7 +279,7 @@ describe('customer to customer', () => {
     const sub = await api.post('/v1/me/subscriptions', subBody, A)
     assert.equal(sub.status, 201, JSON.stringify(sub.body))
     const cycle = sub.body.cycles[0].id
-    // A paid Farm Experience booking (FARM_EXPERIENCE): a ready farm, then A books and pays.
+    // A Farm Experience booking (FARM_EXPERIENCE): a ready farm, then A books.
     const farmFlags = { FARM_EXPERIENCE: env.FARM_EXPERIENCE, STAFF_STEP_UP: env.STAFF_STEP_UP }
     Object.assign(env, { FARM_EXPERIENCE: true, STAFF_STEP_UP: false })
     t.after(() => Object.assign(env, farmFlags))
@@ -356,11 +355,10 @@ describe('customer to customer', () => {
       ['GET /v1/farm-bookings/:id/qr.svg', () => api.get(`/v1/farm-bookings/${farmBooking.id}/qr.svg`, B), () => api.get('/v1/farm-bookings/fbk_none/qr.svg', B)],
       ['POST /v1/farm-bookings/:id/verify-payment', () => api.post(`/v1/farm-bookings/${farmBooking.id}/verify-payment`, { razorpay_payment_id: 'pay_b', razorpay_order_id: farmBooking.rzp, razorpay_signature: sig(farmBooking.rzp, 'pay_b') }, B),
         () => api.post('/v1/farm-bookings/fbk_none/verify-payment', { razorpay_payment_id: 'pay_b', razorpay_order_id: farmBooking.rzp, razorpay_signature: sig(farmBooking.rzp, 'pay_b') }, B)],
-      ['POST /v1/farm-bookings/:id/renew', () => api.post(`/v1/farm-bookings/${farmBooking.id}/renew`, {}, B), () => api.post('/v1/farm-bookings/fbk_none/renew', {}, B)],
+      ['POST /v1/farm-bookings/:id/pay', () => api.post(`/v1/farm-bookings/${farmBooking.id}/pay`, {}, B), () => api.post('/v1/farm-bookings/fbk_none/pay', {}, B)],
       ['POST /v1/farm-bookings/:id/cancel', () => api.post(`/v1/farm-bookings/${farmBooking.id}/cancel`, {}, B), () => api.post('/v1/farm-bookings/fbk_none/cancel', {}, B)],
       ['POST /v1/farm-bookings/:id/reschedule', () => api.post(`/v1/farm-bookings/${farmBooking.id}/reschedule`, { date: farmDay }, B), () => api.post('/v1/farm-bookings/fbk_none/reschedule', { date: farmDay }, B)],
       ['POST /v1/farm-bookings/:id/hospitality', () => api.post(`/v1/farm-bookings/${farmBooking.id}/hospitality`, { accept: true }, B), () => api.post('/v1/farm-bookings/fbk_none/hospitality', { accept: true }, B)],
-      ['POST /v1/farm-bookings/:id/extras/:extraId', () => api.post(`/v1/farm-bookings/${farmBooking.id}/extras/fbx_none`, { accept: true }, B), () => api.post('/v1/farm-bookings/fbk_none/extras/fbx_none', { accept: true }, B)],
     ]
     assert.deepEqual([...new Set(cases.map(([r]) => r))].sort(), [...ISOLATION_CASES].sort(), 'a case for every isolation route')
     for (const [route, theirs, none] of cases) {

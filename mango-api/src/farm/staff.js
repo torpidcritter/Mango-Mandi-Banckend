@@ -1,15 +1,15 @@
 // Farm Experience lists, calendar and reports for staff (docs/farm-experience.md).
-// Every figure is read from paid, recorded data: payments Razorpay confirmed,
-// refunds made and weights staff recorded, never from what a page sent.
+// Every figure is read from recorded data: bills made from the weights staff
+// recorded, payments Razorpay confirmed or a manager recorded, never from what a page sent.
 import { addDays, todayIST } from '../clock.js'
 import { csvCell } from '../warehouse/reports.js'
 import { listRow } from './bookings.js'
-import { FINAL, ON_SITE, PAID_OPEN, STATUSES } from './rules.js'
+import { BEFORE_VISIT, FINAL, ON_SITE, STATUSES } from './rules.js'
 
 export const SORTS = { created: 'b.created_at', visit: 'b.visit_date', kg: 'b.kg', guests: '(b.adults + b.children)', total: 'b.total', number: 'b.number' }
 
-/** Bookings that need someone: paid and waiting on a manager, a stay to arrange, a customer request, or an answer to a proposal. */
-export const NEEDS_ACTION = `(b.status IN ('NEEDS_ATTENTION', 'HOSPITALITY_REVIEW') OR b.request_kind IS NOT NULL
+/** Bookings that need someone: a stay to arrange, a customer request, or a refund of money taken twice that needs a manager. */
+export const NEEDS_ACTION = `(b.status = 'HOSPITALITY_REVIEW' OR b.request_kind IS NOT NULL
   OR EXISTS (SELECT 1 FROM farm_refunds r WHERE r.booking_id = b.id AND r.refund_gave_up_at IS NOT NULL AND r.refunded_at IS NULL))`
 
 export async function listBookings(c, f) {
@@ -30,7 +30,7 @@ export async function listBookings(c, f) {
   if (f.createdFrom) where.push(`b.created_at >= ${arg(f.createdFrom)}::date`)
   if (f.createdTo) where.push(`b.created_at < (${arg(f.createdTo)}::date + 1)`)
   if (f.payment === 'PAID') where.push(`b.paid_at IS NOT NULL`)
-  if (f.payment === 'UNPAID') where.push(`b.paid_at IS NULL`)
+  if (f.payment === 'DUE') where.push(`b.status = 'PAYMENT_DUE'`)
   if (f.payment === 'REFUNDED') where.push(`EXISTS (SELECT 1 FROM farm_refunds r WHERE r.booking_id = b.id)`)
   if (f.minKg != null) where.push(`b.kg >= ${arg(f.minKg)}`)
   if (f.maxKg != null) where.push(`b.kg <= ${arg(f.maxKg)}`)
@@ -42,10 +42,10 @@ export async function listBookings(c, f) {
   const total = (await c.query(`SELECT COUNT(*)::int AS n FROM farm_bookings b ${w}`, args)).rows[0].n
   const order = `${SORTS[f.sort] ?? SORTS.created} ${f.dir === 'asc' ? 'ASC' : 'DESC'}, b.id`
   const { rows } = await c.query(
-    `SELECT b.*, p.status AS payment_status, p.payment_id,
+    `SELECT b.*, (SELECT COALESCE(p.payment_id, p.reference) FROM farm_booking_payments p WHERE p.booking_id = b.id AND p.status = 'SUCCEEDED' ORDER BY p.paid_at LIMIT 1) AS payment_id,
             (SELECT CASE WHEN COUNT(*) = 0 THEN NULL WHEN COUNT(*) FILTER (WHERE r.refunded_at IS NULL) > 0 THEN 'REFUND_PENDING' ELSE 'REFUNDED' END
                FROM farm_refunds r WHERE r.booking_id = b.id) AS refund_state
-       FROM farm_bookings b LEFT JOIN farm_booking_payments p ON p.booking_id = b.id AND p.kind = 'BOOKING'
+       FROM farm_bookings b
        ${w} ORDER BY ${order} LIMIT ${arg(f.pageSize)} OFFSET ${arg((f.page - 1) * f.pageSize)}`,
     args,
   )
@@ -61,7 +61,7 @@ export async function overview(c, today = todayIST()) {
     c.query(
       `SELECT visit_date, COUNT(*)::int AS bookings, SUM(adults + children)::int AS guests, SUM(overnight_guests)::int AS overnight, SUM(kg)::int AS kg
          FROM farm_bookings WHERE visit_date BETWEEN $1 AND $2 AND status = ANY($3) GROUP BY visit_date ORDER BY visit_date`,
-      [today, addDays(today, 13), [...PAID_OPEN, ...ON_SITE]],
+      [today, addDays(today, 13), [...BEFORE_VISIT, ...ON_SITE]],
     ),
     c.query(`SELECT COUNT(*)::int AS n FROM farm_refunds WHERE refunded_at IS NULL`),
   ])
@@ -79,20 +79,20 @@ export async function calendar(c, from, to) {
     c.query(
       `SELECT id, number, status, visit_date, arrival_date, departure_date, variety_name, kg, adults, children, overnight_guests, hospitality_status, over_capacity, contact_name
          FROM farm_bookings WHERE departure_date >= $1 AND arrival_date <= $2 AND NOT (status = ANY($3)) ORDER BY visit_date, created_at`,
-      [from, to, ['CANCELLED', 'EXPIRED']],
+      [from, to, ['CANCELLED']],
     ),
     c.query('SELECT COALESCE(SUM(sleeps + extra_beds), 0)::int AS beds, COUNT(*)::int AS rooms FROM farm_rooms WHERE active AND NOT maintenance'),
     c.query(
       `SELECT a.room_id, a.from_date, a.to_date, a.guests, fb.number FROM farm_room_allocations a JOIN farm_bookings fb ON fb.id = a.booking_id
         WHERE a.to_date > $1 AND a.from_date <= $2 AND NOT (fb.status = ANY($3))`,
-      [from, to, ['CANCELLED', 'NO_SHOW', 'EXPIRED']],
+      [from, to, ['CANCELLED', 'NO_SHOW']],
     ),
   ])
   const out = []
   for (let d = from; d <= to; d = addDays(d, 1)) {
     const day = days.rows.find((x) => x.day === d)
-    const visits = bookings.rows.filter((b) => b.visit_date === d && !['PAYMENT_PENDING', 'NO_SHOW'].includes(b.status))
-    const staying = bookings.rows.filter((b) => b.arrival_date <= d && d < b.departure_date && !['PAYMENT_PENDING', 'NO_SHOW'].includes(b.status) && !FINAL.includes(b.status))
+    const visits = bookings.rows.filter((b) => b.visit_date === d && b.status !== 'NO_SHOW')
+    const staying = bookings.rows.filter((b) => b.arrival_date <= d && d < b.departure_date && !FINAL.includes(b.status))
     const used = roomUse.rows.filter((a) => a.from_date <= d && d < a.to_date)
     out.push({
       date: d,
@@ -102,7 +102,6 @@ export async function calendar(c, from, to) {
         availableKg: Math.max(h.bookable_kg - h.reserved_kg, 0), readiness: h.readiness, qcStatus: h.qc_status, note: h.note,
       })),
       visits: visits.map((b) => ({ id: b.id, number: b.number, status: b.status, name: b.contact_name, variety: b.variety_name, kg: b.kg, guests: b.adults + b.children, hospitalityStatus: b.hospitality_status, overCapacity: b.over_capacity })),
-      pendingHolds: bookings.rows.filter((b) => b.visit_date === d && b.status === 'PAYMENT_PENDING').length,
       overnightGuests: staying.reduce((s, b) => s + b.overnight_guests, 0),
       roomsInUse: used.length,
       // Two bookings sharing a room on a night (should not happen: allocateRooms refuses it), shown if ever found.
@@ -113,33 +112,35 @@ export async function calendar(c, from, to) {
 }
 
 /**
- * The report: paid bookings only (paid_at set) in the range of visit dates,
- * optionally one variety. Conversion counts every booking started in the range.
+ * The report for a range of visit dates (optionally one variety): every booking
+ * in it, what was weighed, and revenue from bills paid. Conversion: bookings
+ * made in the range whose bill was paid.
  */
 export async function report(c, { from, to, varietyId = null }) {
   const args = [from, to, varietyId]
   const v = `($3::text IS NULL OR b.variety_id = $3)`
-  const [paid, started, byVariety, extras, refunds, rooms, days] = await Promise.all([
+  const extraPart = `COALESCE((b.bill->>'extraKg')::numeric * (b.bill->>'extraPricePerKg')::numeric, 0)`
+  const [all, started, byVariety, refunds, rooms, days] = await Promise.all([
     c.query(
-      `SELECT COUNT(*)::int AS bookings, COALESCE(SUM(b.kg), 0)::int AS kg, COALESCE(SUM(b.total), 0)::bigint AS revenue,
-              COALESCE(SUM(b.adults + b.children) FILTER (WHERE b.status IN ('CHECKED_IN','HARVESTING','WEIGHING','PACKING','COMPLETED')), 0)::int AS guests_hosted,
-              COALESCE(AVG(b.adults + b.children), 0)::float AS avg_group, COALESCE(AVG(b.kg), 0)::float AS avg_kg,
-              COALESCE(SUM(b.accepted_kg), 0)::float AS harvested_kg,
+      `SELECT COUNT(*) FILTER (WHERE b.status <> 'CANCELLED')::int AS bookings, COALESCE(SUM(b.kg) FILTER (WHERE b.status <> 'CANCELLED'), 0)::int AS kg,
+              COALESCE(SUM(b.bill_amount) FILTER (WHERE b.paid_at IS NOT NULL), 0)::bigint AS revenue,
+              COUNT(*) FILTER (WHERE b.paid_at IS NOT NULL)::int AS paid,
+              COALESCE(SUM(b.adults + b.children) FILTER (WHERE b.status = ANY($4)), 0)::int AS guests_hosted,
+              COALESCE(AVG(b.adults + b.children) FILTER (WHERE b.status <> 'CANCELLED'), 0)::float AS avg_group,
+              COALESCE(AVG(b.kg) FILTER (WHERE b.status <> 'CANCELLED'), 0)::float AS avg_kg,
+              COALESCE(SUM(b.accepted_kg) FILTER (WHERE b.bill IS NOT NULL), 0)::float AS harvested_kg,
+              COALESCE(SUM(${extraPart}) FILTER (WHERE b.paid_at IS NOT NULL), 0)::float AS extra_revenue,
+              COALESCE(SUM((b.bill->>'extraKg')::numeric) FILTER (WHERE b.paid_at IS NOT NULL), 0)::float AS extra_kg,
               COUNT(*) FILTER (WHERE b.status = 'CANCELLED')::int AS cancelled, COUNT(*) FILTER (WHERE b.status = 'NO_SHOW')::int AS no_shows,
-              COUNT(*) FILTER (WHERE b.status = 'COMPLETED')::int AS completed,
+              COUNT(*) FILTER (WHERE b.status = 'COMPLETED')::int AS completed, COUNT(*)::int AS made,
               COALESCE(SUM(b.overnight_guests * GREATEST(b.departure_date - b.arrival_date, 0)) FILTER (WHERE b.status NOT IN ('CANCELLED','NO_SHOW')), 0)::int AS guest_nights
-         FROM farm_bookings b WHERE b.paid_at IS NOT NULL AND b.visit_date BETWEEN $1 AND $2 AND ${v}`,
-      args,
+         FROM farm_bookings b WHERE b.visit_date BETWEEN $1 AND $2 AND ${v}`,
+      [...args, ON_SITE],
     ),
     c.query(`SELECT COUNT(*)::int AS n, COUNT(*) FILTER (WHERE b.paid_at IS NOT NULL)::int AS paid FROM farm_bookings b WHERE b.created_at >= $1::date AND b.created_at < ($2::date + 1) AND ${v}`, args),
     c.query(
-      `SELECT b.variety_name AS name, COUNT(*)::int AS bookings, SUM(b.kg)::int AS kg, SUM(b.total)::bigint AS revenue
-         FROM farm_bookings b WHERE b.paid_at IS NOT NULL AND b.visit_date BETWEEN $1 AND $2 AND ${v} GROUP BY b.variety_name ORDER BY SUM(b.kg) DESC`,
-      args,
-    ),
-    c.query(
-      `SELECT COALESCE(SUM(p.amount), 0)::bigint AS revenue, COALESCE(SUM(x.kg), 0)::float AS kg FROM farm_booking_payments p JOIN farm_bookings b ON b.id = p.booking_id
-         JOIN farm_booking_extras x ON x.id = p.extra_id WHERE p.kind = 'EXTRA' AND p.status = 'SUCCEEDED' AND b.visit_date BETWEEN $1 AND $2 AND ${v}`,
+      `SELECT b.variety_name AS name, COUNT(*)::int AS bookings, SUM(COALESCE(b.accepted_kg, b.kg))::float AS kg, COALESCE(SUM(b.bill_amount) FILTER (WHERE b.paid_at IS NOT NULL), 0)::bigint AS revenue
+         FROM farm_bookings b WHERE b.status <> 'CANCELLED' AND b.visit_date BETWEEN $1 AND $2 AND ${v} GROUP BY b.variety_name ORDER BY SUM(b.kg) DESC`,
       args,
     ),
     c.query(
@@ -149,7 +150,7 @@ export async function report(c, { from, to, varietyId = null }) {
     ),
     c.query(
       `SELECT COALESCE(SUM(LEAST(a.to_date, $2::date + 1) - GREATEST(a.from_date, $1::date)), 0)::int AS room_nights FROM farm_room_allocations a
-         JOIN farm_bookings b ON b.id = a.booking_id WHERE a.to_date > $1 AND a.from_date <= $2 AND b.status NOT IN ('CANCELLED','NO_SHOW','EXPIRED') AND ${v}`,
+         JOIN farm_bookings b ON b.id = a.booking_id WHERE a.to_date > $1 AND a.from_date <= $2 AND b.status NOT IN ('CANCELLED','NO_SHOW') AND ${v}`,
       args,
     ),
     c.query(
@@ -159,21 +160,20 @@ export async function report(c, { from, to, varietyId = null }) {
       [from, to],
     ),
   ])
-  const p = paid.rows[0]
+  const p = all.rows[0]
   const d = days.rows[0]
   const roomCapacity = d.rooms * d.open_days
-  const visitsOnCapped = p.bookings
   return {
     from, to, varietyId,
-    bookings: p.bookings, kgBooked: p.kg, kgHarvested: Number(p.harvested_kg), revenue: Number(p.revenue), avgKg: Math.round(p.avg_kg),
+    bookings: p.bookings, kgBooked: p.kg, kgHarvested: Number(p.harvested_kg), revenue: Number(p.revenue), paidBookings: p.paid, avgKg: Math.round(p.avg_kg),
     guestsHosted: p.guests_hosted, avgGroup: Math.round(p.avg_group * 10) / 10, completed: p.completed, cancelled: p.cancelled, noShows: p.no_shows,
-    cancellationRate: p.bookings ? p.cancelled / p.bookings : 0,
+    cancellationRate: p.made ? p.cancelled / p.made : 0,
     conversion: { started: started.rows[0].n, paid: started.rows[0].paid, rate: started.rows[0].n ? started.rows[0].paid / started.rows[0].n : 0 },
     refunds: { count: refunds.rows[0].n, value: Number(refunds.rows[0].value) },
-    extras: { revenue: Number(extras.rows[0].revenue), kg: Number(extras.rows[0].kg) },
-    varieties: byVariety.rows.map((r) => ({ name: r.name, bookings: r.bookings, kg: r.kg, revenue: Number(r.revenue) })),
+    extras: { revenue: Math.round(Number(p.extra_revenue)), kg: Number(p.extra_kg) },
+    varieties: byVariety.rows.map((r) => ({ name: r.name, bookings: r.bookings, kg: Number(r.kg), revenue: Number(r.revenue) })),
     utilisation: {
-      openDays: d.open_days, visitSlots: d.visit_slots, visitRate: d.capped_days && d.visit_slots ? Math.min(visitsOnCapped / d.visit_slots, 1) : null,
+      openDays: d.open_days, visitSlots: d.visit_slots, visitRate: d.capped_days && d.visit_slots ? Math.min(p.bookings / d.visit_slots, 1) : null,
       roomNights: rooms.rows[0].room_nights, roomNightsAvailable: roomCapacity, roomRate: roomCapacity ? rooms.rows[0].room_nights / roomCapacity : null,
       guestNights: p.guest_nights,
     },
@@ -181,13 +181,15 @@ export async function report(c, { from, to, varietyId = null }) {
 }
 
 export const CSV_COLUMNS = ['number', 'status', 'created_at', 'visit_date', 'arrival_date', 'departure_date', 'customer', 'phone', 'email', 'variety', 'kg', 'price_per_kg_rupees',
-  'total_rupees', 'paid_at', 'payment_id', 'adults', 'children', 'overnight', 'hospitality', 'harvested_kg', 'accepted_kg', 'packing', 'refunded_rupees']
+  'estimate_rupees', 'harvested_kg', 'accepted_kg', 'bill_rupees', 'paid_at', 'payment', 'adults', 'children', 'overnight', 'hospitality', 'packing', 'refunded_rupees']
 
 /** The bookings in a range of visit dates as CSV (formula-safe cells). Managers only. */
 export async function bookingsCsv(c, { from, to, varietyId = null }) {
   const { rows } = await c.query(
-    `SELECT b.*, p.payment_id, (SELECT COALESCE(SUM(r.amount), 0) FROM farm_refunds r WHERE r.booking_id = b.id)::int AS refunded
-       FROM farm_bookings b LEFT JOIN farm_booking_payments p ON p.booking_id = b.id AND p.kind = 'BOOKING'
+    `SELECT b.*, (SELECT COALESCE(p.payment_id, p.payment_method || ' ' || p.reference) FROM farm_booking_payments p
+                   WHERE p.booking_id = b.id AND p.status = 'SUCCEEDED' ORDER BY p.paid_at LIMIT 1) AS payment_id,
+            (SELECT COALESCE(SUM(r.amount), 0) FROM farm_refunds r WHERE r.booking_id = b.id)::int AS refunded
+       FROM farm_bookings b
       WHERE b.visit_date BETWEEN $1 AND $2 AND ($3::text IS NULL OR b.variety_id = $3) ORDER BY b.visit_date, b.created_at LIMIT 5000`,
     [from, to, varietyId],
   )
@@ -195,8 +197,8 @@ export async function bookingsCsv(c, { from, to, varietyId = null }) {
   for (const b of rows) {
     lines.push([
       b.number, b.status, b.created_at.toISOString(), b.visit_date, b.arrival_date, b.departure_date, b.contact_name, b.contact_phone, b.contact_email ?? '',
-      b.variety_name, b.kg, b.price_per_kg / 100, b.total / 100, b.paid_at?.toISOString() ?? '', b.payment_id ?? '', b.adults, b.children, b.overnight_guests,
-      b.hospitality_status, b.harvested_kg ?? '', b.accepted_kg ?? '', b.packing_status, b.refunded / 100,
+      b.variety_name, b.kg, b.price_per_kg / 100, b.total / 100, b.harvested_kg ?? '', b.accepted_kg ?? '', b.bill_amount == null ? '' : b.bill_amount / 100,
+      b.paid_at?.toISOString() ?? '', b.payment_id ?? '', b.adults, b.children, b.overnight_guests, b.hospitality_status, b.packing_status, b.refunded / 100,
     ].map(csvCell).join(','))
   }
   return `${lines.join('\r\n')}\r\n`

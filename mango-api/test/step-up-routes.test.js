@@ -78,7 +78,7 @@ async function batchWithPurchase() {
   return { batchId: b.body.id, body }
 }
 
-/** Farm Experience (docs/farm-experience.md): a farm ready for bookings, and a paid booking on it. */
+/** Farm Experience (docs/farm-experience.md): a farm ready for bookings, and bookings billed or paid on it. */
 async function farmReady() {
   env.FARM_EXPERIENCE = true
   const as = { token: manager }
@@ -97,14 +97,22 @@ async function farmReady() {
   assert.equal((await api.put('/admin/v1/farm/settings', { settings, version: cur.body.version, confirmCode: CONFIRM }, as)).status, 200)
   return { varietyId: v.body.id, day }
 }
-async function paidFarmBooking() {
+/** A booking weighed and billed (customers pay after picking): its bill is due. */
+async function billedFarmBooking() {
   const { varietyId, day } = await farmReady()
   const cust = await customerToken(api)
   const body = { varietyId, kg: 300, visitDate: day, adults: 2, children: 0, overnightGuests: 0, contactName: 'Asha', acceptPolicies: true }
   const b = await api.post('/v1/farm-bookings', body, { token: cust.accessToken, headers: { 'Idempotency-Key': newId('k') } })
   assert.equal(b.status, 201, JSON.stringify(b.body))
-  assert.equal((await api.post('/v1/dev/pay-farm', { bookingId: b.body.bookingId, outcome: 'captured' })).body.result, 'confirmed')
+  await query(`UPDATE farm_bookings SET status = 'WEIGHING', harvested_kg = 300, accepted_kg = 300 WHERE id = $1`, [b.body.bookingId])
+  const bill = await api.post(`/admin/v1/farm/bookings/${b.body.bookingId}/bill`, {}, { token: manager })
+  assert.equal(bill.status, 200, JSON.stringify(bill.body))
   return b.body.bookingId
+}
+async function paidFarmBooking() {
+  const id = await billedFarmBooking()
+  assert.equal((await api.post('/v1/dev/pay-farm', { bookingId: id, outcome: 'captured' })).body.result, 'paid')
+  return id
 }
 
 const BULK = {
@@ -219,14 +227,9 @@ const SCENARIOS = {
     const cur = (await api.get('/admin/v1/farm/settings', { token: manager })).body
     return { path: '/farm/settings', method: 'PUT', body: { settings: { farmName: 'Ratnagiri orchard' }, version: cur.version }, ok: 200, unchanged: async () => (await one('SELECT version FROM farm_settings WHERE id = 1')).version === cur.version }
   },
-  'POST /farm/bookings/:id/cancel': async () => {
-    const id = await paidFarmBooking()
-    return { path: `/farm/bookings/${id}/cancel`, body: { reason: 'the road to the farm flooded', refund: true }, ok: 200, unchanged: async () => (await one('SELECT status FROM farm_bookings WHERE id = $1', [id])).status !== 'CANCELLED' }
-  },
-  'POST /farm/bookings/:id/shortfall-refund': async () => {
-    const id = await paidFarmBooking()
-    await query(`UPDATE farm_bookings SET status = 'WEIGHING', accepted_kg = 290 WHERE id = $1`, [id])
-    return { path: `/farm/bookings/${id}/shortfall-refund`, body: { kg: 10, reason: 'ten kg were not ready' }, ok: 200, unchanged: async () => !(await one('SELECT 1 AS x FROM farm_refunds WHERE booking_id = $1', [id])) }
+  'POST /farm/bookings/:id/record-payment': async () => {
+    const id = await billedFarmBooking()
+    return { path: `/farm/bookings/${id}/record-payment`, body: { method: 'CASH', reference: 'Receipt 12' }, ok: 200, unchanged: async () => (await one('SELECT paid_at FROM farm_bookings WHERE id = $1', [id])).paid_at === null }
   },
   'POST /farm/refunds/:id/settle': async () => {
     const id = await paidFarmBooking()
@@ -234,7 +237,7 @@ const SCENARIOS = {
     const refundId = newId('frf')
     await query(
       `INSERT INTO farm_refunds (id, booking_id, farm_payment_id, payment_id, amount, kind, reason, requested_by, requested_at, refund_gave_up_at)
-       VALUES ($1, $2, $3, $4, 1000, 'SHORTFALL', 'test', 'test', $5, $5)`,
+       VALUES ($1, $2, $3, $4, 1000, 'OVERPAID', 'test', 'test', $5, $5)`,
       [refundId, id, pay.id, pay.payment_id, new Date(T0)],
     )
     return { path: `/farm/refunds/${refundId}/settle`, body: { reference: 'UPI 112233' }, ok: 200, unchanged: async () => !(await one('SELECT refunded_at FROM farm_refunds WHERE id = $1', [refundId])).refunded_at }

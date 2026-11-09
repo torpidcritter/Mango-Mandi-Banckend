@@ -1,22 +1,22 @@
-// Farm Experience (docs/farm-experience.md): 250 kg or more, paid in full
-// before the visit, with a farm stay arranged by staff. The rules on their own
-// (price, minimum, status moves, cancel and move options, meal plan), then the
-// whole flow through the API: setup, booking with a hold, Razorpay webhooks
-// (once however often), late payments, concurrency on the last kilograms,
-// hospitality review for groups of any size, the day at the farm, extra
-// kilograms, shortfall refunds, cancelling and moving, who may do what, and
-// the reports.
+// Farm Experience (docs/farm-experience.md): 250 kg or more, booked without
+// paying, a farm stay arranged by staff, and the bill paid after picking for
+// the kilograms weighed and accepted. The rules on their own (price, minimum,
+// bill, status moves, cancel and move options, meal plan), then the whole flow
+// through the API: setup, booking, the open-bookings cap, concurrency on the
+// last kilograms, hospitality review for groups of any size, the day at the
+// farm, the bill (paid online once however often Razorpay says so, or recorded
+// by a manager), payments for a replaced bill refunded, cancelling and moving,
+// who may do what, and the reports.
 import { adminToken, client, closeAll, customerToken, resetDb, signWebhook, startServer } from './helpers.js'
 import assert from 'node:assert/strict'
 import { after, afterEach, before, beforeEach, describe, test } from 'node:test'
 import { drainBackground } from '../src/background.js'
-import { addDays, now, setNow, todayIST } from '../src/clock.js'
+import { addDays, setNow, todayIST } from '../src/clock.js'
 import { query } from '../src/db.js'
 import { env } from '../src/env.js'
 import { forgetSwitches } from '../src/feature-switches.js'
 import { newId } from '../src/ids.js'
-import { runFarmJobs } from '../src/farm/jobs.js'
-import { cancelOption, extraAmount, priceFor, rescheduleOption, suggestMealPlan, assertStaffMove, MIN_KG } from '../src/farm/rules.js'
+import { billFor, cancelOption, priceFor, rescheduleOption, suggestMealPlan, assertStaffMove, MIN_KG } from '../src/farm/rules.js'
 import { processDueRefunds } from '../src/payments.js'
 
 let srv
@@ -95,16 +95,39 @@ async function webhook(event, eventId = newId('evt')) {
   assert.equal(r.status, 200, JSON.stringify(r.body))
   return r.body
 }
-async function paidBooking(varietyId, over = {}, cust = null) {
+/** A booking made (nothing paid): it waits for staff to arrange the stay. */
+async function booked(varietyId, over = {}, cust = null) {
   cust ??= await customerToken(api)
   const b = await book(cust, input(varietyId, over))
   assert.equal(b.status, 201, JSON.stringify(b.body))
-  const w = await webhook(captured(b.body.razorpayOrderId, b.body.total))
-  assert.equal(w.result, 'confirmed', JSON.stringify(w))
+  assert.equal(b.body.status, 'HOSPITALITY_REVIEW')
   return { cust, id: b.body.bookingId, created: b.body }
 }
 const harvestRow = (varietyId, day = VISIT()) => one('SELECT * FROM farm_harvest WHERE variety_id = $1 AND day = $2', [varietyId, day])
 const booking = (id) => one('SELECT * FROM farm_bookings WHERE id = $1', [id])
+const staffPost = (path, body, token = manager) => api.post(`/admin/v1/farm/bookings/${path}`, body, as(token))
+
+/** Takes a booking through the visit to its bill: stay approved, checked in on the day, picked, weighed, billed. */
+async function billed(id, { harvestedKg = 310, acceptedKg = 300, token = manager } = {}) {
+  if ((await booking(id)).status === 'HOSPITALITY_REVIEW') assert.equal((await staffPost(`${id}/hospitality`, { action: 'APPROVE' }, token)).status, 200)
+  const b = await booking(id)
+  setNow(new Date(`${b.visit_date}T05:00:00Z`))
+  const ci = await api.post('/admin/v1/farm/check-in', { code: b.checkin_code }, as(token))
+  assert.equal(ci.body.status, 'CHECKED_IN', JSON.stringify(ci.body))
+  for (const to of ['HARVESTING', 'WEIGHING']) assert.equal((await staffPost(`${id}/status`, { to }, token)).body.status, to)
+  assert.equal((await staffPost(`${id}/harvest`, { harvestedKg, acceptedKg }, token)).status, 200)
+  const bill = await staffPost(`${id}/bill`, {}, token)
+  assert.equal(bill.status, 200, JSON.stringify(bill.body))
+  assert.equal(bill.body.status, 'PAYMENT_DUE')
+  return bill.body
+}
+/** The customer presses Pay on the bill: the Razorpay order to pay. */
+async function startPay(cust, id) {
+  const r = await api.post(`/v1/farm-bookings/${id}/pay`, {}, { token: cust.accessToken })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  assert.match(r.body.razorpayOrderId, /^order_dev_/)
+  return r.body
+}
 
 // ---------------------------------------------------------------- rules
 
@@ -117,29 +140,38 @@ describe('rules', () => {
     assert.deepEqual([priceFor(v, 250).total, priceFor(v, 499).pricePerKg, priceFor(v, 500).pricePerKg, priceFor(v, 1000).total], [3_000_000, 12_000, 10_000, 9_000_000])
     assert.equal(priceFor(v, 7500).pricePerKg, 9_000) // no top limit
   })
-  test('extra kilograms are charged to the paisa', () => {
-    assert.equal(extraAmount(12.5, 12_000), 150_000)
-    assert.equal(extraAmount('0.33', 12_000), 3960)
+  test('the bill charges the accepted kilograms: the booked part at the booking price, extra at the extra price, to the paisa', () => {
+    const b = { kg: 300, price_per_kg: 12_000 }
+    assert.deepEqual(billFor(b, 280), { acceptedKg: 280, bookedKg: 300, pricePerKg: 12_000, bookedPartKg: 280, extraKg: 0, extraPricePerKg: null, amount: 3_360_000 })
+    assert.equal(billFor(b, 312.25).amount, 3_600_000 + 147_000) // no extra price set: the booking price
+    const extra = billFor(b, 312.25, 10_000)
+    assert.deepEqual([extra.extraKg, extra.extraPricePerKg, extra.amount], [12.25, 10_000, 3_600_000 + 122_500])
+    assert.equal(billFor(b, '0.33').amount, 3960)
+    assert.throws(() => billFor(b, 0), /accepted weight/)
+    assert.throws(() => billFor(b, 0.005), /too little/)
   })
-  test('status moves outside the list are refused', () => {
+  test('status moves outside the list are refused; the bill and the payment have their own routes', () => {
     assertStaffMove('CONFIRMED', 'PREPARING')
     assertStaffMove('PACKING', 'COMPLETED')
-    assert.throws(() => assertStaffMove('PAYMENT_PENDING', 'CONFIRMED'), /can’t move/)
     assert.throws(() => assertStaffMove('HOSPITALITY_REVIEW', 'CONFIRMED'), /can’t move/)
     assert.throws(() => assertStaffMove('CONFIRMED', 'COMPLETED'), /can’t move/)
+    assert.throws(() => assertStaffMove('WEIGHING', 'PAYMENT_DUE'), /can’t move/)
+    assert.throws(() => assertStaffMove('PAYMENT_DUE', 'PACKING'), /can’t move/)
+    assert.throws(() => assertStaffMove('PAYMENT_DUE', 'COMPLETED'), /can’t move/)
   })
   test('cancel and move options follow the deadline and the progress', () => {
     const s = { cancelDays: 7, rescheduleDays: 3 }
     const today = '2027-04-01'
     const at = (status, visit) => ({ status, visit_date: visit })
-    assert.equal(cancelOption(at('PAYMENT_PENDING', '2027-04-02'), s, today), 'UNPAID')
-    assert.equal(cancelOption(at('CONFIRMED', '2027-04-08'), s, today), 'REFUND')
+    assert.equal(cancelOption(at('HOSPITALITY_REVIEW', '2027-04-08'), s, today), 'CANCEL')
+    assert.equal(cancelOption(at('CONFIRMED', '2027-04-08'), s, today), 'CANCEL')
     assert.equal(cancelOption(at('CONFIRMED', '2027-04-07'), s, today), 'REQUEST')
     assert.equal(cancelOption(at('PREPARING', '2027-05-30'), s, today), 'REQUEST')
     assert.equal(cancelOption(at('HARVESTING', '2027-04-01'), s, today), null)
+    assert.equal(cancelOption(at('PAYMENT_DUE', '2027-04-01'), s, today), null)
     assert.equal(rescheduleOption(at('CONFIRMED', '2027-04-04'), s, today), 'MOVE')
     assert.equal(rescheduleOption(at('CONFIRMED', '2027-04-03'), s, today), 'REQUEST')
-    assert.equal(rescheduleOption(at('PAYMENT_PENDING', '2027-04-30'), s, today), null)
+    assert.equal(rescheduleOption(at('PAYMENT_DUE', '2027-04-30'), s, today), null)
   })
   test('the starting meal plan covers each day of the stay for the whole group', () => {
     const plan = suggestMealPlan({ arrival: '2027-04-10', departure: '2027-04-11', guests: 40, meals: { breakfast: true, lunch: true, dinner: true, refreshments: false } })
@@ -194,10 +226,10 @@ describe('switch and setup', () => {
   })
 })
 
-// ---------------------------------------------------------------- booking and payment
+// ---------------------------------------------------------------- booking
 
-describe('booking and payment', () => {
-  test('249 kg is refused by the API, 250 kg is booked, and the price comes from the server', async () => {
+describe('booking (nothing paid up front)', () => {
+  test('249 kg is refused by the API; 250 kg is booked with the kilograms held and nothing to pay yet', async () => {
     const { varietyId } = await setupFarm()
     const cust = await customerToken(api)
     const low = await book(cust, input(varietyId, { kg: 249 }))
@@ -205,57 +237,24 @@ describe('booking and payment', () => {
     assert.equal(low.body.error.code, 'FARM_MIN_KG')
     const ok = await book(cust, { ...input(varietyId, { kg: 250 }) })
     assert.equal(ok.status, 201, JSON.stringify(ok.body))
-    assert.equal(ok.body.total, 250 * 12_000)
-    assert.match(ok.body.razorpayOrderId, /^order_dev_/)
+    assert.deepEqual([ok.body.status, ok.body.estimate, ok.body.kg], ['HOSPITALITY_REVIEW', 250 * 12_000, 250])
+    assert.equal(ok.body.razorpayOrderId, undefined)
     // A price sent by the shop is not accepted at all.
     const sneaky = await book(await customerToken(api), { ...input(varietyId), total: 1 })
     assert.equal(sneaky.status, 400)
     const b = await booking(ok.body.bookingId)
-    assert.deepEqual([b.status, b.kg_reserved], ['PAYMENT_PENDING', true])
+    assert.deepEqual([b.status, b.kg_reserved, b.bill_amount, b.paid_at], ['HOSPITALITY_REVIEW', true, null, null])
     assert.equal((await harvestRow(varietyId)).reserved_kg, 250)
-  })
-
-  test('a large group (500 people) is accepted by the form and flagged for staff, not refused', async () => {
-    const { varietyId } = await setupFarm()
-    const { id } = await paidBooking(varietyId, { adults: 350, children: 150, overnightGuests: 480, departureDate: addDays(VISIT(), 1) })
-    const b = await booking(id)
-    assert.deepEqual([b.status, b.over_capacity, b.adults + b.children], ['HOSPITALITY_REVIEW', true, 500])
-    // Staff can't approve it blind: rooms or a written arrangement first.
-    const a = await api.post(`/admin/v1/farm/bookings/${id}/hospitality`, { action: 'APPROVE' }, as(manager))
-    assert.equal(a.body.error.code, 'HOSPITALITY_PLAN_REQUIRED')
-    const p = await api.post(`/admin/v1/farm/bookings/${id}/hospitality`, { action: 'PROPOSE', text: 'Farmhouse for 4; the rest in two partner homestays 2 km away, with transfers.' }, as(manager))
-    assert.equal(p.status, 200, JSON.stringify(p.body))
-    assert.equal(p.body.hospitality.status, 'ALTERNATIVE_PROPOSED')
-    assert.equal((await api.get(`/v1/farm-bookings/${id}`)).status, 401)
-  })
-
-  test('a captured webhook confirms the payment once, however often it comes; the page never trusts the redirect', async () => {
-    const { varietyId } = await setupFarm()
-    const cust = await customerToken(api)
-    const b = await book(cust, input(varietyId))
-    const ev = captured(b.body.razorpayOrderId, b.body.total, 'pay_farm_1')
-    assert.equal((await webhook(ev, 'evt_f1')).result, 'confirmed')
-    assert.equal((await webhook(ev, 'evt_f1')).duplicate, true)
-    assert.equal((await webhook(ev, 'evt_f2')).result, 'already_paid')
-    // A second, different payment for the same booking is refunded on its own.
-    assert.equal((await webhook(captured(b.body.razorpayOrderId, b.body.total, 'pay_farm_2'))).result, 'duplicate_payment')
-    assert.ok(await one(`SELECT 1 AS x FROM duplicate_payments WHERE payment_id = 'pay_farm_2'`))
-    // A wrong amount confirms nothing.
-    const other = await book(await customerToken(api), input(varietyId, { visitDate: addDays(VISIT(), 1) }))
-    const bad = await webhook(captured(other.body.razorpayOrderId, other.body.total - 100, 'pay_farm_3'))
-    assert.equal(bad.result, 'rejected')
-    assert.equal((await booking(other.body.bookingId)).status, 'PAYMENT_PENDING')
-    // verify-payment with a forged signature is refused; the page shows the webhook's word.
-    const v = await api.post(`/v1/farm-bookings/${other.body.bookingId}/verify-payment`, { razorpay_order_id: other.body.razorpayOrderId, razorpay_payment_id: 'pay_x', razorpay_signature: 'f'.repeat(64) }, { token: (await customerToken(api)).accessToken })
-    assert.equal(v.status, 404) // not their booking
-    const page = await api.get(`/v1/farm-bookings/${b.body.bookingId}`, { token: cust.accessToken })
-    assert.equal(page.body.status, 'HOSPITALITY_REVIEW')
-    assert.equal(page.body.payment.status, 'SUCCEEDED')
+    assert.equal((await one('SELECT COUNT(*)::int AS n FROM farm_booking_payments')).n, 0)
+    const page = await api.get(`/v1/farm-bookings/${ok.body.bookingId}`, { token: cust.accessToken })
+    assert.deepEqual([page.body.payment, page.body.canPay, page.body.bill, page.body.canCancel], [null, false, null, 'CANCEL'])
     assert.match(page.body.checkinCode, /^[2-9A-HJKMNP-Z]{12}$/)
     assert.equal(page.body.notes, undefined)
+    // Nothing to pay before the bill.
+    assert.equal((await api.post(`/v1/farm-bookings/${ok.body.bookingId}/pay`, {}, { token: cust.accessToken })).body.error.code, 'NOTHING_TO_PAY')
   })
 
-  test('a failed payment keeps the booking and its hold; the customer can try again; the same key never books twice', async () => {
+  test('the same key never books twice; one customer holds at most the set number of upcoming visits', async () => {
     const { varietyId } = await setupFarm()
     const cust = await customerToken(api)
     const key = newId('k')
@@ -266,43 +265,27 @@ describe('booking and payment', () => {
     assert.equal((await one('SELECT COUNT(*)::int AS n FROM farm_bookings')).n, 1)
     const reused = await book(cust, input(varietyId, { kg: 260 }), key)
     assert.equal(reused.status, 422)
-    const f = await webhook({ event: 'payment.failed', payload: { payment: { entity: { id: 'pay_fail', order_id: b.body.razorpayOrderId, amount: b.body.total, currency: 'INR' } } } })
-    assert.equal(f.result, 'attempt_failed')
-    const page = await api.get(`/v1/farm-bookings/${b.body.bookingId}`, { token: cust.accessToken })
-    assert.deepEqual([page.body.status, page.body.payment.failed, page.body.payment.razorpayOrderId], ['PAYMENT_PENDING', true, b.body.razorpayOrderId])
-    // One unpaid booking at a time.
-    const second = await book(cust, input(varietyId, { visitDate: addDays(VISIT(), 1) }))
-    assert.equal(second.body.error.code, 'UNPAID_FARM_BOOKING')
-    assert.equal((await webhook(captured(b.body.razorpayOrderId, b.body.total))).result, 'confirmed')
+    assert.equal((await book(cust, input(varietyId, { visitDate: addDays(VISIT(), 1) }))).status, 201)
+    const third = await book(cust, input(varietyId, { visitDate: addDays(VISIT(), 2) }))
+    assert.equal(third.status, 409)
+    assert.deepEqual([third.body.error.code, third.body.error.details?.max ?? third.body.error.max], ['TOO_MANY_FARM_BOOKINGS', 2])
+    // Cancelling one frees a place.
+    await api.post(`/v1/farm-bookings/${b.body.bookingId}/cancel`, {}, { token: cust.accessToken })
+    assert.equal((await book(cust, input(varietyId, { visitDate: addDays(VISIT(), 2) }))).status, 201)
   })
 
-  test('an expired hold gives the kilograms back; a late payment books them again if free, else goes to a manager', async () => {
-    const { varietyId } = await setupFarm({ bookableKg: 300 })
-    const a = await customerToken(api)
-    const first = await book(a, input(varietyId))
-    assert.equal(first.status, 201, JSON.stringify(first.body))
-    setNow(new Date(now().getTime() + 20 * 60_000))
-    assert.equal((await runFarmJobs()).expired, 1)
-    assert.deepEqual([(await booking(first.body.bookingId)).status, (await harvestRow(varietyId)).reserved_kg], ['EXPIRED', 0])
-    // Paid late while still free: booked.
-    assert.equal((await webhook(captured(first.body.razorpayOrderId, first.body.total))).result, 'confirmed_late')
-    assert.equal((await harvestRow(varietyId)).reserved_kg, 300)
-    // Another expires, someone else takes the fruit, then it is paid: a manager decides.
-    const day2 = addDays(VISIT(), 1)
-    const late = await book(await customerToken(api), input(varietyId, { visitDate: day2 }))
-    setNow(new Date(now().getTime() + 20 * 60_000))
-    await runFarmJobs()
-    const taker = await book(await customerToken(api), input(varietyId, { visitDate: day2 }))
-    assert.equal(taker.status, 201, JSON.stringify(taker.body))
-    assert.equal((await webhook(captured(late.body.razorpayOrderId, late.body.total))).result, 'needs_attention')
-    const b = await booking(late.body.bookingId)
-    assert.deepEqual([b.status, b.kg_reserved], ['NEEDS_ATTENTION', false])
-    assert.match(b.attention_reason, /no longer free/)
-    // The manager moves it to a date with fruit: the kilograms are taken there.
-    const moved = await api.post(`/admin/v1/farm/bookings/${b.id}/move`, { date: addDays(VISIT(), 2), reason: 'Paid after the hold; moved' }, as(manager))
-    assert.equal(moved.status, 200, JSON.stringify(moved.body))
-    assert.equal(moved.body.status, 'HOSPITALITY_REVIEW')
-    assert.equal((await harvestRow(varietyId, addDays(VISIT(), 2))).reserved_kg, 300)
+  test('a large group (500 people) is accepted by the form and flagged for staff, not refused', async () => {
+    const { varietyId } = await setupFarm()
+    const { id } = await booked(varietyId, { adults: 350, children: 150, overnightGuests: 480, departureDate: addDays(VISIT(), 1) })
+    const b = await booking(id)
+    assert.deepEqual([b.status, b.over_capacity, b.adults + b.children], ['HOSPITALITY_REVIEW', true, 500])
+    // Staff can't approve it blind: rooms or a written arrangement first.
+    const a = await staffPost(`${id}/hospitality`, { action: 'APPROVE' })
+    assert.equal(a.body.error.code, 'HOSPITALITY_PLAN_REQUIRED')
+    const p = await staffPost(`${id}/hospitality`, { action: 'PROPOSE', text: 'Farmhouse for 4; the rest in two partner homestays 2 km away, with transfers.' })
+    assert.equal(p.status, 200, JSON.stringify(p.body))
+    assert.equal(p.body.hospitality.status, 'ALTERNATIVE_PROPOSED')
+    assert.equal((await api.get(`/v1/farm-bookings/${id}`)).status, 401)
   })
 
   test('two customers racing for the last kilograms: exactly one gets them', async () => {
@@ -314,7 +297,7 @@ describe('booking and payment', () => {
     assert.equal((await harvestRow(varietyId)).reserved_kg, 300)
   })
 
-  test('dates: closed, outside the window, or full are refused; a day cap counts holds', async () => {
+  test('dates: closed, outside the window, or full are refused; a day cap counts bookings', async () => {
     const { varietyId } = await setupFarm({ maxBookings: 1 })
     const cust = await customerToken(api)
     assert.equal((await book(cust, input(varietyId, { visitDate: addDays(VISIT(), 5) }))).body.error.code, 'FARM_DATE_UNAVAILABLE')
@@ -333,28 +316,28 @@ describe('booking and payment', () => {
 
   test('bookable kilograms can’t be cut below what is already booked', async () => {
     const { varietyId } = await setupFarm()
-    await paidBooking(varietyId, { kg: 600 })
+    await booked(varietyId, { kg: 600 })
     const r = await api.put(`/admin/v1/farm/harvest/${varietyId}/${VISIT()}`, { bookableKg: 500 }, as(manager))
     assert.equal(r.body.error.code, 'FARM_BELOW_BOOKED')
   })
 })
 
-// ---------------------------------------------------------------- the visit
+// ---------------------------------------------------------------- the visit and the bill
 
-describe('hospitality, the visit, extras and shortfalls', () => {
-  test('the whole journey: review, rooms, confirm, check-in by QR code, harvest, extra kg paid, packing, completed', async () => {
+describe('the visit, the bill and paying after picking', () => {
+  test('the whole journey: review, rooms, confirm, check-in by QR code, picking, weighing, bill with extra kg, paid online, packing, completed', async () => {
     const { varietyId, roomId } = await setupFarm()
-    const { cust, id } = await paidBooking(varietyId, { overnightGuests: 4, departureDate: addDays(VISIT(), 1) })
+    const { cust, id } = await booked(varietyId, { overnightGuests: 4, departureDate: addDays(VISIT(), 1) })
     const ops = await adminToken(api, 'ops@mandimangoes.test', 'operator123')
     const list = await api.get('/admin/v1/farm/bookings?needsAction=true', as(ops))
     assert.equal(list.body.items[0].id, id)
     const rooms = await api.put(`/admin/v1/farm/bookings/${id}/rooms`, { allocations: [{ roomId, fromDate: VISIT(), toDate: addDays(VISIT(), 1), guests: 4 }] }, as(ops))
     assert.equal(rooms.status, 200, JSON.stringify(rooms.body))
-    const ok = await api.post(`/admin/v1/farm/bookings/${id}/hospitality`, { action: 'APPROVE', text: 'Room 1 for four; others leave the same evening.' }, as(ops))
+    const ok = await staffPost(`${id}/hospitality`, { action: 'APPROVE', text: 'Room 1 for four; others leave the same evening.' }, ops)
     assert.equal(ok.body.status, 'CONFIRMED')
     assert.equal(ok.body.hospitality.mealPlan.length, 2)
     // The same room can't be given to another booking for the same night.
-    const other = await paidBooking(varietyId, { overnightGuests: 2, departureDate: addDays(VISIT(), 1) })
+    const other = await booked(varietyId, { overnightGuests: 2, departureDate: addDays(VISIT(), 1) })
     const clash = await api.put(`/admin/v1/farm/bookings/${other.id}/rooms`, { allocations: [{ roomId, fromDate: VISIT(), toDate: addDays(VISIT(), 1), guests: 2 }] }, as(ops))
     assert.equal(clash.body.error.code, 'ROOM_TAKEN')
     // Customer's itinerary.
@@ -375,54 +358,136 @@ describe('hospitality, the visit, extras and shortfalls', () => {
     assert.equal((await api.post('/admin/v1/farm/check-in', { code: mine.body.checkinCode }, as(ops))).body.error.code, 'ALREADY_CHECKED_IN')
     // Customers can't cancel once at the farm.
     assert.equal((await api.post(`/v1/farm-bookings/${id}/cancel`, {}, { token: cust.accessToken })).body.error.code, 'NOT_CANCELLABLE')
-    for (const to of ['HARVESTING', 'WEIGHING']) assert.equal((await api.post(`/admin/v1/farm/bookings/${id}/status`, { to }, as(ops))).body.status, to)
-    await api.post(`/admin/v1/farm/bookings/${id}/harvest`, { harvestedKg: 315.5, acceptedKg: 312.25, inspectionNote: 'Good' }, as(ops))
-    // 12.25 kg more than paid: an extra request the customer approves and pays.
-    const x = await api.post(`/admin/v1/farm/bookings/${id}/extras`, { kg: 12.25 }, as(ops))
-    assert.equal(x.body.extras[0].amount, 147_000)
-    const pay = await api.post(`/v1/farm-bookings/${id}/extras/${x.body.extras[0].id}`, { accept: true }, { token: cust.accessToken })
-    assert.equal(pay.status, 200, JSON.stringify(pay.body))
-    assert.equal(pay.body.amount, 147_000)
-    assert.equal((await webhook(captured(pay.body.razorpayOrderId, 147_000))).result, 'extra_paid')
-    assert.equal((await api.post(`/admin/v1/farm/bookings/${id}/status`, { to: 'PACKING' }, as(ops))).body.status, 'PACKING')
-    assert.equal((await api.post(`/admin/v1/farm/bookings/${id}/status`, { to: 'COMPLETED' }, as(ops))).body.error.code, 'NOT_PACKED')
-    await api.post(`/admin/v1/farm/bookings/${id}/harvest`, { packingStatus: 'COLLECTED' }, as(ops))
-    const done = await api.post(`/admin/v1/farm/bookings/${id}/status`, { to: 'COMPLETED' }, as(ops))
+    for (const to of ['HARVESTING', 'WEIGHING']) assert.equal((await staffPost(`${id}/status`, { to }, ops)).body.status, to)
+    // No bill before the weight is recorded.
+    assert.equal((await staffPost(`${id}/bill`, {}, ops)).body.error.code, 'NOT_WEIGHED')
+    await staffPost(`${id}/harvest`, { harvestedKg: 315.5, acceptedKg: 312.25, inspectionNote: 'Good' }, ops)
+    // The bill: 300 kg booked at Rs 120 and 12.25 kg more at the same price (no extra price set).
+    const bill = await staffPost(`${id}/bill`, {}, ops)
+    assert.equal(bill.status, 200, JSON.stringify(bill.body))
+    assert.deepEqual([bill.body.status, bill.body.bill.amount, bill.body.bill.extraKg], ['PAYMENT_DUE', 3_747_000, 12.25])
+    // Weights are fixed once billed; packing waits for the payment.
+    assert.equal((await staffPost(`${id}/harvest`, { acceptedKg: 300 }, ops)).body.error.code, 'BILL_MADE')
+    assert.equal((await staffPost(`${id}/status`, { to: 'COMPLETED' }, ops)).body.error.code, 'BAD_STATUS_MOVE')
+    // The customer sees the bill and pays it online.
+    const due = await api.get(`/v1/farm-bookings/${id}`, { token: cust.accessToken })
+    assert.deepEqual([due.body.canPay, due.body.payment.status, due.body.payment.amount, due.body.bill.acceptedKg], [true, 'DUE', 3_747_000, 312.25])
+    const pay = await startPay(cust, id)
+    assert.equal(pay.amount, 3_747_000)
+    assert.equal((await startPay(cust, id)).razorpayOrderId, pay.razorpayOrderId) // pressing Pay again reuses the order
+    assert.equal((await webhook(captured(pay.razorpayOrderId, 3_747_000))).result, 'paid')
+    const paid = await api.get(`/v1/farm-bookings/${id}`, { token: cust.accessToken })
+    assert.deepEqual([paid.body.status, paid.body.canPay, paid.body.payment.status, paid.body.payment.method], ['PACKING', false, 'PAID', 'ONLINE'])
+    assert.equal((await staffPost(`${id}/status`, { to: 'COMPLETED' }, ops)).body.error.code, 'NOT_PACKED')
+    await staffPost(`${id}/harvest`, { packingStatus: 'COLLECTED' }, ops)
+    const done = await staffPost(`${id}/status`, { to: 'COMPLETED' }, ops)
     assert.equal(done.body.status, 'COMPLETED')
-    assert.equal(done.body.money.paid, 300 * 12_000 + 147_000)
+    assert.equal(done.body.money.paid, 3_747_000)
     // Every step is recorded with who did it.
     assert.ok(done.body.events.some((e) => e.action === 'CHECKED_IN' && e.actor === 'ops@mandimangoes.test'))
+    assert.ok(done.body.events.some((e) => e.action === 'BILL_ISSUED' && e.actor === 'ops@mandimangoes.test'))
+    assert.ok(done.body.events.some((e) => e.action === 'PAID' && e.actor === 'system'))
     const audit = await one(`SELECT COUNT(*)::int AS n FROM staff_audit WHERE action LIKE '%/farm/%'`)
     assert.ok(audit.n >= 5)
   })
 
-  test('a partial harvest: the manager refunds only the missing kilograms, never more than paid', async () => {
+  test('a smaller harvest is billed for what was accepted, with the extra kg price when one is set', async () => {
     const { varietyId } = await setupFarm()
-    const { id } = await paidBooking(varietyId)
-    await api.post(`/admin/v1/farm/bookings/${id}/hospitality`, { action: 'APPROVE' }, as(manager))
-    setNow(new Date(`${VISIT()}T05:00:00Z`))
-    const b = await booking(id)
-    await api.post('/admin/v1/farm/check-in', { code: b.checkin_code }, as(manager))
-    await api.post(`/admin/v1/farm/bookings/${id}/status`, { to: 'HARVESTING' }, as(manager))
-    await api.post(`/admin/v1/farm/bookings/${id}/harvest`, { harvestedKg: 280, acceptedKg: 280 }, as(manager))
-    const tooMuch = await api.post(`/admin/v1/farm/bookings/${id}/shortfall-refund`, { kg: 25, reason: 'Crop shortfall on the day', confirmCode: CONFIRM }, as(manager))
-    assert.equal(tooMuch.body.error.code, 'SHORTFALL_TOO_LARGE')
-    const r = await api.post(`/admin/v1/farm/bookings/${id}/shortfall-refund`, { kg: 20, reason: 'Crop shortfall on the day', confirmCode: CONFIRM }, as(manager))
-    assert.equal(r.status, 200, JSON.stringify(r.body))
-    assert.equal(r.body.money.refunds[0].amount, 20 * 12_000)
-    assert.notEqual(r.body.money.refunds[0].status, 'PENDING') // sent at once (dev gateway)
-    assert.equal(r.body.status, 'HARVESTING') // the visit goes on
+    const cur = await api.get('/admin/v1/farm/settings', as(manager))
+    assert.equal((await api.put('/admin/v1/farm/settings', { settings: { extraPricePerKg: 10_000 }, version: cur.body.version, confirmCode: CONFIRM }, as(manager))).status, 200)
+    const short = await booked(varietyId)
+    const big = await booked(varietyId, { visitDate: VISIT() })
+    assert.equal((await billed(short.id, { harvestedKg: 290, acceptedKg: 280 })).bill.amount, 280 * 12_000)
+    const b = await billed(big.id, { harvestedKg: 330, acceptedKg: 320 })
+    assert.deepEqual([b.bill.bookedPartKg, b.bill.extraKg, b.bill.extraPricePerKg, b.bill.amount], [300, 20, 10_000, 300 * 12_000 + 20 * 10_000])
   })
 
-  test('the customer accepts or declines a proposed arrangement; declining leaves a full refund open', async () => {
+  test('a captured payment is applied once however often it comes; a second payment is refunded; a wrong amount pays nothing', async () => {
     const { varietyId } = await setupFarm()
-    const { cust, id } = await paidBooking(varietyId, { visitDate: addDays(VISIT(), 0) })
-    await api.post(`/admin/v1/farm/bookings/${id}/hospitality`, { action: 'PROPOSE', text: 'Day visit only; the farmhouse is closed for repairs that night.' }, as(manager))
+    const { cust, id } = await booked(varietyId)
+    const bill = await billed(id)
+    const pay = await startPay(cust, id)
+    // A wrong amount confirms nothing.
+    assert.equal((await webhook(captured(pay.razorpayOrderId, bill.bill.amount - 100, 'pay_farm_0'))).result, 'rejected')
+    assert.equal((await booking(id)).status, 'PAYMENT_DUE')
+    const ev = captured(pay.razorpayOrderId, bill.bill.amount, 'pay_farm_1')
+    assert.equal((await webhook(ev, 'evt_f1')).result, 'paid')
+    assert.equal((await webhook(ev, 'evt_f1')).duplicate, true)
+    assert.equal((await webhook(ev, 'evt_f2')).result, 'already_paid')
+    // A second, different payment for the same order is refunded on its own.
+    assert.equal((await webhook(captured(pay.razorpayOrderId, bill.bill.amount, 'pay_farm_2'))).result, 'duplicate_payment')
+    assert.ok(await one(`SELECT 1 AS x FROM duplicate_payments WHERE payment_id = 'pay_farm_2'`))
+    // verify-payment for someone else's booking is refused; the page shows the webhook's word.
+    const v = await api.post(`/v1/farm-bookings/${id}/verify-payment`, { razorpay_order_id: pay.razorpayOrderId, razorpay_payment_id: 'pay_x', razorpay_signature: 'f'.repeat(64) }, { token: (await customerToken(api)).accessToken })
+    assert.equal(v.status, 404)
+    assert.equal((await api.post(`/v1/farm-bookings/${id}/pay`, {}, { token: cust.accessToken })).body.error.code, 'NOTHING_TO_PAY')
+  })
+
+  test('a failed payment leaves the bill open to pay again', async () => {
+    const { varietyId } = await setupFarm()
+    const { cust, id } = await booked(varietyId)
+    const bill = await billed(id)
+    const pay = await startPay(cust, id)
+    const f = await webhook({ event: 'payment.failed', payload: { payment: { entity: { id: 'pay_fail', order_id: pay.razorpayOrderId, amount: bill.bill.amount, currency: 'INR' } } } })
+    assert.equal(f.result, 'attempt_failed')
+    const page = await api.get(`/v1/farm-bookings/${id}`, { token: cust.accessToken })
+    assert.deepEqual([page.body.status, page.body.payment.failed, page.body.payment.razorpayOrderId, page.body.canPay], ['PAYMENT_DUE', true, pay.razorpayOrderId, true])
+    assert.equal((await webhook(captured(pay.razorpayOrderId, bill.bill.amount))).result, 'paid')
+  })
+
+  test('a corrected bill replaces the open one; paying the old one is refunded in full', async () => {
+    const { varietyId } = await setupFarm()
+    const { cust, id } = await booked(varietyId)
+    const first = await billed(id, { harvestedKg: 310, acceptedKg: 300 })
+    const old = await startPay(cust, id)
+    const fixed = await staffPost(`${id}/bill`, { acceptedKg: 305 })
+    assert.equal(fixed.status, 200, JSON.stringify(fixed.body))
+    assert.equal(fixed.body.bill.amount, 305 * 12_000)
+    assert.ok(fixed.body.events.some((e) => e.action === 'BILL_REVISED'))
+    assert.equal((await staffPost(`${id}/bill`, { acceptedKg: 320 })).body.error.code, 'VALIDATION_ERROR') // more than was picked
+    const pay = await startPay(cust, id)
+    assert.notEqual(pay.razorpayOrderId, old.razorpayOrderId)
+    // The customer pays the old bill in another tab: it does not count, and goes back.
+    assert.equal((await webhook(captured(old.razorpayOrderId, first.bill.amount, 'pay_old'))).result, 'refund_due')
+    assert.equal((await booking(id)).status, 'PAYMENT_DUE')
+    assert.equal((await webhook(captured(pay.razorpayOrderId, 305 * 12_000, 'pay_new'))).result, 'paid')
+    await drainBackground()
+    await processDueRefunds()
+    const r = await one('SELECT * FROM farm_refunds WHERE booking_id = $1', [id])
+    assert.deepEqual([r.kind, r.amount, r.payment_id], ['OVERPAID', first.bill.amount, 'pay_old'])
+    assert.ok(r.refunded_at)
+    const b = await booking(id)
+    assert.deepEqual([b.status, b.bill_amount], ['PACKING', 305 * 12_000])
+  })
+
+  test('a manager records a bill paid at the farm (confirming it is them); an online payment after that is refunded', async () => {
+    const { varietyId } = await setupFarm()
+    const { cust, id } = await booked(varietyId)
+    const bill = await billed(id)
+    const pay = await startPay(cust, id)
+    const body = { method: 'UPI', reference: 'UPI ref 4321' }
+    assert.equal((await staffPost(`${id}/record-payment`, body)).body.error.code, 'REAUTH_REQUIRED')
+    const rec = await staffPost(`${id}/record-payment`, { ...body, confirmCode: CONFIRM })
+    assert.equal(rec.status, 200, JSON.stringify(rec.body))
+    assert.equal(rec.body.status, 'PACKING')
+    const p = rec.body.payments.find((x) => x.kind === 'RECORDED')
+    assert.deepEqual([p.amount, p.status, p.method, p.reference, p.recordedBy], [bill.bill.amount, 'SUCCEEDED', 'UPI', 'UPI ref 4321', 'manager@mandimangoes.test'])
+    assert.equal((await staffPost(`${id}/record-payment`, { ...body, confirmCode: CONFIRM })).body.error.code, 'NOTHING_TO_PAY')
+    const mine = await api.get(`/v1/farm-bookings/${id}`, { token: cust.accessToken })
+    assert.deepEqual([mine.body.payment.status, mine.body.payment.method], ['PAID', 'UPI'])
+    assert.equal((await webhook(captured(pay.razorpayOrderId, bill.bill.amount, 'pay_late'))).result, 'refund_due')
+    assert.equal((await one('SELECT kind FROM farm_refunds WHERE booking_id = $1', [id])).kind, 'OVERPAID')
+  })
+
+  test('the customer accepts or declines a proposed arrangement; declining lets them cancel at once', async () => {
+    const { varietyId } = await setupFarm()
+    const { cust, id } = await booked(varietyId)
+    await staffPost(`${id}/hospitality`, { action: 'PROPOSE', text: 'Day visit only; the farmhouse is closed for repairs that night.' })
     const no = await api.post(`/v1/farm-bookings/${id}/hospitality`, { accept: false, note: 'We wanted to stay' }, { token: cust.accessToken })
     assert.equal(no.body.hospitality.status, 'CUSTOMER_DECLINED')
-    assert.equal(no.body.canCancel, 'REFUND')
-    const second = await paidBooking(varietyId, { visitDate: addDays(VISIT(), 1) })
-    await api.post(`/admin/v1/farm/bookings/${second.id}/hospitality`, { action: 'PROPOSE', text: 'Tents on the lawn for the group of six.' }, as(manager))
+    assert.equal(no.body.canCancel, 'CANCEL')
+    const second = await booked(varietyId, { visitDate: addDays(VISIT(), 1) })
+    await staffPost(`${second.id}/hospitality`, { action: 'PROPOSE', text: 'Tents on the lawn for the group of six.' })
     const yes = await api.post(`/v1/farm-bookings/${second.id}/hospitality`, { accept: true }, { token: second.cust.accessToken })
     assert.deepEqual([yes.body.status, yes.body.hospitality.status], ['CONFIRMED', 'CUSTOMER_ACCEPTED'])
   })
@@ -431,47 +496,34 @@ describe('hospitality, the visit, extras and shortfalls', () => {
 // ---------------------------------------------------------------- cancel, move, refunds
 
 describe('cancelling, moving and refunds', () => {
-  test('a customer cancelling 7+ days ahead is refunded in full and the fruit goes back; later it becomes a request', async () => {
+  test('a customer cancelling 7+ days ahead is cancelled at once and the fruit goes back; later it becomes a request a manager decides', async () => {
     const { varietyId } = await setupFarm()
-    const { cust, id } = await paidBooking(varietyId)
+    const { cust, id } = await booked(varietyId)
     const c = await api.post(`/v1/farm-bookings/${id}/cancel`, { reason: 'Plans changed' }, { token: cust.accessToken })
     assert.equal(c.status, 200, JSON.stringify(c.body))
-    assert.deepEqual([c.body.requested, c.body.booking.status, c.body.booking.refundStatus], [false, 'CANCELLED', 'REFUNDED'])
-    assert.equal(c.body.booking.money.refunded, 300 * 12_000)
+    assert.deepEqual([c.body.requested, c.body.booking.status, c.body.booking.refundStatus, c.body.booking.money.paid], [false, 'CANCELLED', null, 0])
     assert.equal((await harvestRow(varietyId)).reserved_kg, 0)
-    // Within the deadline: a request for the team, nothing refunded yet.
-    const late = await paidBooking(varietyId)
+    assert.equal((await api.get(`/v1/farm-bookings/${id}/qr.svg`, { token: cust.accessToken })).status, 404)
+    const late = await booked(varietyId)
+    const visiting = await booked(varietyId, { visitDate: addDays(VISIT(), 1) })
+    // Within the deadline: a request for the team.
     setNow(new Date(`${addDays(VISIT(), -3)}T05:00:00Z`))
     const r = await api.post(`/v1/farm-bookings/${late.id}/cancel`, { reason: 'Sick' }, { token: late.cust.accessToken })
     assert.deepEqual([r.body.requested, r.body.booking.status, r.body.booking.request.kind], [true, 'HOSPITALITY_REVIEW', 'CANCEL'])
-    assert.equal((await one('SELECT COUNT(*)::int AS n FROM farm_refunds WHERE booking_id = $1', [late.id])).n, 0)
-    // The manager decides: cancel with a refund (confirming it is them).
-    const asked = await api.post(`/admin/v1/farm/bookings/${late.id}/cancel`, { reason: 'Customer is unwell; refunding', refund: true }, as(manager))
-    assert.equal(asked.body.error.code, 'REAUTH_REQUIRED')
-    const done = await api.post(`/admin/v1/farm/bookings/${late.id}/cancel`, { reason: 'Customer is unwell; refunding', refund: true, confirmCode: CONFIRM }, as(manager))
+    const done = await staffPost(`${late.id}/cancel`, { reason: 'Customer is unwell; cancelled' })
+    assert.equal(done.status, 200, JSON.stringify(done.body))
     assert.equal(done.body.status, 'CANCELLED')
-    assert.equal(done.body.money.refunded, 300 * 12_000)
-  })
-
-  test('cancelling an unpaid booking just releases it; a payment that lands afterwards is refunded', async () => {
-    const { varietyId } = await setupFarm()
-    const cust = await customerToken(api)
-    const b = await book(cust, input(varietyId))
-    const c = await api.post(`/v1/farm-bookings/${b.body.bookingId}/cancel`, {}, { token: cust.accessToken })
-    assert.deepEqual([c.body.booking.status, c.body.booking.refundStatus], ['CANCELLED', null])
-    const w = await webhook(captured(b.body.razorpayOrderId, b.body.total))
-    assert.equal(w.result, 'refund_due')
-    await drainBackground()
-    await processDueRefunds()
-    const r = await one('SELECT * FROM farm_refunds WHERE booking_id = $1', [b.body.bookingId])
-    assert.equal(r.kind, 'LATE_PAYMENT')
-    assert.ok(r.refunded_at)
+    assert.equal((await one('SELECT COUNT(*)::int AS n FROM farm_refunds')).n, 0)
+    // Once at the farm, nobody cancels: the visit is billed or marked otherwise.
+    await staffPost(`${visiting.id}/hospitality`, { action: 'APPROVE' })
+    await api.post('/admin/v1/farm/check-in', { code: (await booking(visiting.id)).checkin_code, override: true }, as(manager))
+    assert.equal((await staffPost(`${visiting.id}/cancel`, { reason: 'Trying to cancel on site' })).body.error.code, 'NOT_CANCELLABLE')
   })
 
   test('a customer moves the visit at once when it is early and the date has fruit', async () => {
     const { varietyId } = await setupFarm()
-    const { cust, id } = await paidBooking(varietyId)
-    await api.post(`/admin/v1/farm/bookings/${id}/hospitality`, { action: 'APPROVE' }, as(manager))
+    const { cust, id } = await booked(varietyId)
+    await staffPost(`${id}/hospitality`, { action: 'APPROVE' })
     const m = await api.post(`/v1/farm-bookings/${id}/reschedule`, { date: addDays(VISIT(), 1) }, { token: cust.accessToken })
     assert.equal(m.status, 200, JSON.stringify(m.body))
     assert.deepEqual([m.body.requested, m.body.booking.visitDate, m.body.booking.status], [false, addDays(VISIT(), 1), 'HOSPITALITY_REVIEW'])
@@ -481,10 +533,16 @@ describe('cancelling, moving and refunds', () => {
 
   test('a refund that fails at Razorpay is retried; a manager can record one paid another way', async () => {
     const { varietyId } = await setupFarm()
-    const { id } = await paidBooking(varietyId)
-    const done = await api.post(`/admin/v1/farm/bookings/${id}/cancel`, { reason: 'Farm closed for weather', refund: true, kind: 'NOT_HOSTED', confirmCode: CONFIRM }, as(manager))
-    const refund = await one('SELECT * FROM farm_refunds WHERE booking_id = $1', [id])
-    assert.equal(done.body.money.refunds[0].status, 'SENT')
+    // A payment for a bill already settled by a manager: refunded through the farm refunds.
+    const other = await booked(varietyId, { visitDate: VISIT() })
+    const ob = await billed(other.id)
+    const op = await startPay(other.cust, other.id)
+    await staffPost(`${other.id}/record-payment`, { method: 'CASH', reference: 'Receipt 77', confirmCode: CONFIRM })
+    await webhook(captured(op.razorpayOrderId, ob.bill.amount, 'pay_c'))
+    await drainBackground()
+    await processDueRefunds()
+    const refund = await one('SELECT * FROM farm_refunds WHERE booking_id = $1', [other.id])
+    assert.ok(refund.refunded_at)
     // Razorpay says it failed: reopened for another attempt after its back-off.
     const w = await webhook({ event: 'refund.failed', payload: { refund: { entity: { id: refund.refund_id, payment_id: refund.payment_id, amount: refund.amount } } } })
     assert.ok(w)
@@ -501,11 +559,12 @@ describe('cancelling, moving and refunds', () => {
 describe('who may do what', () => {
   test('customers only see their own bookings, and never staff notes', async () => {
     const { varietyId } = await setupFarm()
-    const { id, cust } = await paidBooking(varietyId)
-    await api.post(`/admin/v1/farm/bookings/${id}/notes`, { body: 'VIP: owner’s friend' }, as(manager))
+    const { id, cust } = await booked(varietyId)
+    await staffPost(`${id}/notes`, { body: 'VIP: owner’s friend' })
     const stranger = await customerToken(api)
     assert.equal((await api.get(`/v1/farm-bookings/${id}`, { token: stranger.accessToken })).status, 404)
     assert.equal((await api.post(`/v1/farm-bookings/${id}/cancel`, {}, { token: stranger.accessToken })).status, 404)
+    assert.equal((await api.post(`/v1/farm-bookings/${id}/pay`, {}, { token: stranger.accessToken })).status, 404)
     const staff = await api.get(`/admin/v1/farm/bookings/${id}`, as(manager))
     assert.equal(staff.body.notes[0].body, 'VIP: owner’s friend')
     const mine = await api.get(`/v1/farm-bookings/${id}`, { token: cust.accessToken })
@@ -514,15 +573,15 @@ describe('who may do what', () => {
     assert.ok(!JSON.stringify(mine.body).includes('manager@'))
   })
 
-  test('operators run the day but can’t refund, cancel, move, change prices or settings; packers and riders see nothing', async () => {
+  test('operators run the day and make the bill, but can’t record payments, cancel, move, change prices or settings; packers and QC see nothing', async () => {
     const { varietyId } = await setupFarm()
-    const { id } = await paidBooking(varietyId)
+    const { id } = await booked(varietyId)
     const ops = await adminToken(api, 'ops@mandimangoes.test', 'operator123')
     assert.equal((await api.get(`/admin/v1/farm/bookings/${id}`, as(ops))).status, 200)
     for (const [m, p, b] of [
-      ['POST', `/farm/bookings/${id}/cancel`, { reason: 'trying it', refund: true }],
+      ['POST', `/farm/bookings/${id}/cancel`, { reason: 'trying it' }],
       ['POST', `/farm/bookings/${id}/move`, { date: addDays(VISIT(), 1), reason: 'trying it' }],
-      ['POST', `/farm/bookings/${id}/shortfall-refund`, { kg: 1, reason: 'trying it' }],
+      ['POST', `/farm/bookings/${id}/record-payment`, { method: 'CASH', reference: 'trying it' }],
       ['PATCH', `/farm/varieties/${varietyId}`, { pricePerKg: 1, version: 1 }],
       ['PUT', '/farm/settings', { settings: {}, version: 1 }],
       ['PUT', `/farm/days/${VISIT()}`, { open: false }],
@@ -535,43 +594,58 @@ describe('who may do what', () => {
       const t = await adminToken(api, ...who)
       assert.equal((await api.get('/admin/v1/farm/bookings', as(t))).status, 403)
     }
-    assert.equal((await one('SELECT status FROM farm_bookings WHERE id = $1', [id])).status, 'HOSPITALITY_REVIEW')
+    assert.equal((await booking(id)).status, 'HOSPITALITY_REVIEW')
+    // The bill is theirs to make on the day.
+    assert.equal((await billed(id, { token: ops })).status, 'PAYMENT_DUE')
   })
 })
 
 // ---------------------------------------------------------------- reports and messages
 
 describe('reports and messages', () => {
-  test('reports count paid bookings only, with refunds and a formula-safe CSV', async () => {
+  test('reports count revenue from paid bills only, with conversion and a formula-safe CSV', async () => {
     const { varietyId } = await setupFarm()
-    await paidBooking(varietyId, { kg: 400, adults: 2, children: 0 })
-    await book(await customerToken(api), input(varietyId, { visitDate: addDays(VISIT(), 1), contactName: '=HYPERLINK("x")' })) // unpaid
-    const r = await api.get(`/admin/v1/farm/reports?from=${T()}&to=${addDays(VISIT(), 5)}`, as(manager))
+    const range = `from=${T()}&to=${addDays(VISIT(), 5)}`
+    const { cust, id } = await booked(varietyId, { kg: 400, adults: 2, children: 0 })
+    await booked(varietyId, { visitDate: addDays(VISIT(), 1), contactName: '=HYPERLINK("x")' }) // never billed
+    const bill = await billed(id, { harvestedKg: 420, acceptedKg: 410 })
+    const pay = await startPay(cust, id)
+    await webhook(captured(pay.razorpayOrderId, bill.bill.amount))
+    const r = await api.get(`/admin/v1/farm/reports?${range}`, as(manager))
     assert.equal(r.status, 200, JSON.stringify(r.body))
-    assert.deepEqual([r.body.bookings, r.body.kgBooked, r.body.revenue], [1, 400, 400 * 12_000])
+    assert.deepEqual([r.body.bookings, r.body.kgBooked, r.body.kgHarvested, r.body.revenue, r.body.paidBookings], [2, 700, 410, 410 * 12_000, 1])
+    assert.deepEqual([r.body.extras.kg, r.body.extras.revenue], [10, 10 * 12_000])
     assert.deepEqual([r.body.conversion.started, r.body.conversion.paid], [2, 1])
-    const csv = await api.get(`/admin/v1/farm/reports/bookings.csv?from=${T()}&to=${addDays(VISIT(), 5)}`, as(manager))
+    const csv = await api.get(`/admin/v1/farm/reports/bookings.csv?${range}`, as(manager))
     assert.match(csv.body, /'=HYPERLINK/)
+    assert.match(csv.body, /bill_rupees/)
   })
 
-  test('with WHATSAPP_FARM_UPDATES on, a paid booking queues the customer update and team alert once', async () => {
+  test('with WHATSAPP_FARM_UPDATES on, a booking, its bill and its payment each queue their message once', async () => {
     env.WHATSAPP_FARM_UPDATES = true
     env.FARM_ALERT_PHONES = ['+919811111111']
     const { varietyId } = await setupFarm()
     const cust = await customerToken(api)
-    const b = await book(cust, input(varietyId))
-    const ev = captured(b.body.razorpayOrderId, b.body.total, 'pay_msg')
+    const key = newId('k')
+    const b = await book(cust, input(varietyId), key)
+    await book(cust, input(varietyId), key) // a retry adds nothing
+    const created = (await query('SELECT kind, farm_params FROM notifications WHERE farm_booking_id = $1 ORDER BY kind', [b.body.bookingId])).rows
+    assert.deepEqual(created.map((r) => r.kind), ['FARM_BOOKING_UPDATE', 'FARM_TEAM_ALERT'])
+    assert.equal(created[0].farm_params.length, 4)
+    assert.match(created[0].farm_params[2], /pay after picking/)
+    const bill = await billed(b.body.bookingId)
+    const pay = await startPay(cust, b.body.bookingId)
+    const ev = captured(pay.razorpayOrderId, bill.bill.amount, 'pay_msg')
     await webhook(ev, 'evt_m1')
     await webhook(ev, 'evt_m2')
-    const rows = (await query('SELECT kind, farm_params FROM notifications WHERE farm_booking_id = $1 ORDER BY kind', [b.body.bookingId])).rows
-    assert.deepEqual(rows.map((r) => r.kind), ['FARM_BOOKING_UPDATE', 'FARM_TEAM_ALERT'])
-    assert.equal(rows[0].farm_params.length, 4)
-    assert.match(rows[0].farm_params[2], /received your payment/)
+    const texts = (await query(`SELECT farm_params FROM notifications WHERE farm_booking_id = $1 AND kind = 'FARM_BOOKING_UPDATE' ORDER BY created_at`, [b.body.bookingId])).rows.map((r) => r.farm_params[2])
+    assert.equal(texts.filter((t) => /Your bill is/.test(t)).length, 1)
+    assert.equal(texts.filter((t) => /received your payment/.test(t)).length, 1)
   })
 
   test('with it off, nothing is queued (the booking page shows the status)', async () => {
     const { varietyId } = await setupFarm()
-    await paidBooking(varietyId)
+    await booked(varietyId)
     assert.equal((await one('SELECT COUNT(*)::int AS n FROM notifications WHERE farm_booking_id IS NOT NULL')).n, 0)
   })
 })

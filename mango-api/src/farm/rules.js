@@ -8,30 +8,28 @@ import { MIN_KG } from './settings.js'
 export { MIN_KG }
 
 export const STATUSES = [
-  'PAYMENT_PENDING', 'EXPIRED', 'NEEDS_ATTENTION', 'HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT',
-  'CHECKED_IN', 'HARVESTING', 'WEIGHING', 'PACKING', 'COMPLETED', 'CANCELLED', 'NO_SHOW',
+  'HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT', 'CHECKED_IN', 'HARVESTING', 'WEIGHING', 'PAYMENT_DUE', 'PACKING',
+  'COMPLETED', 'CANCELLED', 'NO_SHOW',
 ]
-/** Paid and still going ahead (or waiting on a manager): these hold their kilograms. */
-export const PAID_OPEN = ['NEEDS_ATTENTION', 'HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT']
+/** Booked and not yet at the farm: these hold their kilograms. Nothing is paid until after picking. */
+export const BEFORE_VISIT = ['HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT']
 /** At the farm, or done there. */
-export const ON_SITE = ['CHECKED_IN', 'HARVESTING', 'WEIGHING', 'PACKING', 'COMPLETED']
+export const ON_SITE = ['CHECKED_IN', 'HARVESTING', 'WEIGHING', 'PAYMENT_DUE', 'PACKING', 'COMPLETED']
 /** Counted against a day's visit cap. */
-export const TAKES_A_VISIT = ['PAYMENT_PENDING', ...PAID_OPEN, ...ON_SITE]
+export const TAKES_A_VISIT = [...BEFORE_VISIT, ...ON_SITE]
 export const FINAL = ['COMPLETED', 'CANCELLED', 'NO_SHOW']
 
 /** The plain-words name of each status, for the shop and the panel. */
 export const STATUS_WORDS = {
-  PAYMENT_PENDING: 'Payment pending',
-  EXPIRED: 'Hold expired',
-  NEEDS_ATTENTION: 'Paid: our team is arranging a date',
-  HOSPITALITY_REVIEW: 'Paid: stay being arranged',
+  HOSPITALITY_REVIEW: 'Booked: stay being arranged',
   CONFIRMED: 'Booking confirmed',
   PREPARING: 'Preparation in progress',
   READY_FOR_VISIT: 'Ready for your visit',
   CHECKED_IN: 'Checked in',
   HARVESTING: 'Harvesting in progress',
   WEIGHING: 'Weighing and inspection',
-  PACKING: 'Packing and collection',
+  PAYMENT_DUE: 'Ready to pay',
+  PACKING: 'Paid: packing',
   COMPLETED: 'Completed',
   CANCELLED: 'Cancelled',
   NO_SHOW: 'Missed visit',
@@ -46,7 +44,7 @@ export const STAFF_MOVES = {
   PREPARING: ['READY_FOR_VISIT'],
   CHECKED_IN: ['HARVESTING'],
   HARVESTING: ['WEIGHING'],
-  WEIGHING: ['PACKING'],
+  // WEIGHING → PAYMENT_DUE is the bill (its own route); PAYMENT_DUE → PACKING is the payment.
   PACKING: ['COMPLETED'],
 }
 
@@ -72,32 +70,42 @@ export function priceFor(variety, kg) {
   return { pricePerKg, total: pricePerKg * kg, tier }
 }
 
-/** Extra kilograms picked on the day, in paise, rounded to the nearest paisa. */
-export const extraAmount = (kg, pricePerKg) => Math.round(Number(kg) * pricePerKg)
+/**
+ * The bill after weighing: the kilograms accepted, up to what was booked, at the
+ * booking's price per kg; anything above that at `extraPricePerKg` (the farm
+ * setting) or else the same price. Fewer kilograms than booked cost less: the
+ * customer pays only for what they take. In paise, rounded to the paisa.
+ */
+export function billFor(b, acceptedKg, extraPricePerKg = null) {
+  const accepted = Number(acceptedKg)
+  if (!Number.isFinite(accepted) || accepted <= 0) throw new HttpError(409, 'NOT_WEIGHED', 'Record the accepted weight first.')
+  const bookedPartKg = Math.min(accepted, b.kg)
+  const extraKg = Math.round(Math.max(accepted - b.kg, 0) * 100) / 100
+  const extraPrice = extraKg > 0 ? (extraPricePerKg ?? b.price_per_kg) : null
+  const amount = Math.round(bookedPartKg * b.price_per_kg) + (extraKg > 0 ? Math.round(extraKg * extraPrice) : 0)
+  if (amount < 100) throw new HttpError(409, 'BILL_TOO_SMALL', 'That is too little to charge for.')
+  return { acceptedKg: accepted, bookedKg: b.kg, pricePerKg: b.price_per_kg, bookedPartKg, extraKg, extraPricePerKg: extraPrice, amount }
+}
 
 /** Everyone in the group. */
 export const groupSize = (b) => b.adults + b.children
 
 /**
- * What a customer's cancel does now:
- * - 'UNPAID': nothing was paid; the booking is just cancelled;
- * - 'REFUND': cancelled, and every payment refunded in full;
- * - 'REQUEST': too close to the visit, or preparations have started: a manager decides;
+ * What a customer's cancel does now (nothing is paid before the visit, so no money moves):
+ * - 'CANCEL': cancelled at once, the kilograms go back on sale;
+ * - 'REQUEST': too close to the visit, or preparations have started: our team decides;
  * - null: it can't be cancelled (at the farm already, or over).
  */
 export function cancelOption(b, settings, today) {
-  if (b.status === 'PAYMENT_PENDING' || b.status === 'EXPIRED') return 'UNPAID'
-  if (['HOSPITALITY_REVIEW', 'CONFIRMED', 'NEEDS_ATTENTION'].includes(b.status)) {
-    return diffDays(b.visit_date, today) >= settings.cancelDays ? 'REFUND' : 'REQUEST'
-  }
+  if (b.status === 'HOSPITALITY_REVIEW' || b.status === 'CONFIRMED') return diffDays(b.visit_date, today) >= settings.cancelDays ? 'CANCEL' : 'REQUEST'
   if (b.status === 'PREPARING' || b.status === 'READY_FOR_VISIT') return 'REQUEST'
   return null
 }
 
 /** What a customer's change of date does: 'MOVE' (done at once if the date has room), 'REQUEST' (a manager decides), or null. */
 export function rescheduleOption(b, settings, today) {
-  if (!['HOSPITALITY_REVIEW', 'CONFIRMED', 'PREPARING', 'READY_FOR_VISIT', 'NEEDS_ATTENTION'].includes(b.status)) return null
-  if (b.status === 'PREPARING' || b.status === 'READY_FOR_VISIT' || b.status === 'NEEDS_ATTENTION') return 'REQUEST'
+  if (!BEFORE_VISIT.includes(b.status)) return null
+  if (b.status === 'PREPARING' || b.status === 'READY_FOR_VISIT') return 'REQUEST'
   return diffDays(b.visit_date, today) >= settings.rescheduleDays ? 'MOVE' : 'REQUEST'
 }
 

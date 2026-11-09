@@ -2,8 +2,8 @@
 // refunds (payments.js): the row is leased before Razorpay is called, attempts
 // back off, and after REFUND_MAX_ATTEMPTS a manager settles it. Each refund is
 // tagged with its own id at Razorpay (notes.farmRefundId), and only refunds made
-// under that tag count toward it, so a shortfall refund and a later full refund
-// of the same payment never cover each other twice.
+// under that tag count toward it. Farm refunds happen only when one bill was
+// paid twice (online after a manager recorded a payment, or two online tries).
 import { canStartCall } from '../budget.js'
 import { now } from '../clock.js'
 import { query, tx } from '../db.js'

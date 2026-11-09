@@ -19,29 +19,27 @@ const IST_DATE = new Intl.DateTimeFormat('en-IN', { weekday: 'short', day: 'nume
 const day = (d) => IST_DATE.format(new Date(`${d}T00:00:00Z`))
 
 /** What the customer is told for each step (only steps listed here send anything). */
+const rupees = (paise) => `₹${new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(paise / 100)}`
 const CUSTOMER = {
-  PAID: (b) => `We received your payment for ${b.kg} kg of ${b.variety_name}. Our team is now arranging your stay for ${day(b.visit_date)}.`,
-  PAID_LATE: () => 'We received your payment, but your date is no longer available. Our team will contact you to pick a new date or refund you in full.',
+  CREATED: (b) => `We have your booking for ${b.kg} kg of ${b.variety_name} on ${day(b.visit_date)}. Our team is arranging your stay. You pay after picking, for the mangoes weighed and accepted.`,
   HOSPITALITY_APPROVED: (b) => `Your farm visit on ${day(b.visit_date)} is confirmed. Your itinerary and check-in code are in your booking.`,
   ALTERNATIVE_ACCEPTED: (b) => `Your farm visit on ${day(b.visit_date)} is confirmed with the arrangement you accepted.`,
   ALTERNATIVE_PROPOSED: () => 'We have proposed a change to your stay. Please open your booking to accept or decline it.',
   MOVED: (b) => `Your farm visit is now on ${day(b.visit_date)}.`,
-  CANCELLED: () => 'Your farm booking is cancelled. Any refund due is shown in your booking.',
+  CANCELLED: () => 'Your farm booking is cancelled. Nothing was charged.',
   TO_READY_FOR_VISIT: (b) => `Everything is ready for your visit on ${day(b.visit_date)}. Arrival instructions are in your booking.`,
   REMINDER: (b) => `A reminder: your farm visit is on ${day(b.visit_date)}. Arrival instructions are in your booking.`,
-  TO_PACKING: () => 'Your mangoes are weighed and being packed for collection.',
+  BILL_ISSUED: (b) => `Your mangoes are weighed: ${Number(b.accepted_kg)} kg accepted. Your bill is ${rupees(b.bill_amount)}. Please pay it in your booking.`,
+  BILL_REVISED: (b) => `Your bill was corrected to ${rupees(b.bill_amount)} for ${Number(b.accepted_kg)} kg. Please pay it in your booking.`,
+  PAID: (b) => `We received your payment of ${rupees(b.bill_amount)}. Your mangoes are being packed.`,
   TO_COMPLETED: () => 'Your farm visit is complete. Thank you for visiting MandiMangoes.',
-  EXTRA_REQUESTED: () => 'You picked more mangoes than you paid for. Please open your booking to approve and pay for the extra.',
-  EXTRA_PAID: () => 'We received your payment for the extra mangoes.',
-  SHORTFALL_REFUND: () => 'We are refunding the mangoes we could not supply. The amount is shown in your booking.',
-  REFUND_SENT: () => 'Your refund has been sent to your bank. It can take 5 to 7 working days to show.',
+  REFUND_SENT: () => 'We took your payment twice, so we have refunded one. It can take 5 to 7 working days to show.',
   REQUEST_DECLINED: () => 'Our team replied to your request. Please open your booking to see it.',
 }
 
 /** What the team is told (to FARM_ALERT_PHONES). */
 const TEAM = {
-  TEAM_NEW_BOOKING: 'New paid farm booking',
-  TEAM_ATTENTION: 'Farm booking needs a manager',
+  TEAM_NEW_BOOKING: 'New farm booking',
   TEAM_REQUEST: 'Farm booking: customer request',
   TEAM_DECLINED: 'Farm booking: customer declined the proposed stay',
 }

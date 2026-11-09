@@ -1,5 +1,5 @@
-// Farm Experience reports (docs/farm-experience.md), managers only: paid bookings by visit date,
-// kg, revenue, groups, cancellations, refunds, extra kg, varieties and how full the farm was;
+// Farm Experience reports (docs/farm-experience.md), managers only: bookings by visit date,
+// kg, revenue from bills paid, groups, cancellations, refunds, extra kg, varieties and how full the farm was;
 // and the bookings as CSV. Every figure comes from the API.
 import { useId, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
@@ -25,8 +25,8 @@ export default function FarmReports() {
         ['Paid bookings', String(r.bookings)],
         ['Kg booked', String(r.kgBooked)],
         ['Kg harvested', String(r.kgHarvested)],
-        ['Revenue (bookings)', rupees(r.revenue)],
-        ['Extra kg revenue', `${rupees(r.extras.revenue)} (${r.extras.kg} kg)`],
+        ['Revenue (bills paid)', `${rupees(r.revenue)} (${r.paidBookings} paid)`],
+        ['Of which extra kg', `${rupees(r.extras.revenue)} (${r.extras.kg} kg)`],
         ['Refunds', `${rupees(r.refunds.value)} (${r.refunds.count})`],
         ['Average kg', String(r.avgKg)],
         ['Guests hosted', String(r.guestsHosted)],
@@ -34,7 +34,7 @@ export default function FarmReports() {
         ['Completed', String(r.completed)],
         ['Cancelled', `${r.cancelled} (${pct(r.cancellationRate)})`],
         ['No-shows', String(r.noShows)],
-        ['Started → paid', `${r.conversion.paid} of ${r.conversion.started} (${pct(r.conversion.rate)})`],
+        ['Booked → paid', `${r.conversion.paid} of ${r.conversion.started} (${pct(r.conversion.rate)})`],
         ['Visit slots used', pct(r.utilisation.visitRate)],
         ['Room nights used', `${r.utilisation.roomNights} of ${r.utilisation.roomNightsAvailable} (${pct(r.utilisation.roomRate)})`],
         ['Guest nights', String(r.utilisation.guestNights)],

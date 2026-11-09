@@ -6,11 +6,10 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { api, errorMessage, signedInPhone, signedInProfile, type FarmBookingInput, type FarmExperience, type FarmMeals, type FarmVariety } from '../api'
+import { api, signedInProfile, type FarmBookingInput, type FarmExperience, type FarmMeals, type FarmVariety } from '../api'
 import { clock, day, rupees } from '../format'
 import { DayChips, Field } from '../forms'
 import { ProductImage } from '../mango'
-import { openRazorpay } from '../payment'
 import { ErrorNote, Spinner } from '../ui'
 import { useT, type T } from '../i18n'
 
@@ -125,8 +124,9 @@ export default function FarmPage() {
           <li>{t('farm.how1', { min: f.minKg })}</li>
           <li>{t('farm.how2')}</li>
           <li>{t('farm.how3')}</li>
-          <li>{t('farm.how4', { minutes: s.holdMinutes })}</li>
+          <li>{t('farm.how4')}</li>
           <li>{t('farm.how5')}</li>
+          <li>{t('farm.how6')}</li>
         </ol>
       </section>
 
@@ -172,7 +172,12 @@ function Policies({ f }: { f: FarmExperience }) {
   return (
     <dl className="facts">
       {row(t('farm.minimum'), t('farm.minimumText', { min: f.minKg }))}
-      {row(t('farm.payment'), t('farm.paymentText'))}
+      {row(
+        t('farm.payment'),
+        <>
+          {t('farm.paymentText')} {s.extraPricePerKg != null ? t('farm.extraPrice', { price: rupees(s.extraPricePerKg) }) : t('farm.extraSamePrice')}
+        </>,
+      )}
       {row(t('farm.cancelling'), t('farm.cancelRule', { days: s.cancelDays }))}
       {row(t('farm.moving'), t('farm.moveRule', { days: s.rescheduleDays }))}
       {row(t('farm.transport'), <>{s.transportIncluded ? t('farm.inc.transportYes') : t('farm.inc.transportNo')} {written(s.transportPolicy)}</>)}
@@ -355,18 +360,9 @@ function BookingFlow({ f }: { f: FarmExperience }) {
         ...(d.billingGstin.trim() && { billingGstin: d.billingGstin.trim() }),
         acceptPolicies: true,
       }
+      // Nothing is paid now: the bill comes after picking and weighing.
       const b = await api.bookFarm(input, idemKey.current)
-      let payError: string | undefined
-      if (b.razorpayKeyId && b.razorpayOrderId) {
-        await openRazorpay(
-          { orderId: b.bookingId, key: b.razorpayKeyId, rzp: b.razorpayOrderId, total: b.total, number: b.number, holdExpiresAt: b.holdExpiresAt },
-          signedInPhone(),
-          api.verifyFarmPayment,
-        ).catch((err: unknown) => {
-          payError = errorMessage(err)
-        })
-      }
-      navigate(`/farm-bookings/${b.bookingId}`, { state: { placed: true, payError } })
+      navigate(`/farm-bookings/${b.bookingId}`, { state: { placed: true } })
     },
   })
 
@@ -565,9 +561,7 @@ function BookingFlow({ f }: { f: FarmExperience }) {
             {step === 'summary'
               ? book.isPending
                 ? t('farm.booking')
-                : quote.data
-                  ? t('checkout.pay', { total: rupees(quote.data.total) })
-                  : t('farm.payNow')
+                : t('farm.bookNow')
               : t('farm.next')}
           </button>
         </div>
@@ -629,13 +623,13 @@ function Summary({
           <dd>{s.transportIncluded ? t('farm.inc.transportYes') : t('farm.inc.transportNo')}</dd>
         </div>
         <div>
-          <dt>{t('farm.total')}</dt>
+          <dt>{t('farm.estimate')}</dt>
           <dd>
             <strong className="price">{total != null ? rupees(total) : '—'}</strong>
           </dd>
         </div>
       </dl>
-      <p className="small muted">{t('farm.payNote', { minutes: s.holdMinutes })}</p>
+      <p className="small muted">{t('farm.payNote')}</p>
       <details>
         <summary>{t('farm.infoTitle')}</summary>
         <Policies f={f} />

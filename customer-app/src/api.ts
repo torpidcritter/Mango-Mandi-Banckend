@@ -871,9 +871,6 @@ const id = encodeURIComponent
 /** What Razorpay Checkout's success handler receives. */
 // Farm Experience (FARM_EXPERIENCE, docs/farm-experience.md). Money in paise; the API prices everything.
 export type FarmStatus =
-  | 'PAYMENT_PENDING'
-  | 'EXPIRED'
-  | 'NEEDS_ATTENTION'
   | 'HOSPITALITY_REVIEW'
   | 'CONFIRMED'
   | 'PREPARING'
@@ -881,6 +878,7 @@ export type FarmStatus =
   | 'CHECKED_IN'
   | 'HARVESTING'
   | 'WEIGHING'
+  | 'PAYMENT_DUE'
   | 'PACKING'
   | 'COMPLETED'
   | 'CANCELLED'
@@ -917,7 +915,9 @@ export interface FarmSettings {
   seasonEnd: string
   leadDays: number
   maxDaysAhead: number
-  holdMinutes: number
+  maxOpenBookings: number
+  /** Price per kg for kilograms picked beyond the booking; null: the booking's own price. */
+  extraPricePerKg: number | null
   cancelDays: number
   rescheduleDays: number
   guestCharges: string
@@ -974,14 +974,34 @@ export interface FarmBookingInput {
   billingGstin?: string
   acceptPolicies: true
 }
-export interface FarmPaymentStart {
+/** A booking just made: nothing is paid until after picking. */
+export interface FarmBookingCreated {
   bookingId: string
   number: string
   status: FarmStatus
-  total: number
-  holdExpiresAt: string | null
-  razorpayOrderId: string | null
+  /** What the booked kilograms would cost; the bill after weighing is what is paid. */
+  estimate: number
+  kg: number
+  visitDate: string
+}
+/** The Razorpay order for paying the bill. */
+export interface FarmPaymentStart {
+  bookingId: string
+  number: string
+  amount: number
+  razorpayOrderId: string
   razorpayKeyId: string | null
+}
+/** The bill after weighing, in paise. */
+export interface FarmBill {
+  acceptedKg: number
+  bookedKg: number
+  pricePerKg: number
+  bookedPartKg: number
+  extraKg: number
+  extraPricePerKg: number | null
+  amount: number
+  at: string
 }
 export interface FarmBookingSummary {
   id: string
@@ -990,17 +1010,11 @@ export interface FarmBookingSummary {
   variety: string
   kg: number
   total: number
+  billAmount: number | null
+  paidAt: string | null
   visitDate: string
   guests: number
   createdAt: string
-}
-export interface FarmExtra {
-  id: string
-  kg: number
-  pricePerKg: number
-  amount: number
-  status: 'REQUESTED' | 'PAYMENT_PENDING' | 'PAID' | 'DECLINED' | 'WITHDRAWN'
-  note: string | null
 }
 export interface FarmBooking {
   id: string
@@ -1010,7 +1024,9 @@ export interface FarmBooking {
   variety: { id: string; name: string }
   kg: number
   pricePerKg: number
+  /** The estimate at booking. */
   total: number
+  bill: FarmBill | null
   visitDate: string
   guests: {
     adults: number
@@ -1034,16 +1050,17 @@ export interface FarmBooking {
   }
   harvest: { harvestedKg: number | null; acceptedKg: number | null; packingStatus: string | null }
   money: { paid: number; refunded: number; refunds: { id: string; amount: number; status: string }[] }
-  extras: FarmExtra[]
-  request: { kind: 'CANCEL' | 'MOVE'; date: string | null; note: string | null; at: string } | null
-  holdExpiresAt: string | null
+  request: { kind: 'CANCEL' | 'RESCHEDULE'; date: string | null; note: string | null; at: string } | null
+  paidAt: string | null
   checkinCode: string | null
-  payment: { status: string; razorpayOrderId: string | null; failed: boolean } | null
-  extraPayment: { id: string; extraId: string; amount: number; razorpayOrderId: string } | null
+  payment:
+    | { status: 'DUE'; amount: number; razorpayOrderId: string | null; failed: boolean }
+    | { status: 'PAID'; amount: number; paidAt: string; method: string }
+    | null
   razorpayKeyId: string | null
-  canCancel: 'UNPAID' | 'REFUND' | 'REQUEST' | null
+  canPay: boolean
+  canCancel: 'CANCEL' | 'REQUEST' | null
   canMove: 'MOVE' | 'REQUEST' | null
-  canRenew: boolean
   farm: {
     name: string | null
     location: string | null
@@ -1058,7 +1075,7 @@ export interface FarmBooking {
     transportIncluded: boolean
     transportPolicy: string | null
   }
-  policy: { cancelDays: number; rescheduleDays: number }
+  policy: { cancelDays: number; rescheduleDays: number; extraPricePerKg: number | null }
 }
 
 export interface CheckoutReply {
@@ -1295,32 +1312,25 @@ export const api = {
   farmQuote: (varietyId: string, kg: number) => raw<FarmQuote>('POST', '/farm-experience/quote', { varietyId, kg }),
   /** Holds the mangoes and starts the payment. The key is made once per booking form, so a retry never books twice. */
   bookFarm: (input: FarmBookingInput, idempotencyKey: string) =>
-    request<FarmPaymentStart>('POST', '/farm-bookings', input, { 'Idempotency-Key': idempotencyKey }),
+    request<FarmBookingCreated>('POST', '/farm-bookings', input, { 'Idempotency-Key': idempotencyKey }),
   farmBookings: () => request<FarmBookingSummary[]>('GET', '/farm-bookings'),
   farmBooking: (bookingId: string) => request<FarmBooking>('GET', `/farm-bookings/${id(bookingId)}`),
   farmQrUrl: (bookingId: string) => fileUrl(`/farm-bookings/${id(bookingId)}/qr.svg`, 'PHOTO_UNAVAILABLE', 'The check-in code could not be loaded.'),
   verifyFarmPayment: (bookingId: string, reply: CheckoutReply) =>
     request<{ paymentStatus: string; status: FarmStatus }>('POST', `/farm-bookings/${id(bookingId)}/verify-payment`, reply),
-  renewFarmBooking: (bookingId: string) => request<FarmPaymentStart>('POST', `/farm-bookings/${id(bookingId)}/renew`),
+  /** Starts (or picks up) the online payment of the bill after picking. */
+  payFarm: (bookingId: string) => request<FarmPaymentStart>('POST', `/farm-bookings/${id(bookingId)}/pay`),
   cancelFarmBooking: (bookingId: string, reason?: string) =>
     request<{ requested: boolean; booking: FarmBooking }>('POST', `/farm-bookings/${id(bookingId)}/cancel`, reason ? { reason } : {}),
   moveFarmBooking: (bookingId: string, date: string, note?: string) =>
     request<{ requested: boolean; booking: FarmBooking }>('POST', `/farm-bookings/${id(bookingId)}/reschedule`, note ? { date, note } : { date }),
   answerFarmArrangement: (bookingId: string, accept: boolean) => request<FarmBooking>('POST', `/farm-bookings/${id(bookingId)}/hospitality`, { accept }),
-  answerFarmExtra: (bookingId: string, extraId: string, accept: boolean) =>
-    request<{ declined?: boolean; farmPaymentId?: string; amount?: number; razorpayOrderId?: string; razorpayKeyId?: string | null }>(
-      'POST',
-      `/farm-bookings/${id(bookingId)}/extras/${id(extraId)}`,
-      { accept },
-    ),
-
   /** Development only: the API's stand-in for Razorpay. */
   devPay: (orderId: string, outcome: 'captured' | 'failed') => raw<{ result: string }>('POST', '/dev/pay', { orderId, outcome }),
   devPayPreorder: (preorderId: string, outcome: 'captured' | 'failed') =>
     raw<{ result: string }>('POST', '/dev/pay-preorder', { preorderId, outcome }),
   devPayGift: (giftOrderId: string, outcome: 'captured' | 'failed') => raw<{ result: string }>('POST', '/dev/pay-gift', { giftOrderId, outcome }),
-  devPayFarm: (bookingId: string, outcome: 'captured' | 'failed', extra = false) =>
-    raw<{ result: string }>('POST', '/dev/pay-farm', { bookingId, outcome, extra }),
+  devPayFarm: (bookingId: string, outcome: 'captured' | 'failed') => raw<{ result: string }>('POST', '/dev/pay-farm', { bookingId, outcome }),
 }
 
 /**

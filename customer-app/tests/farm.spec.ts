@@ -4,9 +4,10 @@ import { MANAGER_CONFIRM, managerToken } from './staff'
 
 // Farm Experience (docs/farm-experience.md) against the real API, with FARM_EXPERIENCE on.
 // A manager sets up a variety, its harvest, a room and the farm's details (through the admin
-// API), then a customer finds the farm visit in Bulk Deals, books 300 kg in six steps and pays
-// (test payment). In the staff panel a manager gives the group a room and approves the stay;
-// the customer sees it confirmed, then cancels more than a week ahead for a full refund.
+// API), then a customer finds the farm visit in Bulk Deals and books 300 kg in six steps without
+// paying. In the staff panel a manager gives the group a room, approves the stay, checks them in,
+// records the weighing and sends the bill; the customer pays it after picking (test payment),
+// and the manager completes the visit once the mangoes are collected.
 // The farm details written here are test text for the e2e database only.
 
 const API = (process.env.VITE_API_URL ?? 'http://localhost:3000').replace(/\/$/, '')
@@ -61,7 +62,7 @@ async function noA11yViolations(page: Page) {
   expect(r.violations.map((v) => `${v.id}: ${v.nodes.map((n) => n.target).join(' ')}`)).toEqual([])
 }
 
-test('book a farm visit, pay, get the stay approved in the panel, then cancel for a refund', async ({ page, request, context }, info) => {
+test('book a farm visit without paying, get the stay approved, pick and weigh, then pay the bill', async ({ page, request, context }, info) => {
   test.slow()
   const token = await managerToken(request)
   // Each run books its own variety on its own day, so runs and projects don't share stock or rooms.
@@ -77,6 +78,7 @@ test('book a farm visit, pay, get the stay approved in the panel, then cancel fo
   await expect(page.getByRole('heading', { name: 'Farm Experience', level: 1 })).toBeVisible()
   await expect(page.getByText('E2E test orchard').first()).toBeVisible()
   await expect(page.getByText('E2E: transport is not included.').first()).toBeVisible()
+  await expect(page.getByText(/Nothing is paid when you book/).first()).toBeVisible()
   await noA11yViolations(page)
   await page.getByRole('link', { name: 'Book a visit' }).first().click()
 
@@ -110,26 +112,26 @@ test('book a farm visit, pay, get the stay approved in the panel, then cancel fo
   // 5. Details
   await page.getByLabel('Your name').fill('Asha E2E')
   await page.getByRole('button', { name: 'Continue' }).click()
-  // 6. Summary: the policies must be accepted before paying.
+  // 6. Summary: an estimate, nothing to pay now; the policies must be accepted before booking.
   await expect(page.getByText('Step 6 of 6: Summary')).toBeVisible()
   await expect(page.getByText('3 adults, 0 children, 2 staying overnight')).toBeVisible()
+  await expect(page.getByText(/Nothing is paid now/)).toBeVisible()
   await noA11yViolations(page)
-  await page.getByRole('button', { name: `Pay ${rupee(3_600_000)}` }).click()
+  await page.getByRole('button', { name: 'Book the visit' }).click()
   await expect(page.getByText('Please read and accept the booking policies.')).toBeVisible()
   await page.getByLabel(/I have read the booking policies/).check()
-  await page.getByRole('button', { name: `Pay ${rupee(3_600_000)}` }).click()
+  await page.getByRole('button', { name: 'Book the visit' }).click()
 
   await expect(page.getByRole('heading', { name: /^Farm visit MMF-/ })).toBeVisible()
   const number = (await page.getByRole('heading', { name: /^Farm visit MMF-/ }).textContent())!.replace('Farm visit ', '').trim()
-  await page.getByRole('button', { name: 'Payment succeeds' }).click()
-  await expect(page.getByText('Paid: stay being arranged').first()).toBeVisible()
-  await expect(page.getByText('Your check-in code')).toBeVisible()
+  await expect(page.getByText('Thank you, your farm visit is booked.')).toBeVisible()
+  await expect(page.getByText('Booked: stay being arranged').first()).toBeVisible()
+  await expect(page.getByText(`${rupee(3_600_000)} · you pay after picking`)).toBeVisible()
   await expect(page.getByRole('img', { name: 'QR code for checking in at the farm' })).toBeVisible()
   await noA11yViolations(page)
-  const bookingUrl = page.url()
-  const bookingId = bookingUrl.split('/').pop()!
+  const bookingId = page.url().split('/').pop()!
 
-  // The staff panel: the booking is listed; a manager gives the group the room and approves the stay.
+  // The staff panel: a manager gives the group the room and approves the stay.
   const panel = await context.newPage()
   await panel.goto(`${PANEL}/login`)
   await panel.getByLabel('Work email').fill('manager@mandimangoes.test')
@@ -150,21 +152,55 @@ test('book a farm visit, pay, get the stay approved in the panel, then cancel fo
   const approve = panel.getByRole('dialog')
   if (await approve.count()) await approve.getByRole('button', { name: /Approve/ }).click()
   await expect(panel.getByText('Confirmed', { exact: true }).first()).toBeVisible()
-  await panel.close()
 
-  // The customer sees the stay confirmed with the room, then cancels more than 7 days ahead: a full refund.
+  // The customer sees the stay confirmed with the room.
   await page.reload()
   await expect(page.getByText('Confirmed', { exact: true }).first()).toBeVisible()
   await expect(page.getByText(`${name} room`)).toBeVisible()
-  await page.getByRole('button', { name: 'Cancel booking' }).click()
-  const dialog = page.getByRole('dialog', { name: 'Cancel this farm visit?' })
-  await expect(dialog.getByText(`You get a full refund of ${rupee(3_600_000)} to the way you paid.`)).toBeVisible()
-  await dialog.getByRole('button', { name: 'Cancel booking' }).click()
-  await expect(page.getByText('Cancelled', { exact: true }).first()).toBeVisible()
 
-  // The booking is cancelled on the server too.
-  const after = (await (await request.get(`${API}/admin/v1/farm/bookings/${bookingId}`, { headers: { Authorization: `Bearer ${token}` } })).json()) as { status: string }
-  expect(after.status).toBe('CANCELLED')
+  // The visit (checked in early by the manager, as the visit day is weeks away): pick, weigh, bill.
+  await panel.getByRole('button', { name: 'Check in', exact: true }).click()
+  await panel.getByRole('dialog', { name: 'Check in' }).getByRole('button', { name: 'Check in outside the stay dates' }).click()
+  await panel.getByRole('button', { name: 'Start harvesting' }).click()
+  await panel.getByRole('button', { name: 'Start weighing' }).click()
+  await panel.getByRole('button', { name: 'Record harvest and packing' }).click()
+  const weigh = panel.getByRole('dialog', { name: 'Harvest, weighing and packing' })
+  await weigh.getByLabel('Harvested kg').fill('310')
+  await weigh.getByLabel('Accepted kg (after inspection)').fill('305')
+  await weigh.getByRole('button', { name: 'Save' }).click()
+  await expect(weigh).toBeHidden()
+  await panel.getByRole('button', { name: 'Send the bill' }).click()
+  const bill = panel.getByRole('dialog', { name: 'Send the bill' })
+  await expect(bill.getByLabel('Accepted kg')).toHaveValue('305')
+  await noA11yViolations(panel)
+  await bill.getByRole('button', { name: 'Send the bill' }).click()
+  await expect(bill).toBeHidden()
+  await expect(panel.getByText(/^Bill of ₹36,600(\.00)? waiting to be paid\./)).toBeVisible()
+
+  // The customer pays the bill after picking (test payment in development).
+  await page.reload()
+  await expect(page.getByText('Ready to pay').first()).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Your bill' })).toBeVisible()
+  await expect(page.getByText(rupee(3_660_000)).first()).toBeVisible()
+  await noA11yViolations(page)
+  await page.getByRole('button', { name: 'Payment succeeds' }).click()
+  await expect(page.getByText('Thank you, your payment is received.')).toBeVisible()
+  await expect(page.getByText('Paid: packing').first()).toBeVisible()
+
+  // The manager records the mangoes collected and completes the visit.
+  await panel.reload()
+  await panel.getByRole('button', { name: 'Record harvest and packing' }).click()
+  const pack = panel.getByRole('dialog', { name: 'Harvest, weighing and packing' })
+  await pack.getByLabel('Packing', { exact: true }).selectOption('COLLECTED')
+  await pack.getByRole('button', { name: 'Save' }).click()
+  await expect(pack).toBeHidden()
+  await panel.getByRole('button', { name: 'Complete' }).click()
+  await expect(panel.getByText('Completed', { exact: true }).first()).toBeVisible()
+  await panel.close()
+
+  // The server agrees.
+  const after = (await (await request.get(`${API}/admin/v1/farm/bookings/${bookingId}`, { headers: { Authorization: `Bearer ${token}` } })).json()) as { status: string; money: { paid: number } }
+  expect([after.status, after.money.paid]).toEqual(['COMPLETED', 3_660_000])
 })
 
 // The test room is taken out of the farmhouse again, pass or fail, so later runs see only their own.

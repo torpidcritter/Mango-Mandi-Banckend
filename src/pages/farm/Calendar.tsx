@@ -93,8 +93,7 @@ export default function FarmCalendar() {
                           {v.overCapacity && <Badge tone="warn">Large group</Badge>}
                         </div>
                       ))}
-                      {d.pendingHolds > 0 && <div className="muted small">{d.pendingHolds} waiting for payment</div>}
-                      {!d.visits.length && !d.pendingHolds && <span className="muted">—</span>}
+                      {!d.visits.length && <span className="muted">—</span>}
                     </td>
                     <td data-label="Staying overnight">{d.overnightGuests || '—'}</td>
                     <td data-label="Rooms used">
