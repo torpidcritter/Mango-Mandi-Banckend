@@ -169,6 +169,25 @@ export const OPERATOR_ROUTES = [
   route('POST', '/partner-network/product-proposals/:id/notes'),
   route('POST', '/partner-network/product-proposals/:id/request-sample'),
   route('GET', '/partner-network/categories'),
+  // Farm Experience (docs/farm-experience.md): bookings, notes, the stay, rooms, the day at the farm and check-in.
+  // Dates, cancelling, refunds, no-shows, prices, the calendar, harvest stock, rooms setup, settings and reports are managers'.
+  route('GET', '/farm/overview'),
+  route('GET', '/farm/bookings'),
+  route('GET', '/farm/bookings/:id'),
+  route('PATCH', '/farm/bookings/:id'),
+  route('POST', '/farm/bookings/:id/notes'),
+  route('POST', '/farm/bookings/:id/hospitality'),
+  route('PUT', '/farm/bookings/:id/rooms'),
+  route('POST', '/farm/bookings/:id/status'),
+  route('POST', '/farm/bookings/:id/harvest'),
+  route('POST', '/farm/bookings/:id/extras'),
+  route('POST', '/farm/bookings/:id/extras/:extraId/withdraw'),
+  route('GET', '/farm/check-in/:code'),
+  route('POST', '/farm/check-in'),
+  route('GET', '/farm/calendar'),
+  route('GET', '/farm/varieties'),
+  route('GET', '/farm/rooms'),
+  route('GET', '/farm/settings'),
   ...warehouseFor('OPERATOR'),
 ]
 

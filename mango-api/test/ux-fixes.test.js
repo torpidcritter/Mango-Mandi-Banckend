@@ -98,7 +98,7 @@ describe('UX-3: the hold length at Pay comes from the rules', () => {
       // bills: whether checkout takes business details for the bill (on outside production: trust-config.js).
       bills: true,
       // App feel, growth and gift-to-many switches: all off unless set.
-      features: { installApp: false, push: false, tracking: false, favourites: false, sortFilter: false, referrals: false, funnel: false, multiGift: false, partnerNetwork: true, languages: false },
+      features: { installApp: false, push: false, tracking: false, favourites: false, sortFilter: false, referrals: false, funnel: false, multiGift: false, partnerNetwork: true, farmExperience: false, languages: false },
     })
   })
 

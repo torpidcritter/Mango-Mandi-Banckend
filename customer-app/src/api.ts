@@ -95,6 +95,8 @@ export interface ShopFeatures {
   languages?: boolean
   /** Partner With Us: the business enquiry pages and their links (PARTNER_NETWORK, docs/partner-network.md). */
   partnerNetwork?: boolean
+  /** Farm Experience: the farm visit with 250 kg or more (FARM_EXPERIENCE, docs/farm-experience.md). */
+  farmExperience?: boolean
 }
 /** The shop's languages (the API's GET/PUT /v1/me/language). */
 export type ShopLanguage = 'en' | 'hi' | 'kn'
@@ -867,6 +869,198 @@ const qs = (params: Record<string, string | null | undefined>) => {
 const id = encodeURIComponent
 
 /** What Razorpay Checkout's success handler receives. */
+// Farm Experience (FARM_EXPERIENCE, docs/farm-experience.md). Money in paise; the API prices everything.
+export type FarmStatus =
+  | 'PAYMENT_PENDING'
+  | 'EXPIRED'
+  | 'NEEDS_ATTENTION'
+  | 'HOSPITALITY_REVIEW'
+  | 'CONFIRMED'
+  | 'PREPARING'
+  | 'READY_FOR_VISIT'
+  | 'CHECKED_IN'
+  | 'HARVESTING'
+  | 'WEIGHING'
+  | 'PACKING'
+  | 'COMPLETED'
+  | 'CANCELLED'
+  | 'NO_SHOW'
+export interface FarmMeals {
+  breakfast: boolean
+  lunch: boolean
+  dinner: boolean
+  refreshments: boolean
+}
+/** What the farm team wrote on Farm Settings (empty until they do: the shop never makes it up). */
+export interface FarmSettings {
+  farmName: string
+  location: string
+  mapUrl: string
+  contactPhone: string
+  contactEmail: string
+  arrivalInstructions: string
+  checkInTime: string
+  checkOutTime: string
+  stayNights: number
+  sleepingArrangements: string
+  bathroomFacilities: string
+  otherFacilities: string
+  groupCoordination: string
+  meals: FarmMeals
+  mealNotes: string
+  transportIncluded: boolean
+  transportPolicy: string
+  weatherPolicy: string
+  harvestPolicy: string
+  noShowPolicy: string
+  seasonStart: string
+  seasonEnd: string
+  leadDays: number
+  maxDaysAhead: number
+  holdMinutes: number
+  cancelDays: number
+  rescheduleDays: number
+  guestCharges: string
+  faqs: { q: string; a: string }[]
+}
+export interface FarmVariety {
+  id: string
+  name: string
+  sku: string | null
+  description: string | null
+  ripenessNote: string | null
+  harvestFrom: string | null
+  harvestTo: string | null
+  pricePerKg: number
+  tiers: { minKg: number; pricePerKg: number }[]
+  photoUrl: string | null
+  availableKg?: number
+  bestDayKg?: number
+  firstDate?: string | null
+  available?: boolean
+}
+export interface FarmExperience {
+  minKg: number
+  bookingsOpen: boolean
+  settings: FarmSettings
+  varieties: FarmVariety[]
+}
+export interface FarmDate {
+  date: string
+  visitsLeft: number | null
+  varieties: { varietyId: string; availableKg: number; readiness: string | null }[]
+}
+export interface FarmQuote {
+  varietyId: string
+  kg: number
+  pricePerKg: number
+  total: number
+}
+export interface FarmBookingInput {
+  varietyId: string
+  kg: number
+  visitDate: string
+  arrivalDate?: string
+  departureDate?: string
+  adults: number
+  children: number
+  overnightGuests: number
+  food?: { veg?: number; nonVeg?: number; jain?: number; allergies?: string; requests?: string }
+  accessibility?: string
+  notes?: string
+  contactName: string
+  contactEmail?: string
+  billingName?: string
+  billingGstin?: string
+  acceptPolicies: true
+}
+export interface FarmPaymentStart {
+  bookingId: string
+  number: string
+  status: FarmStatus
+  total: number
+  holdExpiresAt: string | null
+  razorpayOrderId: string | null
+  razorpayKeyId: string | null
+}
+export interface FarmBookingSummary {
+  id: string
+  number: string
+  status: FarmStatus
+  variety: string
+  kg: number
+  total: number
+  visitDate: string
+  guests: number
+  createdAt: string
+}
+export interface FarmExtra {
+  id: string
+  kg: number
+  pricePerKg: number
+  amount: number
+  status: 'REQUESTED' | 'PAYMENT_PENDING' | 'PAID' | 'DECLINED' | 'WITHDRAWN'
+  note: string | null
+}
+export interface FarmBooking {
+  id: string
+  number: string
+  status: FarmStatus
+  refundStatus: 'REFUNDED' | 'REFUND_PENDING' | null
+  variety: { id: string; name: string }
+  kg: number
+  pricePerKg: number
+  total: number
+  visitDate: string
+  guests: {
+    adults: number
+    children: number
+    total: number
+    overnight: number
+    arrivalDate: string
+    departureDate: string
+    food: { veg?: number; nonVeg?: number; jain?: number; allergies?: string; requests?: string }
+    accessibility: string | null
+    notes: string | null
+  }
+  contact: { name: string; phone: string; email: string | null }
+  hospitality: {
+    status: 'PENDING' | 'APPROVED' | 'ALTERNATIVE_PROPOSED' | 'CUSTOMER_ACCEPTED' | 'CUSTOMER_DECLINED'
+    plan: string | null
+    alternative: string | null
+    overCapacity: boolean
+    rooms: { roomId: string; name: string; fromDate: string; toDate: string; guests: number }[]
+    mealPlan: { date: string; breakfast: number; lunch: number; dinner: number; refreshments: number }[]
+  }
+  harvest: { harvestedKg: number | null; acceptedKg: number | null; packingStatus: string | null }
+  money: { paid: number; refunded: number; refunds: { id: string; amount: number; status: string }[] }
+  extras: FarmExtra[]
+  request: { kind: 'CANCEL' | 'MOVE'; date: string | null; note: string | null; at: string } | null
+  holdExpiresAt: string | null
+  checkinCode: string | null
+  payment: { status: string; razorpayOrderId: string | null; failed: boolean } | null
+  extraPayment: { id: string; extraId: string; amount: number; razorpayOrderId: string } | null
+  razorpayKeyId: string | null
+  canCancel: 'UNPAID' | 'REFUND' | 'REQUEST' | null
+  canMove: 'MOVE' | 'REQUEST' | null
+  canRenew: boolean
+  farm: {
+    name: string | null
+    location: string | null
+    mapUrl: string | null
+    contactPhone: string | null
+    contactEmail: string | null
+    arrivalInstructions: string | null
+    checkInTime: string | null
+    checkOutTime: string | null
+    meals: FarmMeals
+    mealNotes: string | null
+    transportIncluded: boolean
+    transportPolicy: string | null
+  }
+  policy: { cancelDays: number; rescheduleDays: number }
+}
+
 export interface CheckoutReply {
   razorpay_payment_id: string
   razorpay_order_id: string
@@ -1094,11 +1288,39 @@ export const api = {
       { 'X-Upload-Token': uploadToken },
     ),
 
+  /** Farm Experience (docs/farm-experience.md): 404 while the switch is off. */
+  farmExperience: () => raw<FarmExperience>('GET', '/farm-experience'),
+  farmDates: (varietyId: string | null, kg: number | null) =>
+    raw<{ dates: FarmDate[] }>('GET', `/farm-experience/dates${qs({ varietyId, kg: kg == null ? null : String(kg) })}`),
+  farmQuote: (varietyId: string, kg: number) => raw<FarmQuote>('POST', '/farm-experience/quote', { varietyId, kg }),
+  /** Holds the mangoes and starts the payment. The key is made once per booking form, so a retry never books twice. */
+  bookFarm: (input: FarmBookingInput, idempotencyKey: string) =>
+    request<FarmPaymentStart>('POST', '/farm-bookings', input, { 'Idempotency-Key': idempotencyKey }),
+  farmBookings: () => request<FarmBookingSummary[]>('GET', '/farm-bookings'),
+  farmBooking: (bookingId: string) => request<FarmBooking>('GET', `/farm-bookings/${id(bookingId)}`),
+  farmQrUrl: (bookingId: string) => fileUrl(`/farm-bookings/${id(bookingId)}/qr.svg`, 'PHOTO_UNAVAILABLE', 'The check-in code could not be loaded.'),
+  verifyFarmPayment: (bookingId: string, reply: CheckoutReply) =>
+    request<{ paymentStatus: string; status: FarmStatus }>('POST', `/farm-bookings/${id(bookingId)}/verify-payment`, reply),
+  renewFarmBooking: (bookingId: string) => request<FarmPaymentStart>('POST', `/farm-bookings/${id(bookingId)}/renew`),
+  cancelFarmBooking: (bookingId: string, reason?: string) =>
+    request<{ requested: boolean; booking: FarmBooking }>('POST', `/farm-bookings/${id(bookingId)}/cancel`, reason ? { reason } : {}),
+  moveFarmBooking: (bookingId: string, date: string, note?: string) =>
+    request<{ requested: boolean; booking: FarmBooking }>('POST', `/farm-bookings/${id(bookingId)}/reschedule`, note ? { date, note } : { date }),
+  answerFarmArrangement: (bookingId: string, accept: boolean) => request<FarmBooking>('POST', `/farm-bookings/${id(bookingId)}/hospitality`, { accept }),
+  answerFarmExtra: (bookingId: string, extraId: string, accept: boolean) =>
+    request<{ declined?: boolean; farmPaymentId?: string; amount?: number; razorpayOrderId?: string; razorpayKeyId?: string | null }>(
+      'POST',
+      `/farm-bookings/${id(bookingId)}/extras/${id(extraId)}`,
+      { accept },
+    ),
+
   /** Development only: the API's stand-in for Razorpay. */
   devPay: (orderId: string, outcome: 'captured' | 'failed') => raw<{ result: string }>('POST', '/dev/pay', { orderId, outcome }),
   devPayPreorder: (preorderId: string, outcome: 'captured' | 'failed') =>
     raw<{ result: string }>('POST', '/dev/pay-preorder', { preorderId, outcome }),
   devPayGift: (giftOrderId: string, outcome: 'captured' | 'failed') => raw<{ result: string }>('POST', '/dev/pay-gift', { giftOrderId, outcome }),
+  devPayFarm: (bookingId: string, outcome: 'captured' | 'failed', extra = false) =>
+    raw<{ result: string }>('POST', '/dev/pay-farm', { bookingId, outcome, extra }),
 }
 
 /**

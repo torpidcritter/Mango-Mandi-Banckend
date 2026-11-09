@@ -15,6 +15,8 @@ import { enqueue } from './notify.js'
 import { addEvent, processPayment, SYSTEM } from './orders.js'
 import { findPreorderId, processPreorderPayment, refundPreorder } from './preorders.js'
 import { processGiftPayment } from './gifts.js'
+import { processFarmPayment } from './farm/bookings.js'
+import { applyFarmRefundOutcome, processDueFarmRefunds } from './farm/refunds.js'
 
 const hasKeys = () => Boolean(env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET)
 const RAZORPAY = 'https://api.razorpay.com/v1'
@@ -217,6 +219,9 @@ export async function applyCapture(c, table, id, p) {
   if (table === 'preorders') {
     return processPreorderPayment(c, { preorderId: id, outcome: 'captured', paymentId: p.id, amount: p.amount, method: p.method })
   }
+  if (table === 'farm_booking_payments') {
+    return (await processFarmPayment(c, { farmPaymentId: id, outcome: 'captured', paymentId: p.id, amount: p.amount, method: p.method })).result
+  }
   return (await processPayment(c, { orderId: id, outcome: 'captured', paymentId: p.id, amount: p.amount, method: p.method })).result
 }
 
@@ -228,8 +233,9 @@ export async function applyCapture(c, table, id, p) {
  * (it bought nothing). Returns null when the payment is fine, else a reason.
  */
 export async function checkCapture(c, { table, id, paymentId, amount, currency }) {
-  const from = table === 'preorders' ? 'preorders' : table === 'gift_orders' ? 'gift_orders' : 'orders'
-  const { rows } = await c.query(`SELECT total, payment_id FROM ${from} WHERE id = $1`, [id])
+  const from = table === 'preorders' ? 'preorders' : table === 'gift_orders' ? 'gift_orders' : table === 'farm_booking_payments' ? 'farm_booking_payments' : 'orders'
+  // A farm payment (docs/farm-experience.md) is one row per Razorpay order, with its own amount.
+  const { rows } = await c.query(`SELECT ${from === 'farm_booking_payments' ? 'amount AS total' : 'total'}, payment_id FROM ${from} WHERE id = $1`, [id])
   const total = rows[0]?.total
   let reason = null
   if (!paymentId) reason = 'captured payment has no payment id'
@@ -244,7 +250,7 @@ export async function checkCapture(c, { table, id, paymentId, amount, currency }
   if (paymentId && paymentId !== rows[0]?.payment_id) {
     // A gift order's refundable payment is recorded against its first delivery (duplicate_payments points at orders).
     const orderId =
-      table === 'preorders' ? null
+      table === 'preorders' || table === 'farm_booking_payments' ? null
         : table === 'gift_orders' ? ((await c.query('SELECT id FROM orders WHERE gift_order_id = $1 ORDER BY gift_position, id LIMIT 1', [id])).rows[0]?.id ?? null)
           : id
     await c.query(
@@ -338,6 +344,20 @@ async function routeWebhook(event, eventId, mark) {
       })
       return { result: r.result, giftOrderId, refundOrderIds: r.refundOrderIds }
     }
+    // Farm Experience: a booking's payment, found by our own Razorpay order id only.
+    const farmPaymentId = orderId || link || !entity.order_id ? null
+      : ((await c.query('SELECT id FROM farm_booking_payments WHERE razorpay_order_id = $1', [entity.order_id])).rows[0]?.id ?? null)
+    if (farmPaymentId) {
+      if (kind !== 'payment.failed') {
+        const bad = await checkCapture(c, { table: 'farm_booking_payments', id: farmPaymentId, paymentId: entity.id, amount: entity.amount, currency: entity.currency })
+        if (bad) return { result: 'rejected', farmPaymentId, reason: bad }
+      }
+      const r = await processFarmPayment(c, {
+        farmPaymentId, outcome: kind === 'payment.failed' ? 'failed' : 'captured', paymentId: entity.id ?? null,
+        amount: typeof entity.amount === 'number' ? entity.amount : null, method: entity.method ?? null,
+      })
+      return { result: r.result, farmBookingId: r.bookingId }
+    }
     if (!orderId) {
       const preorderId = await findPreorderId(c, entity, link)
       if (preorderId) {
@@ -392,6 +412,8 @@ export function refundsFor(out) {
     preorderId: due ? (out.preorderId ?? null) : null,
     // A gift order (MULTI_GIFT): the deliveries the buyer cancelled before its payment landed.
     orderIds: out?.refundOrderIds ?? [],
+    // Farm Experience: a booking paid after it was cancelled.
+    farmBookingId: due ? (out.farmBookingId ?? null) : null,
     duplicates: out?.result === 'duplicate_payment' || out?.result === 'rejected',
   }
 }
@@ -403,12 +425,13 @@ export function refundsFor(out) {
  * and the maintenance loop can't pay twice, and anything that fails here is
  * retried by maintenance (processDueRefunds, refundDuplicatePayments). Never throws.
  */
-export async function sendDueRefunds({ orderId = null, preorderId = null, orderIds = [], duplicates = false } = {}) {
+export async function sendDueRefunds({ orderId = null, preorderId = null, orderIds = [], duplicates = false, farmBookingId = null } = {}) {
   const log = (what) => (err) => logger.error({ err, orderId, preorderId }, `${what} refund failed; maintenance will retry`)
   if (orderId) await refundOrder(orderId).catch(log('order'))
   for (const id of orderIds) await refundOrder(id).catch(log('gift delivery'))
   if (preorderId) await refundPreorder(preorderId).catch(log('preorder'))
   if (duplicates) await refundDuplicatePayments().catch(log('duplicate payment'))
+  if (farmBookingId) await processDueFarmRefunds(now(), { bookingId: farmBookingId }).catch(log('farm booking'))
 }
 
 const DISPUTE_DONE = ['won', 'lost', 'closed']
@@ -474,7 +497,8 @@ async function handleDisputeEvent(event, eventId, mark) {
 async function captureAuthorized(entity) {
   if (!entity.id || !entity.order_id) return { ignored: true }
   const { rows } = await query(
-    'SELECT id, total FROM orders WHERE razorpay_order_id = $1 UNION ALL SELECT id, total FROM gift_orders WHERE razorpay_order_id = $1',
+    `SELECT id, total FROM orders WHERE razorpay_order_id = $1 UNION ALL SELECT id, total FROM gift_orders WHERE razorpay_order_id = $1
+      UNION ALL SELECT id, amount FROM farm_booking_payments WHERE razorpay_order_id = $1`,
     [entity.order_id],
   )
   const o = rows[0]
@@ -527,7 +551,7 @@ async function handleRefundEvent(event, eventId, mark) {
  * 'failed' for a manager instead. Returns how many rows matched.
  */
 async function applyRefundOutcome(c, refundId, failed) {
-  let hit = 0
+  let hit = await applyFarmRefundOutcome(c, refundId, failed)
   for (const table of ['orders', 'preorders']) {
     const { rows } = await c.query(`SELECT id, status, refund_attempts FROM ${table} WHERE refund_id = $1 FOR UPDATE`, [refundId])
     for (const row of rows) {
@@ -582,6 +606,9 @@ export async function reconcileRefunds(at = now()) {
      UNION ALL
      SELECT 'duplicate_payments', payment_id, payment_id, refund_id FROM duplicate_payments
       WHERE refund_status = 'pending' AND refund_id IS NOT NULL AND refunded_at < $1 AND (refund_checked_at IS NULL OR refund_checked_at < $2)
+     UNION ALL
+     SELECT 'farm_refunds', id, payment_id, refund_id FROM farm_refunds
+      WHERE refund_status = 'pending' AND refund_id IS NOT NULL AND refund_id NOT LIKE 'manual:%' AND refunded_at < $1 AND (refund_checked_at IS NULL OR refund_checked_at < $2)
      LIMIT 20`,
     [new Date(at.getTime() - REFUND_SETTLE_MS), new Date(at.getTime() - REFUND_RECHECK_MS)],
   )
@@ -653,7 +680,56 @@ export async function reconcilePendingPayments({ minAgeSeconds = 120 } = {}) {
       logger.error({ err, giftOrderId: g.id }, 'payment reconciliation failed for gift order')
     }
   }
+  // Farm Experience payments still unpaid, for a day after they were started (a payment can land after the hold).
+  const farm = await query(
+    `SELECT id, razorpay_order_id FROM farm_booking_payments
+      WHERE razorpay_order_id IS NOT NULL AND status IN ('INITIATED', 'CANCELLED') AND created_at < $1 AND created_at > $2
+        AND (reconcile_checked_at IS NULL OR reconcile_checked_at < $3)
+      ORDER BY (status = 'INITIATED') DESC, reconcile_checked_at NULLS FIRST, created_at DESC LIMIT 50`,
+    [new Date(at.getTime() - minAgeSeconds * 1000), new Date(at.getTime() - 86_400_000), new Date(at.getTime() - 50_000)],
+  )
+  for (const p of farm.rows) {
+    if (!canStartCall(GATEWAY_CALL_MS)) break
+    try {
+      await query('UPDATE farm_booking_payments SET reconcile_checked_at = $2 WHERE id = $1', [p.id, now()])
+      const r = await reconcileFarmPayment(p)
+      if (r && r !== 'rejected') n++
+    } catch (err) {
+      logger.error({ err, farmPaymentId: p.id }, 'payment reconciliation failed for farm booking')
+    }
+  }
   return n
+}
+
+/** Farm Experience: reconcileOrder for one farm payment's Razorpay order. */
+async function reconcileFarmPayment(p) {
+  const payments = await fetchPayments(p.razorpay_order_id)
+  const captured = payments.find((x) => x.status === 'captured')
+  if (captured) return tx((c) => applyCapture(c, 'farm_booking_payments', p.id, captured))
+  const authorized = payments.find((x) => x.status === 'authorized')
+  if (authorized) await captureAuthorized({ id: authorized.id, order_id: p.razorpay_order_id, amount: authorized.amount, currency: authorized.currency })
+  return null
+}
+
+/**
+ * Farm Experience: the customer is back from Checkout, or the booking page asks:
+ * at most one gateway check every `throttleMs` per payment. Returns the result, 'skipped' or null.
+ */
+export async function reconcileFarmNow(farmPaymentId, { minAgeMs = 0, throttleMs = 10_000 } = {}) {
+  if (!hasKeys() && isProd) return null
+  const at = now()
+  const { rows } = await query(
+    `UPDATE farm_booking_payments SET reconcile_checked_at = $2
+      WHERE id = $1 AND razorpay_order_id IS NOT NULL AND created_at <= $3 AND status IN ('INITIATED', 'CANCELLED')
+        AND (reconcile_checked_at IS NULL OR reconcile_checked_at < $4)
+      RETURNING id, razorpay_order_id, booking_id`,
+    [farmPaymentId, at, new Date(at.getTime() - minAgeMs), new Date(at.getTime() - throttleMs)],
+  )
+  if (!rows.length) return 'skipped'
+  const r = await reconcileFarmPayment(rows[0])
+  if (r === 'refund_due') background(sendDueRefunds({ farmBookingId: rows[0].booking_id }))
+  if (r === 'duplicate_payment' || r === 'rejected') background(sendDueRefunds({ duplicates: true }))
+  return r
 }
 
 /** MULTI_GIFT: reconcileOrder for a gift order's Razorpay order. */
@@ -898,7 +974,9 @@ export async function gatewayRefund({ paymentId, amount, receipt, notes, shared 
     // parts, one per delivery: only the refunds made for this delivery (by its
     // orderId note) count toward it.
     const all = gatewayItems(await razorpay('GET', `/payments/${pid}/refunds`), 'rfnd_', 'refund list').filter((r) => r.status !== 'failed')
-    const live = shared ? all.filter((r) => r.notes?.orderId === notes?.orderId) : all
+    // A farm refund (docs/farm-experience.md) is tagged with its own id instead.
+    const tag = (n) => n?.farmRefundId ?? n?.orderId
+    const live = shared ? all.filter((r) => tag(r.notes) === tag(notes)) : all
     const done = live.reduce((sum, r) => sum + (r.amount ?? 0), 0)
     const owed = amount == null ? null : amount - done
     if (live.length && (owed == null || owed <= 0)) return live[0].id
@@ -985,6 +1063,8 @@ export async function processDueRefunds(at = now()) {
       logger.error({ err, orderId: o.id }, 'refund failed; will retry')
     }
   }
+  // Farm Experience refunds (farm/refunds.js), the same lease and back-off.
+  n += await processDueFarmRefunds(at)
   return n
 }
 
@@ -1226,6 +1306,7 @@ export async function knownPayment(id, c = { query }) {
     `SELECT 1 FROM orders WHERE payment_id = $1
       UNION ALL SELECT 1 FROM preorders WHERE payment_id = $1
       UNION ALL SELECT 1 FROM gift_orders WHERE payment_id = $1
+      UNION ALL SELECT 1 FROM farm_booking_payments WHERE payment_id = $1
       UNION ALL SELECT 1 FROM duplicate_payments WHERE payment_id = $1 LIMIT 1`,
     [id],
   )

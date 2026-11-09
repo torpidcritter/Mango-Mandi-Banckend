@@ -41,6 +41,7 @@ export const PANEL_SWITCHES = [
   { key: 'SUBSCRIPTIONS', label: 'Subscriptions', description: 'A box every week or fortnight in the season, each one paid for as a normal order (no auto-debit).' },
   { key: 'MULTI_GIFT', label: 'Gifts to many addresses', description: 'One order can send gift boxes to several addresses.' },
   { key: 'SHOP_LANGUAGES', label: 'Shop languages', description: 'Customers can read the shop in another language.' },
+  { key: 'FARM_EXPERIENCE', label: 'Farm Experience', description: 'Farm visits with 250 kg or more of mangoes in Bulk Deals, and the panel’s farm pages. Customers can book only once Farm Settings opens bookings.' },
   { key: 'PARTNER_NETWORK', label: 'Partner With Us', description: 'The shop’s Partner With Us page and enquiry form, and the panel’s Partner Network section.' },
 ]
 

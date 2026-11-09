@@ -243,6 +243,8 @@ me.get(
         ...(isOn('SUBSCRIPTIONS') ? { subscriptions: true } : {}),
         // Partner Network (docs/partner-network.md): always named, so the panel hides the section when it is off.
         partnerNetwork: isOn('PARTNER_NETWORK'),
+        // Farm Experience (docs/farm-experience.md): always named, so the panel hides its pages when it is off.
+        farmExperience: isOn('FARM_EXPERIENCE'),
       },
       twoStep: {
         enabled: Boolean(rows[0].totp_enabled_at),

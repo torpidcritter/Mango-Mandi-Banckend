@@ -186,6 +186,20 @@ const schema = z.object({
     .transform((s) => s.split(',').map((p) => p.trim()).filter(Boolean))
     .refine((list) => list.every((p) => /^(\+91)?[6-9]\d{9}$/.test(p.replace(/[\s-]/g, ''))), 'PARTNER_ALERT_PHONES must be Indian mobile numbers, comma-separated')
     .transform((list) => list.map((p) => `+91${p.replace(/[\s-]/g, '').replace(/^\+91/, '')}`)),
+  // Farm Experience (docs/farm-experience.md): 250 kg or more bought online with a visit to the farm.
+  // Off unless set to true; managers can also turn it on or off on the panel once it is allowed here.
+  // Customers can book only once a manager also opens bookings on the Farm Settings page.
+  FARM_EXPERIENCE: flag(),
+  // WhatsApp for it: the customer's updates (mandi_farm_booking_update) and the team's alerts
+  // (mandi_farm_team_alert). Turn on once Meta approves both; until then the booking page shows the same.
+  WHATSAPP_FARM_UPDATES: flag(),
+  // Who gets the team alerts: comma-separated Indian mobile numbers. Unset: no team alerts (the panel shows the same).
+  FARM_ALERT_PHONES: z
+    .string()
+    .default('')
+    .transform((s) => s.split(',').map((p) => p.trim()).filter(Boolean))
+    .refine((list) => list.every((p) => /^(\+91)?[6-9]\d{9}$/.test(p.replace(/[\s-]/g, ''))), 'FARM_ALERT_PHONES must be Indian mobile numbers, comma-separated')
+    .transform((list) => list.map((p) => `+91${p.replace(/[\s-]/g, '').replace(/^\+91/, '')}`)),
   // SHOP_LANGUAGES: the shop in Hindi and Kannada as well as English, chosen by each customer
   // (saved to their account once signed in). Off: the shop is English only (docs/languages.md).
   SHOP_LANGUAGES: flag(),

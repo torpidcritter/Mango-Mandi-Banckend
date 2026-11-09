@@ -33,6 +33,8 @@ The wording is a suggestion for the submission. Keep the variables, their order 
 | SUBSCRIPTION_DUE | `mandi_subscription_due` | UTILITY | 4 | — |
 | PARTNER_ENQUIRY_RECEIVED | `mandi_partner_enquiry_received` | UTILITY | 3 | — |
 | PARTNER_TEAM_ALERT | `mandi_partner_team_alert` | UTILITY | 4 | — |
+| FARM_BOOKING_UPDATE | `mandi_farm_booking_update` | UTILITY | 4 | — |
+| FARM_TEAM_ALERT | `mandi_farm_team_alert` | UTILITY | 4 | — |
 | MANAGER_DAILY_SUMMARY | `mandimangoes_daily_summary` | UTILITY | 8 | — |
 | LOGIN_CODE | `mandi_login_code` | AUTHENTICATION | 1 | Copy code (Meta's one-time password button) |
 
@@ -395,6 +397,40 @@ Suggested wording: (write it in WhatsApp Manager)
   2. enquiry reference (example: MMP-7K2QXD9T)
   3. detail (example: Farmers & Suppliers, Ratnagiri, Maharashtra)
   4. panel link (example: https://ops.mandimangoes.in/partner-network/enquiries/pen_1)
+
+Suggested wording: (write it in WhatsApp Manager)
+
+## FARM_BOOKING_UPDATE
+
+- Template: `mandi_farm_booking_update`
+- Category: UTILITY
+- Who may receive it: Order and service update: sent unless the number sent STOP
+- Sent when: A Farm Experience booking is paid, confirmed, moved, cancelled, refunded, ready for the visit, reminded two days before, or asks the customer to approve extra mangoes (FARM_EXPERIENCE, docs/farm-experience.md).
+- Only with `WHATSAPP_FARM_UPDATES=true`
+- Button: none
+- If it can't be sent: Not sent: the booking page in the shop shows the same status.
+- Variables:
+  1. name (example: Asha)
+  2. booking number (example: MMF-7K2QXD9T)
+  3. what happened (example: Your farm visit on Sat, 10 Apr is confirmed. Your itinerary and check-in code are in your booking.)
+  4. booking link (example: https://mandimangoes.in/farm-bookings/fbk_1)
+
+Suggested wording: (write it in WhatsApp Manager)
+
+## FARM_TEAM_ALERT
+
+- Template: `mandi_farm_team_alert`
+- Category: UTILITY
+- Who may receive it: Asked for by the person: sent unless the number sent STOP
+- Sent when: To the numbers in FARM_ALERT_PHONES: a new paid booking, one that needs a manager, a customer request, or a declined stay proposal.
+- Only with `WHATSAPP_FARM_UPDATES=true`
+- Button: none
+- If it can't be sent: Not sent: the Farm Experience Bookings list shows the same.
+- Variables:
+  1. what happened (example: New paid farm booking)
+  2. booking number (example: MMF-7K2QXD9T)
+  3. detail (example: 300 kg Alphonso, Sat, 10 Apr, 6 guests)
+  4. panel link (example: https://ops.mandimangoes.in/farm/bookings/fbk_1)
 
 Suggested wording: (write it in WhatsApp Manager)
 

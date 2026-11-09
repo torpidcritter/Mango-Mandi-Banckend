@@ -201,6 +201,10 @@ export function paramsFor(n) {
       // "{{2}} off your next order of {{5}} or more: code {{3}}, until {{4}}" (docs/growth.md).
       // {{2}} is "10%" for a percent code, "Rs 100" for a flat one.
       return [name, n.reward_kind === 'PERCENT' ? `${n.reward_amount ?? 0}%` : rupees(n.reward_amount ?? 0), n.reward_code ?? '', n.reward_ends_on ? dateWords(n.reward_ends_on) : 'soon', rupees(n.reward_min ?? 0)]
+    case 'FARM_BOOKING_UPDATE':
+    case 'FARM_TEAM_ALERT':
+      // Fixed when queued (farm/notify.js), so a late retry still says what happened then.
+      return (n.farm_params ?? []).map(String)
     case 'PARTNER_ENQUIRY_RECEIVED':
     case 'PARTNER_TEAM_ALERT':
       // Fixed when queued (partner/alerts.js), so a late retry still says what happened then.
