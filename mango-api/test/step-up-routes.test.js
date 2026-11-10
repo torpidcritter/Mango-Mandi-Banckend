@@ -229,7 +229,9 @@ const SCENARIOS = {
   },
   'POST /farm/bookings/:id/record-payment': async () => {
     const id = await billedFarmBooking()
-    return { path: `/farm/bookings/${id}/record-payment`, body: { method: 'CASH', reference: 'Receipt 12' }, ok: 200, unchanged: async () => (await one('SELECT paid_at FROM farm_bookings WHERE id = $1', [id])).paid_at === null }
+    // The group arrived today (the helper skips the visit), so today's payment date is allowed.
+    const { bill_amount: amount } = await one('UPDATE farm_bookings SET arrival_date = $2 WHERE id = $1 RETURNING bill_amount', [id, todayIST()])
+    return { path: `/farm/bookings/${id}/record-payment`, body: { method: 'CASH', reference: 'Receipt 12', amount }, ok: 200, unchanged: async () => (await one('SELECT paid_at FROM farm_bookings WHERE id = $1', [id])).paid_at === null }
   },
   'POST /farm/refunds/:id/settle': async () => {
     const id = await paidFarmBooking()

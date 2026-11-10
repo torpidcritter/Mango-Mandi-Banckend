@@ -9,8 +9,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { date, dateTime, rupees } from '../../format'
 import { MONEY_CHANGE_WHY, useStepUp } from '../../StepUp'
 import { Badge, BackLink, Dialog, FormError, ManagerOnlyNote, PhoneLink, QueryError, Spinner, scrollRegion, usePageTitle, useToast } from '../../ui'
-import { farm, type Booking, type MealDay, type RecordedMethod } from './api'
-import { FARM_STATUS_LABEL, FarmBadge, HOSPITALITY_LABEL, MOVE_LABEL, useIsManager } from './shared'
+import { farm, type Booking, type MealDay, type RecordedMethod, type RecordPaymentBody } from './api'
+import { FARM_STATUS_LABEL, FarmBadge, HOSPITALITY_LABEL, MOVE_LABEL, toPaise, toRupees, useIsManager } from './shared'
 
 export default function FarmBookingDetail() {
   const { id = '' } = useParams()
@@ -303,6 +303,8 @@ function Detail({ b }: { b: Booking }) {
                   <td>
                     {p.kind === 'RECORDED' ? `At the farm: ${(p.method ?? '').toLowerCase().replace(/_/g, ' ')}` : 'Online'}
                     {p.reference && <div className="muted small">Ref {p.reference}</div>}
+                    {p.receivedOn && <div className="muted small">Received {date(p.receivedOn)}</div>}
+                    {p.note && <div className="muted small">Remarks: {p.note}</div>}
                     {p.recordedBy && <div className="muted small">Recorded by {p.recordedBy}</div>}
                   </td>
                   <td>{rupees(p.amount)}</td>
@@ -415,6 +417,7 @@ function Detail({ b }: { b: Booking }) {
       {dialog('recordPayment') && b.bill && (
         <RecordPaymentDialog
           amount={b.bill.amount}
+          arrival={earliestPaymentDay(b)}
           busy={act.isPending}
           error={act.error}
           onClose={() => setOpen(null)}
@@ -872,23 +875,38 @@ const METHODS = [
   ['BANK_TRANSFER', 'Bank transfer'],
 ] as const
 
+const indiaDay = (d: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(d)
+const todayInIndia = () => indiaDay(new Date())
+/** Money is taken at the farm, so not before the group arrived (or was checked in early). The API checks the same. */
+const earliestPaymentDay = (b: Booking) => {
+  const checkedIn = b.checkedInAt ? indiaDay(new Date(b.checkedInAt)) : null
+  return checkedIn && checkedIn < b.guests.arrivalDate ? checkedIn : b.guests.arrivalDate
+}
+
 function RecordPaymentDialog({
   amount,
+  arrival,
   busy,
   error,
   onClose,
   onSave,
 }: {
   amount: number
+  arrival: string
   busy: boolean
   error: unknown
   onClose: () => void
-  onSave: (body: { method: RecordedMethod; reference: string }) => void
+  onSave: (body: RecordPaymentBody) => void
 }) {
   const id = useId()
+  const today = todayInIndia()
   const [method, setMethod] = useState<RecordedMethod>('UPI')
   const [reference, setReference] = useState('')
-  const ok = reference.trim().length >= 3
+  const [received, setReceived] = useState(toRupees(amount))
+  const [receivedOn, setReceivedOn] = useState(today)
+  const [note, setNote] = useState('')
+  const full = received.trim() !== '' && toPaise(received) === amount
+  const ok = reference.trim().length >= 3 && full && receivedOn >= arrival && receivedOn <= today
   return (
     <Dialog
       title="Record payment at the farm"
@@ -908,7 +926,7 @@ function RecordPaymentDialog({
         id={id}
         onSubmit={(e) => {
           e.preventDefault()
-          if (ok) onSave({ method, reference: reference.trim() })
+          if (ok) onSave({ method, reference: reference.trim(), amount: toPaise(received), receivedOn, ...(note.trim() && { note: note.trim() }) })
         }}
       >
         <p>
@@ -925,9 +943,24 @@ function RecordPaymentDialog({
           </select>
         </div>
         <div className="field">
+          <label htmlFor={`${id}-a`}>Amount received (₹)</label>
+          <input id={`${id}-a`} inputMode="decimal" value={received} onChange={(e) => setReceived(e.target.value)} aria-describedby={`${id}-a-hint`} />
+          <p id={`${id}-a-hint`} className={full ? 'muted small' : 'small form-error'}>
+            {full ? 'The full bill.' : `Packing starts only on the full bill of ${rupees(amount)}. Record it once all of it is in.`}
+          </p>
+        </div>
+        <div className="field">
+          <label htmlFor={`${id}-d`}>Date received</label>
+          <input id={`${id}-d`} type="date" min={arrival} max={today} value={receivedOn} onChange={(e) => setReceivedOn(e.target.value)} />
+        </div>
+        <div className="field">
           <label htmlFor={`${id}-r`}>Receipt or UPI reference</label>
           <input id={`${id}-r`} value={reference} maxLength={100} onChange={(e) => setReference(e.target.value)} data-autofocus />
           <p className="muted small">At least 3 characters.</p>
+        </div>
+        <div className="field">
+          <label htmlFor={`${id}-n`}>Remarks (staff only, optional)</label>
+          <textarea id={`${id}-n`} rows={2} maxLength={1000} value={note} onChange={(e) => setNote(e.target.value)} />
         </div>
         <FormError error={error} />
       </form>

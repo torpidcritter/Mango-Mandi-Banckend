@@ -155,6 +155,8 @@ export interface Booking {
     paymentId: string | null
     method: string | null
     reference: string | null
+    receivedOn: string | null
+    note: string | null
     recordedBy: string | null
     failed: boolean
     createdAt: string
@@ -175,6 +177,9 @@ export interface FarmBill {
   amount: number
   at: string
 }
+/** A payment taken at the farm: the full bill, the day it came in, and private remarks. */
+export type RecordPaymentBody = { method: RecordedMethod; reference: string; amount: number; receivedOn: string; note?: string }
+
 export type RecordedMethod = 'UPI' | 'CARD' | 'CASH' | 'BANK_TRANSFER'
 export interface HarvestCell {
   varietyId: string
@@ -288,7 +293,7 @@ export const farm = {
   /** The bill after weighing (or a corrected one before it is paid). */
   bill: (bookingId: string, acceptedKg?: number) => apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/bill`, acceptedKg == null ? {} : { acceptedKg }),
   /** A manager records the bill paid at the farm (always confirmed with the manager's password). */
-  recordPayment: (bookingId: string, body: { method: RecordedMethod; reference: string }, confirmCode?: string) =>
+  recordPayment: (bookingId: string, body: RecordPaymentBody, confirmCode?: string) =>
     apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/record-payment`, withCode(body, confirmCode)),
   move: (bookingId: string, date: string, reason: string, outsideWindow = false) =>
     apiRequest<Booking>('POST', `${F}/bookings/${id(bookingId)}/move`, { date, reason, ...(outsideWindow && { outsideWindow }) }),

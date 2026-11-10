@@ -206,11 +206,16 @@ router.post(
       z.object({
         method: z.enum(['UPI', 'CARD', 'CASH', 'BANK_TRANSFER']),
         reference: z.string().trim().min(3, 'Give the receipt or UPI reference').max(100),
+        amount: z.number().int('In paise').positive(),
+        receivedOn: DAY.optional(),
+        note: z.string().trim().max(1000).optional(),
       }).strict(),
       withoutConfirm(req.body),
     )
     await stepUp(req, { always: true })
-    await tx(async (c) => recordPayment(c, await lockBooking(c, id), { method: p.method, reference: p.reference, actor: actorOf(req) }))
+    await tx(async (c) =>
+      recordPayment(c, await lockBooking(c, id), { method: p.method, reference: p.reference, amount: p.amount, receivedOn: p.receivedOn, note: p.note || null, actor: actorOf(req) }),
+    )
     res.json(await fresh(id))
   }),
 )

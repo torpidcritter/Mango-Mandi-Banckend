@@ -577,15 +577,24 @@ export async function billPayment(c, b) {
 }
 
 /** A manager records that the customer paid the bill another way at the farm (UPI to the farm, card machine, cash). */
-export async function recordPayment(c, b, { method, reference, actor }) {
+export async function recordPayment(c, b, { method, reference, amount, receivedOn = todayIST(), note = null, actor, today = todayIST() }) {
   if (b.status !== 'PAYMENT_DUE' || b.paid_at) throw conflict('There is no unpaid bill on this booking.', 'NOTHING_TO_PAY')
+  // Only the full bill pays it: packing never starts on part of the money.
+  if (amount !== b.bill_amount) {
+    throw conflict(`The bill is ${b.bill_amount / 100} rupees. Record the payment only once the full bill is in.`, 'AMOUNT_MISMATCH')
+  }
+  if (receivedOn > today) throw conflict('The payment date can’t be in the future.', 'BAD_PAYMENT_DATE')
+  // The group pays at the farm, so not before they arrived (or were checked in early).
+  const earliest = b.checked_in_at ? [todayIST(b.checked_in_at), b.arrival_date].sort()[0] : b.arrival_date
+  if (receivedOn < earliest) throw conflict('The payment date can’t be before the group arrived.', 'BAD_PAYMENT_DATE')
   await c.query(`UPDATE farm_booking_payments SET status = 'CANCELLED' WHERE booking_id = $1 AND status = 'INITIATED'`, [b.id])
   await c.query(
-    `INSERT INTO farm_booking_payments (id, booking_id, kind, amount, status, payment_method, reference, recorded_by, created_at, paid_at)
-     VALUES ($1, $2, 'RECORDED', $3, 'SUCCEEDED', $4, $5, $6, $7, $7)`,
-    [newId('fbp'), b.id, b.bill_amount, method, reference, actor.label, now()],
+    `INSERT INTO farm_booking_payments (id, booking_id, kind, amount, status, payment_method, reference, received_on, note, recorded_by, created_at, paid_at)
+     VALUES ($1, $2, 'RECORDED', $3, 'SUCCEEDED', $4, $5, $6, $7, $8, $9, $9)`,
+    [newId('fbp'), b.id, b.bill_amount, method, reference, receivedOn, note, actor.label, now()],
   )
-  return move(c, b, 'PACKING', { action: 'PAID', detail: `${b.bill_amount / 100} rupees paid by ${method.toLowerCase().replace(/_/g, ' ')} (${reference}), recorded by staff`, actor, fields: { paid_at: now() } })
+  const how = `${b.bill_amount / 100} rupees paid by ${method.toLowerCase().replace(/_/g, ' ')} on ${receivedOn} (${reference}), recorded by staff`
+  return move(c, b, 'PACKING', { action: 'PAID', detail: how, actor, fields: { paid_at: now() } })
 }
 
 export async function markNoShow(c, b, { actor, note, today = todayIST() }) {
@@ -711,7 +720,7 @@ export async function staffView(c, b) {
     harvestDay: harvest.rows[0] ? { estimatedKg: harvest.rows[0].estimated_kg, bookableKg: harvest.rows[0].bookable_kg, reservedKg: harvest.rows[0].reserved_kg, readiness: harvest.rows[0].readiness, qcStatus: harvest.rows[0].qc_status } : null,
     payments: p.payments.map((x) => ({
       id: x.id, kind: x.kind, amount: x.amount, status: x.status, razorpayOrderId: x.razorpay_order_id, paymentId: x.payment_id, method: x.payment_method,
-      reference: x.reference, recordedBy: x.recorded_by, failed: Boolean(x.last_failure), createdAt: x.created_at, paidAt: x.paid_at,
+      reference: x.reference, receivedOn: x.received_on, note: x.note, recordedBy: x.recorded_by, failed: Boolean(x.last_failure), createdAt: x.created_at, paidAt: x.paid_at,
     })),
     events: p.events.map((e) => ({ id: e.id, from: e.from_status, to: e.to_status, action: e.action, detail: e.detail, actor: e.actor, actorKind: e.actor_kind, at: e.created_at })),
     notes: notes.rows.map((n) => ({ id: n.id, body: n.body, author: n.author_name, at: n.created_at })),

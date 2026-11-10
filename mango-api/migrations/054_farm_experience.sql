@@ -183,14 +183,17 @@ CREATE TABLE farm_booking_payments (
   status               TEXT NOT NULL CHECK (status IN ('INITIATED', 'SUCCEEDED', 'FAILED', 'CANCELLED')),
   payment_id           TEXT UNIQUE,
   payment_method       TEXT,
-  -- RECORDED only: the receipt or UPI reference, and the manager who recorded it.
+  -- RECORDED only: the receipt or UPI reference, the day the money came in,
+  -- the manager's private remarks, and the manager who recorded it.
   reference            TEXT CHECK (reference IS NULL OR length(reference) <= 100),
+  received_on          DATE,
+  note                 TEXT CHECK (note IS NULL OR length(note) <= 1000),
   recorded_by          TEXT,
   last_failure         TEXT,
   reconcile_checked_at TIMESTAMPTZ,
   created_at           TIMESTAMPTZ NOT NULL,
   paid_at              TIMESTAMPTZ,
-  CHECK (kind = 'ONLINE' OR (status = 'SUCCEEDED' AND reference IS NOT NULL AND recorded_by IS NOT NULL))
+  CHECK (kind = 'ONLINE' OR (status = 'SUCCEEDED' AND reference IS NOT NULL AND received_on IS NOT NULL AND recorded_by IS NOT NULL))
 );
 CREATE INDEX farm_booking_payments_booking_idx ON farm_booking_payments (booking_id, created_at);
 CREATE INDEX farm_booking_payments_pending_idx ON farm_booking_payments (created_at) WHERE status = 'INITIATED';

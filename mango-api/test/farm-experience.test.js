@@ -465,13 +465,27 @@ describe('the visit, the bill and paying after picking', () => {
     const { cust, id } = await booked(varietyId)
     const bill = await billed(id)
     const pay = await startPay(cust, id)
-    const body = { method: 'UPI', reference: 'UPI ref 4321' }
+    const b0 = await booking(id)
+    const body = { method: 'UPI', reference: 'UPI ref 4321', amount: bill.bill.amount, receivedOn: b0.visit_date, note: 'Paid by the group leader' }
     assert.equal((await staffPost(`${id}/record-payment`, body)).body.error.code, 'REAUTH_REQUIRED')
+    // Part of the bill, a day in the future or before the group arrived: refused, nothing recorded.
+    const part = await staffPost(`${id}/record-payment`, { ...body, amount: bill.bill.amount - 100_00, confirmCode: CONFIRM })
+    assert.deepEqual([part.status, part.body.error.code], [409, 'AMOUNT_MISMATCH'])
+    const later = await staffPost(`${id}/record-payment`, { ...body, receivedOn: addDays(b0.visit_date, 1), confirmCode: CONFIRM })
+    assert.equal(later.body.error.code, 'BAD_PAYMENT_DATE')
+    const early = await staffPost(`${id}/record-payment`, { ...body, receivedOn: addDays(b0.arrival_date, -1), confirmCode: CONFIRM })
+    assert.equal(early.body.error.code, 'BAD_PAYMENT_DATE')
+    assert.equal((await booking(id)).status, 'PAYMENT_DUE')
     const rec = await staffPost(`${id}/record-payment`, { ...body, confirmCode: CONFIRM })
     assert.equal(rec.status, 200, JSON.stringify(rec.body))
     assert.equal(rec.body.status, 'PACKING')
     const p = rec.body.payments.find((x) => x.kind === 'RECORDED')
-    assert.deepEqual([p.amount, p.status, p.method, p.reference, p.recordedBy], [bill.bill.amount, 'SUCCEEDED', 'UPI', 'UPI ref 4321', 'manager@mandimangoes.test'])
+    assert.deepEqual(
+      [p.amount, p.status, p.method, p.reference, p.receivedOn, p.note, p.recordedBy],
+      [bill.bill.amount, 'SUCCEEDED', 'UPI', 'UPI ref 4321', b0.visit_date, 'Paid by the group leader', 'manager@mandimangoes.test'],
+    )
+    const mineNow = await api.get(`/v1/farm-bookings/${id}`, { token: cust.accessToken })
+    assert.ok(!JSON.stringify(mineNow.body).includes('group leader'), 'remarks stay with staff')
     assert.equal((await staffPost(`${id}/record-payment`, { ...body, confirmCode: CONFIRM })).body.error.code, 'NOTHING_TO_PAY')
     const mine = await api.get(`/v1/farm-bookings/${id}`, { token: cust.accessToken })
     assert.deepEqual([mine.body.payment.status, mine.body.payment.method], ['PAID', 'UPI'])
@@ -537,7 +551,7 @@ describe('cancelling, moving and refunds', () => {
     const other = await booked(varietyId, { visitDate: VISIT() })
     const ob = await billed(other.id)
     const op = await startPay(other.cust, other.id)
-    await staffPost(`${other.id}/record-payment`, { method: 'CASH', reference: 'Receipt 77', confirmCode: CONFIRM })
+    await staffPost(`${other.id}/record-payment`, { method: 'CASH', reference: 'Receipt 77', amount: ob.bill.amount, confirmCode: CONFIRM })
     await webhook(captured(op.razorpayOrderId, ob.bill.amount, 'pay_c'))
     await drainBackground()
     await processDueRefunds()
