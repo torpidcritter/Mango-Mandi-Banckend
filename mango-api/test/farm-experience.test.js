@@ -534,6 +534,23 @@ describe('cancelling, moving and refunds', () => {
     assert.equal((await staffPost(`${visiting.id}/cancel`, { reason: 'Trying to cancel on site' })).body.error.code, 'NOT_CANCELLABLE')
   })
 
+  test('a group that does not come: marked only on or after the visit day, the kilograms go back, nothing to pay or refund', async () => {
+    const { varietyId } = await setupFarm()
+    const { id } = await booked(varietyId)
+    assert.equal((await staffPost(`${id}/hospitality`, { action: 'APPROVE' })).status, 200)
+    const b = await booking(id)
+    const held = (await harvestRow(varietyId, b.visit_date)).reserved_kg
+    assert.equal((await staffPost(`${id}/no-show`, {})).body.error.code, 'TOO_EARLY')
+    assert.equal((await staffPost(`${id}/no-show`, {}, await adminToken(api, 'ops@mandimangoes.test', 'operator123'))).status, 403)
+    setNow(new Date(`${b.visit_date}T12:00:00Z`))
+    const r = await staffPost(`${id}/no-show`, { note: 'No answer on the phone' })
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.status, 'NO_SHOW')
+    assert.equal((await harvestRow(varietyId, b.visit_date)).reserved_kg, held - 300)
+    const money = await one('SELECT (SELECT COUNT(*) FROM farm_booking_payments WHERE booking_id = $1)::int AS paid, (SELECT COUNT(*) FROM farm_refunds WHERE booking_id = $1)::int AS refunds', [id])
+    assert.deepEqual([money.paid, money.refunds], [0, 0])
+  })
+
   test('a customer moves the visit at once when it is early and the date has fruit', async () => {
     const { varietyId } = await setupFarm()
     const { cust, id } = await booked(varietyId)
