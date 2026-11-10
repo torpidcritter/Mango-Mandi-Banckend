@@ -36,6 +36,8 @@ export interface Me {
     subscriptions?: boolean
     /** Partner Network (PARTNER_NETWORK, docs/partner-network.md). On unless the API says false. */
     partnerNetwork?: boolean
+    /** Farm Experience (docs/farm-experience.md): Bulk Orders → Farm Experience Bookings and its pages. */
+    farmExperience?: boolean
   }
 }
 

@@ -25,6 +25,11 @@ export const STEP_UP_ROUTES = [
   { route: 'POST /batches/:id/purchases', always: true, when: 'Recording what a batch cost' },
   { route: 'PATCH /batches/:id/purchases/:purchaseId', always: true, when: 'Changing what a batch cost' },
   { route: 'PUT /settings/switches/:key', always: true, when: 'Turning a feature on or off' },
+  { route: 'POST /farm/bookings/:id/record-payment', always: true, when: 'Recording a farm bill paid at the farm (UPI, card, cash, bank)' },
+  { route: 'POST /farm/refunds/:id/settle', always: true, when: 'Recording a farm refund paid outside Razorpay' },
+  { route: 'POST /farm/varieties', always: true, when: 'Adding a farm variety with its price per kg' },
+  { route: 'PATCH /farm/varieties/:id', always: true, when: 'Changing a farm variety\'s price or tiers' },
+  { route: 'PUT /farm/settings', always: true, when: 'Changing Farm Experience settings, policies or opening bookings' },
   { route: 'PUT /whatsapp/automations/:kind', always: false, when: 'Turning an automated WhatsApp message on or off' },
   { route: 'POST /staff', always: false, when: 'Adding staff' },
   { route: 'PATCH /staff/:id', always: false, when: 'Changing a role or password' },
@@ -44,5 +49,6 @@ export const READ_AUDITED_ROUTES = [
   'GET /orders/:id', 'GET /manifest', 'GET /claims', 'GET /orders/:id/delivery-photos/:photoId', 'GET /claims/:id/photos/:photoId',
   'GET /whatsapp/conversations/:id', 'GET /whatsapp/media/:id',
   'GET /partner-network/enquiries/:id', 'GET /partner-network/enquiries/:id/documents/:documentId', 'GET /partner-network/product-proposals/:id',
+  'GET /farm/bookings/:id', 'GET /farm/check-in/:code',
 ]
 export const ALWAYS_AUDITED_READS = ['GET /customers/:id', 'GET /orders/:id/bill', 'GET /exports/:kind']

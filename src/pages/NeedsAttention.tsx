@@ -14,6 +14,7 @@ const STEP_LABEL: Record<string, string> = {
   'whatsapp-messages': 'Sending WhatsApp chat replies',
   'whatsapp-templates': 'Reading WhatsApp templates from Meta',
   'partner-followups': 'Queuing Partner Network follow-up alerts',
+  farm: 'Queuing farm visit reminders',
   refunds: 'Sending refunds',
   'duplicate-payments': 'Refunding second payments',
   preorders: 'Preorder jobs',

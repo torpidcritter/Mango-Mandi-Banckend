@@ -41,6 +41,10 @@ const GiftMany = lazy(() => import('./pages/GiftMany'))
 const GiftOrderPage = lazy(() => import('./pages/GiftOrder'))
 const Partner = lazy(() => import('./pages/Partner'))
 const PartnerApply = lazy(() => import('./pages/PartnerApply'))
+const Farm = lazy(() => import('./pages/Farm'))
+const FarmBook = lazy(() => import('./pages/Farm').then((m) => ({ default: m.FarmBook })))
+const FarmBookings = lazy(() => import('./pages/FarmBooking'))
+const FarmBookingPage = lazy(() => import('./pages/FarmBooking').then((m) => ({ default: m.FarmBookingPage })))
 
 /** A page whose code is still loading. */
 function Page({ children, fallback }: { children: ReactNode; fallback?: ReactNode }) {
@@ -104,6 +108,10 @@ function routeTitleKey(path: string): Key {
   if (/^\/gifts\/[^/]+$/.test(path)) return 'title.giftOrder'
   if (path === '/partner') return 'title.partner'
   if (path === '/partner/apply') return 'title.partnerApply'
+  if (path === '/farm-experience') return 'title.farm'
+  if (path === '/farm-experience/book') return 'title.farmBook'
+  if (path === '/farm-bookings') return 'title.farmBookings'
+  if (/^\/farm-bookings\/[^/]+$/.test(path)) return 'title.farmBooking'
   return 'title.notFound'
 }
 
@@ -129,7 +137,7 @@ export default function App() {
   // item: shopping keeps the header, and a sixth item there squeezed the search box at 1280px.
   const partner = useFeatures().partnerNetwork === true
   // Forms with a button at the bottom (checkout, claims, reviews, the partner enquiry) hide the tabs so they never cover it.
-  const focused = /^\/(checkout|review\/|reviews\/|partner\/apply)|\/claim$/.test(location.pathname)
+  const focused = /^\/(checkout|review\/|reviews\/|partner\/apply|farm-experience\/book)|\/claim$/.test(location.pathname)
   // The app shell worker follows the API's switches (SHOP_INSTALL, WEB_PUSH).
   useShellWorker()
   // The anonymous funnel steps follow the API's switch (FUNNEL_ANALYTICS); the visit is counted here.
@@ -246,6 +254,10 @@ export default function App() {
           <Route path="/gifts/:id" element={<RequireSignIn><Page><GiftOrderPage /></Page></RequireSignIn>} />
           <Route path="/partner" element={<Page><Partner /></Page>} />
           <Route path="/partner/apply" element={<Page><PartnerApply /></Page>} />
+          <Route path="/farm-experience" element={<Page><Farm /></Page>} />
+          <Route path="/farm-experience/book" element={<RequireSignIn><Page><FarmBook /></Page></RequireSignIn>} />
+          <Route path="/farm-bookings" element={<RequireSignIn><Page><FarmBookings /></Page></RequireSignIn>} />
+          <Route path="/farm-bookings/:id" element={<RequireSignIn><Page><FarmBookingPage /></Page></RequireSignIn>} />
           <Route
             path="*"
             element={

@@ -385,8 +385,9 @@ h3 {
   background: transparent;
 }
 
-/* Narrower than 1100px the bar shows only the role; the email is still read out and is in the menu. */
-@media (max-width: 1099.98px) {
+/* Narrower than 1300px the bar shows only the role, so the menu groups fit on one row; the email
+   is still read out and is in the menu. */
+@media (max-width: 1299.98px) {
   .account-email {
     position: absolute;
     width: 1px;
@@ -455,8 +456,15 @@ h3 {
   .nav-group-label {
     display: none;
   }
+  /* The groups wrap onto a second row rather than push the page wider (more groups appear as
+     switches turn on, e.g. Bulk Orders with FARM_EXPERIENCE). */
+  .app-nav {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
   .nav-groups {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-1);
   }
@@ -2452,5 +2460,59 @@ tr.row-flagged td {
 @media (min-width: 640.02px) {
   .pn-sort-phone {
     display: none;
+  }
+}
+
+/* Farm Experience (docs/farm-experience.md) */
+.tile-btn {
+  width: 100%;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+.farm-room-row {
+  padding: var(--space-2, 0.5rem) 0;
+  border-bottom: 1px solid var(--line, #e5e5e5);
+}
+.farm-faq-edit {
+  border: 1px solid var(--line, #e5e5e5);
+  border-radius: 8px;
+  padding: var(--space-3, 0.75rem);
+}
+.input-narrow {
+  width: 5rem;
+}
+.farm-facts {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+.farm-facts > div {
+  display: grid;
+  grid-template-columns: minmax(7rem, 11rem) 1fr;
+  gap: var(--space-3);
+}
+.farm-facts dt {
+  color: var(--text-muted);
+}
+.farm-facts dd {
+  margin: 0;
+}
+.farm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.farm-save {
+  position: sticky;
+  bottom: 0;
+  padding: var(--space-3) 0;
+  background: var(--surface, var(--bg));
+}
+@media (max-width: 560px) {
+  .farm-facts > div {
+    grid-template-columns: 1fr;
+    gap: 0;
   }
 }

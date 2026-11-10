@@ -9,6 +9,7 @@ import { ProductImage, photoAt } from '../mango'
 import { useStore } from '../store'
 import { DocTitle, ErrorNote, Skeleton } from '../ui'
 import { useT } from '../i18n'
+import { useFeatures } from '../features'
 
 export const bulkDealsQuery = (pincode: string | null) => ({ queryKey: ['bulk-deals', pincode], queryFn: () => api.bulkDeals(pincode) })
 
@@ -17,12 +18,23 @@ export default function BulkDealsPage() {
   const { pincode } = useStore()
   const q = useQuery(bulkDealsQuery(pincode))
   const t = useT()
+  // Farm Experience (FARM_EXPERIENCE): a farm visit with 250 kg or more, booked from here.
+  const farm = useFeatures().farmExperience === true
   return (
     <>
       <header className="bulk-intro">
         <h1>{t('nav.bulk')}</h1>
         <p className="muted">{t('bulk.intro')}</p>
       </header>
+      {farm && (
+        <section className="card farm-card">
+          <h2>{t('farm.cardTitle')}</h2>
+          <p>{t('farm.cardBody', { min: 250 })}</p>
+          <Link to="/farm-experience" className="btn btn-primary">
+            {t('farm.cardCta')}
+          </Link>
+        </section>
+      )}
       {q.isPending ? (
         <Skeleton label={t('bulk.loading')} cards={3} tall />
       ) : q.isError ? (

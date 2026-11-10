@@ -12,7 +12,7 @@ It is generated from the reviewed role snapshot (`mango-api/test/fixtures/role-p
 - **Audit.** Every successful change is written to `staff_audit` (who, route, target, body without secrets). The table is append-only.
   Views marked here record who looked at customer details. See [authorization.md](authorization.md).
 
-239 routes; 23 ask for step-up.
+271 routes; 28 ask for step-up.
 
 ## Your account
 
@@ -304,6 +304,38 @@ It is generated from the reviewed role snapshot (`mango-api/test/fixtures/role-p
 
 | Route | Manager | Operator | Packer | QC | Rider | Step-up | Audit |
 |---|:-:|:-:|:-:|:-:|:-:|---|---|
+| `GET /farm/bookings` | ✓ | ✓ |  |  |  |  |  |
+| `GET /farm/bookings/:id` | ✓ | ✓ |  |  |  |  | Views (STAFF_AUDIT_TRAIL) |
+| `PATCH /farm/bookings/:id` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/bill` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/cancel` | ✓ |  |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/harvest` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/hospitality` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/move` | ✓ |  |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/no-show` | ✓ |  |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/notes` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/record-payment` | ✓ |  |  |  |  | Always: recording a farm bill paid at the farm (UPI, card, cash, bank) | Each change |
+| `POST /farm/bookings/:id/request/decline` | ✓ |  |  |  |  |  | Each change |
+| `PUT /farm/bookings/:id/rooms` | ✓ | ✓ |  |  |  |  | Each change |
+| `POST /farm/bookings/:id/status` | ✓ | ✓ |  |  |  |  | Each change |
+| `GET /farm/calendar` | ✓ | ✓ |  |  |  |  |  |
+| `POST /farm/check-in` | ✓ | ✓ |  |  |  |  | Each change |
+| `GET /farm/check-in/:code` | ✓ | ✓ |  |  |  |  | Views (STAFF_AUDIT_TRAIL) |
+| `POST /farm/days` | ✓ |  |  |  |  |  | Each change |
+| `PUT /farm/days/:date` | ✓ |  |  |  |  |  | Each change |
+| `PUT /farm/harvest/:varietyId/:date` | ✓ |  |  |  |  |  | Each change |
+| `GET /farm/overview` | ✓ | ✓ |  |  |  |  |  |
+| `POST /farm/refunds/:id/settle` | ✓ |  |  |  |  | Always: recording a farm refund paid outside Razorpay | Each change |
+| `GET /farm/reports` | ✓ |  |  |  |  |  |  |
+| `GET /farm/reports/bookings.csv` | ✓ |  |  |  |  |  |  |
+| `GET /farm/rooms` | ✓ | ✓ |  |  |  |  |  |
+| `POST /farm/rooms` | ✓ |  |  |  |  |  | Each change |
+| `PATCH /farm/rooms/:id` | ✓ |  |  |  |  |  | Each change |
+| `GET /farm/settings` | ✓ | ✓ |  |  |  |  |  |
+| `PUT /farm/settings` | ✓ |  |  |  |  | Always: changing Farm Experience settings, policies or opening bookings | Each change |
+| `GET /farm/varieties` | ✓ | ✓ |  |  |  |  |  |
+| `POST /farm/varieties` | ✓ |  |  |  |  | Always: adding a farm variety with its price per kg | Each change |
+| `PATCH /farm/varieties/:id` | ✓ |  |  |  |  | Always: changing a farm variety's price or tiers | Each change |
 | `GET /partner-network/categories` | ✓ | ✓ |  |  |  |  |  |
 | `PATCH /partner-network/categories/:code` | ✓ |  |  |  |  |  | Each change |
 | `GET /partner-network/enquiries` | ✓ | ✓ |  |  |  |  |  |

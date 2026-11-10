@@ -39,6 +39,14 @@ const PnEnquiries = lazy(() => import('./pages/partner/Enquiries'))
 const PnEnquiryDetail = lazy(() => import('./pages/partner/EnquiryDetail'))
 const PnProposals = lazy(() => import('./pages/partner/Proposals'))
 const PnCategories = lazy(() => import('./pages/partner/Categories'))
+const FarmBookings = lazy(() => import('./pages/farm/Bookings'))
+const FarmBookingDetail = lazy(() => import('./pages/farm/BookingDetail'))
+const FarmCheckIn = lazy(() => import('./pages/farm/CheckIn'))
+const FarmCalendar = lazy(() => import('./pages/farm/Calendar'))
+const FarmHarvest = lazy(() => import('./pages/farm/Harvest'))
+const FarmRooms = lazy(() => import('./pages/farm/Rooms'))
+const FarmSettings = lazy(() => import('./pages/farm/Settings'))
+const FarmReports = lazy(() => import('./pages/farm/Reports'))
 const CustomerProfilePage = lazy(() => import('./pages/Customers').then((m) => ({ default: m.CustomerProfilePage })))
 const WhOverview = lazy(() => import('./warehouse/pages/Overview'))
 const WhReceive = lazy(() => import('./warehouse/pages/Receive'))
@@ -96,6 +104,12 @@ function SwitchedOn({ feature, children }: { feature: 'purchaseRecords' | 'panel
 function PartnerOn({ children }: { children: ReactNode }) {
   const { me } = useSession()
   return me?.features?.partnerNetwork === false ? <NotFound /> : <>{children}</>
+}
+
+/** Farm Experience (docs/farm-experience.md): only while /auth/me says its switch is on. */
+function FarmOn({ children }: { children: ReactNode }) {
+  const { me } = useSession()
+  return me?.features?.farmExperience ? <>{children}</> : <NotFound />
 }
 
 function Home() {
@@ -184,6 +198,15 @@ export default function App() {
               <Route path="/partner-network/proposals" element={<Only screen="partnerNetwork"><PartnerOn><PnProposals /></PartnerOn></Only>} />
               <Route path="/partner-network/proposals/:id" element={<Only screen="partnerNetwork"><PartnerOn><PnProposals /></PartnerOn></Only>} />
               <Route path="/partner-network/categories" element={<Only screen="partnerNetwork"><PartnerOn><PnCategories /></PartnerOn></Only>} />
+              <Route path="/farm" element={<Navigate to="/farm/bookings" replace />} />
+              <Route path="/farm/bookings" element={<Only screen="farmExperience"><FarmOn><FarmBookings /></FarmOn></Only>} />
+              <Route path="/farm/bookings/:id" element={<Only screen="farmExperience"><FarmOn><FarmBookingDetail /></FarmOn></Only>} />
+              <Route path="/farm/check-in" element={<Only screen="farmExperience"><FarmOn><FarmCheckIn /></FarmOn></Only>} />
+              <Route path="/farm/calendar" element={<Only screen="farmExperience"><FarmOn><FarmCalendar /></FarmOn></Only>} />
+              <Route path="/farm/harvest" element={<Only screen="farmExperience"><FarmOn><FarmHarvest /></FarmOn></Only>} />
+              <Route path="/farm/rooms" element={<Only screen="farmExperience"><FarmOn><FarmRooms /></FarmOn></Only>} />
+              <Route path="/farm/settings" element={<Only screen="farmExperience"><FarmOn><FarmSettings /></FarmOn></Only>} />
+              <Route path="/farm/reports" element={<Only screen="farmReports"><FarmOn><FarmReports /></FarmOn></Only>} />
               <Route path="/subscriptions" element={<Only screen="subscriptions"><Subscriptions /></Only>} />
               <Route path="/pincodes" element={<Only screen="pincodes"><Pincodes /></Only>} />
               <Route path="/planning" element={<Only screen="planning"><Planning /></Only>} />

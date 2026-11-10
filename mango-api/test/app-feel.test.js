@@ -206,9 +206,9 @@ describe('web push encryption (RFC 8291) and VAPID (RFC 8292), with node:crypto 
 describe('the switches the shop and panel read', () => {
   test('all off by default (Partner Network is on by default); each one on its own', async () => {
     const off = (await api.get('/v1/policy')).body.features
-    assert.deepEqual(off, { installApp: false, push: false, tracking: false, favourites: false, sortFilter: false, referrals: false, funnel: false, multiGift: false, partnerNetwork: true, languages: false })
+    assert.deepEqual(off, { installApp: false, push: false, tracking: false, favourites: false, sortFilter: false, referrals: false, funnel: false, multiGift: false, partnerNetwork: true, farmExperience: false, languages: false })
     Object.assign(env, { SHOP_INSTALL: true, SHOP_SORT_FILTER: true, FAVOURITES: true, LIVE_TRACKING: true })
-    assert.deepEqual((await api.get('/v1/policy')).body.features, { installApp: true, push: false, tracking: true, favourites: true, sortFilter: true, referrals: false, funnel: false, multiGift: false, partnerNetwork: true, languages: false })
+    assert.deepEqual((await api.get('/v1/policy')).body.features, { installApp: true, push: false, tracking: true, favourites: true, sortFilter: true, referrals: false, funnel: false, multiGift: false, partnerNetwork: true, farmExperience: false, languages: false })
     // Push needs the flag and a key to subscribe with.
     env.WEB_PUSH = true
     assert.equal((await api.get('/v1/policy')).body.features.push, false)

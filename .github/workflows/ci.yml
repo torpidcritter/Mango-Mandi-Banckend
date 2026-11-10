@@ -232,6 +232,8 @@ jobs:
           CUSTOMER_ACTION_LIMIT: '600'
           # The shop in Hindi and Kannada (docs/languages.md), on so customer-app/tests/languages.spec.ts runs.
           SHOP_LANGUAGES: 'true'
+          # Farm Experience (docs/farm-experience.md), on so customer-app/tests/farm.spec.ts runs.
+          FARM_EXPERIENCE: 'true'
       - run: npx playwright install --with-deps chromium
       - name: PDF text tool for the bill checks
         run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils

@@ -71,6 +71,27 @@ const GROUPS: { id: string; label: string; links: NavItem[] }[] = [
   },
 ]
 
+/**
+ * Farm Experience (docs/farm-experience.md): while its switch is on, Bulk Orders holds the regular
+ * Bulk Deals and the farm visit pages; while it is off, the menu is as it was (Bulk Deals under Admin).
+ */
+const BULK_ORDERS: NavItem[] = [
+  ['/bulk-deals', 'Bulk Deals', 'bulkDeals'],
+  ['/farm/bookings', 'Farm Experience Bookings', 'farmExperience'],
+  ['/farm/check-in', 'Farm check-in', 'farmExperience'],
+  ['/farm/calendar', 'Farm calendar', 'farmExperience'],
+  ['/farm/harvest', 'Harvest stock', 'farmExperience'],
+  ['/farm/rooms', 'Farmhouse rooms', 'farmExperience'],
+  ['/farm/settings', 'Farm settings', 'farmExperience'],
+  ['/farm/reports', 'Farm reports', 'farmReports'],
+]
+function withBulkOrders(me: Me | null | undefined) {
+  if (!me?.features?.farmExperience) return GROUPS
+  const groups = GROUPS.map((g) => (g.id === 'admin' ? { ...g, links: g.links.filter(([to]) => to !== '/bulk-deals') } : g))
+  groups.splice(groups.length - 1, 0, { id: 'bulk', label: 'Bulk Orders', links: BULK_ORDERS })
+  return groups
+}
+
 /** Screens that exist only while the API has their switch on (/auth/me features). */
 function switchedOn(me: Me | null | undefined, screen: Screen): boolean {
   if (screen === 'customers') return !!me?.features?.customerProfiles
@@ -80,6 +101,7 @@ function switchedOn(me: Me | null | undefined, screen: Screen): boolean {
   if (screen === 'subscriptions') return !!me?.features?.subscriptions
   // On unless the API says it is off: the contract has no /auth/me field for it yet.
   if (screen === 'partnerNetwork') return me?.features?.partnerNetwork !== false
+  if (screen === 'farmExperience' || screen === 'farmReports') return !!me?.features?.farmExperience
   return true
 }
 
@@ -102,7 +124,7 @@ export default function Layout() {
   // Set when a disclosure opens from its button, so the effect below moves focus into it.
   const focusInto = useRef(false)
 
-  const shown: { id: string; label: string; links: [to: string, label: string][] }[] = GROUPS.map((g) => ({
+  const shown: { id: string; label: string; links: [to: string, label: string][] }[] = withBulkOrders(me).map((g) => ({
     ...g,
     // Customer profiles only exist while the API has them switched on (/auth/me features).
     // Farms and Settings only while their switches are on (docs/ops.md), and so do the Help desk and

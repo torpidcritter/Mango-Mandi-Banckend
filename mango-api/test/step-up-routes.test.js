@@ -19,7 +19,7 @@ let srv
 let api
 let manager
 const CONFIRM = 'manager123'
-const FLAGS = ['STAFF_STEP_UP', 'PURCHASE_RECORDS', 'PANEL_FEATURE_SWITCHES', 'FAVOURITES']
+const FLAGS = ['STAFF_STEP_UP', 'PURCHASE_RECORDS', 'PANEL_FEATURE_SWITCHES', 'FAVOURITES', 'FARM_EXPERIENCE']
 const saved = Object.fromEntries(FLAGS.map((k) => [k, env[k]]))
 
 before(async () => {
@@ -76,6 +76,43 @@ async function batchWithPurchase() {
   assert.equal(b.status, 201, JSON.stringify(b.body))
   const body = { farmId: farm.body.id, purchasedOn: addDays(todayIST(), -1), crates: 4, boxes: 10, costPerCrate: 500_000, transportCost: 0, otherCost: 0 }
   return { batchId: b.body.id, body }
+}
+
+/** Farm Experience (docs/farm-experience.md): a farm ready for bookings, and bookings billed or paid on it. */
+async function farmReady() {
+  env.FARM_EXPERIENCE = true
+  const as = { token: manager }
+  const day = addDays(todayIST(), 10)
+  const v = await api.post('/admin/v1/farm/varieties', { name: 'Alphonso', pricePerKg: 12_000, confirmCode: CONFIRM }, as)
+  assert.equal(v.status, 201, JSON.stringify(v.body))
+  assert.equal((await api.put(`/admin/v1/farm/days/${day}`, { open: true }, as)).status, 200)
+  assert.equal((await api.put(`/admin/v1/farm/harvest/${v.body.id}/${day}`, { estimatedKg: 1000, bookableKg: 1000 }, as)).status, 200)
+  assert.equal((await api.post('/admin/v1/farm/rooms', { name: 'Room 1', sleeps: 4 }, as)).status, 201)
+  const settings = {
+    farmName: 'Test orchard', location: 'Test place', contactPhone: '+919800000000', arrivalInstructions: 'At the gate.', checkInTime: '10:00', checkOutTime: '11:00',
+    sleepingArrangements: 'Rooms', bathroomFacilities: 'Attached', meals: { breakfast: true, lunch: true, dinner: true, refreshments: false }, transportPolicy: 'Not included.',
+    weatherPolicy: 'Moved in heavy rain.', seasonStart: todayIST(), seasonEnd: addDays(todayIST(), 60), faqs: [{ q: 'Minimum?', a: '250 kg.' }], bookingsOpen: true,
+  }
+  const cur = await api.get('/admin/v1/farm/settings', as)
+  assert.equal((await api.put('/admin/v1/farm/settings', { settings, version: cur.body.version, confirmCode: CONFIRM }, as)).status, 200)
+  return { varietyId: v.body.id, day }
+}
+/** A booking weighed and billed (customers pay after picking): its bill is due. */
+async function billedFarmBooking() {
+  const { varietyId, day } = await farmReady()
+  const cust = await customerToken(api)
+  const body = { varietyId, kg: 300, visitDate: day, adults: 2, children: 0, overnightGuests: 0, contactName: 'Asha', acceptPolicies: true }
+  const b = await api.post('/v1/farm-bookings', body, { token: cust.accessToken, headers: { 'Idempotency-Key': newId('k') } })
+  assert.equal(b.status, 201, JSON.stringify(b.body))
+  await query(`UPDATE farm_bookings SET status = 'WEIGHING', harvested_kg = 300, accepted_kg = 300 WHERE id = $1`, [b.body.bookingId])
+  const bill = await api.post(`/admin/v1/farm/bookings/${b.body.bookingId}/bill`, {}, { token: manager })
+  assert.equal(bill.status, 200, JSON.stringify(bill.body))
+  return b.body.bookingId
+}
+async function paidFarmBooking() {
+  const id = await billedFarmBooking()
+  assert.equal((await api.post('/v1/dev/pay-farm', { bookingId: id, outcome: 'captured' })).body.result, 'paid')
+  return id
 }
 
 const BULK = {
@@ -173,6 +210,39 @@ const SCENARIOS = {
   'DELETE /staff/:id': async () => {
     const id = await staffId('packer@mandimangoes.test')
     return { path: `/staff/${id}`, method: 'DELETE', body: {}, ok: 204, unchanged: async () => Boolean(await one('SELECT 1 AS x FROM admin_users WHERE id = $1', [id])) }
+  },
+  'POST /farm/varieties': async () => {
+    env.FARM_EXPERIENCE = true
+    return { path: '/farm/varieties', body: { name: 'Kesar', pricePerKg: 9_000 }, ok: 201, unchanged: async () => !(await one(`SELECT 1 AS x FROM farm_varieties WHERE name = 'Kesar'`)) }
+  },
+  'PATCH /farm/varieties/:id': async () => {
+    const { varietyId } = await farmReady()
+    return {
+      path: `/farm/varieties/${varietyId}`, method: 'PATCH', body: { pricePerKg: 13_000, version: 1 }, ok: 200,
+      unchanged: async () => (await one('SELECT price_per_kg FROM farm_varieties WHERE id = $1', [varietyId])).price_per_kg === 12_000,
+    }
+  },
+  'PUT /farm/settings': async () => {
+    env.FARM_EXPERIENCE = true
+    const cur = (await api.get('/admin/v1/farm/settings', { token: manager })).body
+    return { path: '/farm/settings', method: 'PUT', body: { settings: { farmName: 'Ratnagiri orchard' }, version: cur.version }, ok: 200, unchanged: async () => (await one('SELECT version FROM farm_settings WHERE id = 1')).version === cur.version }
+  },
+  'POST /farm/bookings/:id/record-payment': async () => {
+    const id = await billedFarmBooking()
+    // The group arrived today (the helper skips the visit), so today's payment date is allowed.
+    const { bill_amount: amount } = await one('UPDATE farm_bookings SET arrival_date = $2 WHERE id = $1 RETURNING bill_amount', [id, todayIST()])
+    return { path: `/farm/bookings/${id}/record-payment`, body: { method: 'CASH', reference: 'Receipt 12', amount }, ok: 200, unchanged: async () => (await one('SELECT paid_at FROM farm_bookings WHERE id = $1', [id])).paid_at === null }
+  },
+  'POST /farm/refunds/:id/settle': async () => {
+    const id = await paidFarmBooking()
+    const pay = await one(`SELECT id, payment_id FROM farm_booking_payments WHERE booking_id = $1`, [id])
+    const refundId = newId('frf')
+    await query(
+      `INSERT INTO farm_refunds (id, booking_id, farm_payment_id, payment_id, amount, kind, reason, requested_by, requested_at, refund_gave_up_at)
+       VALUES ($1, $2, $3, $4, 1000, 'OVERPAID', 'test', 'test', $5, $5)`,
+      [refundId, id, pay.id, pay.payment_id, new Date(T0)],
+    )
+    return { path: `/farm/refunds/${refundId}/settle`, body: { reference: 'UPI 112233' }, ok: 200, unchanged: async () => !(await one('SELECT refunded_at FROM farm_refunds WHERE id = $1', [refundId])).refunded_at }
   },
   'POST /me/two-step/setup': async () => ({ path: '/me/two-step/setup', body: {}, ok: 200, unchanged: async () => !(await one(`SELECT totp_pending FROM admin_users WHERE email = 'manager@mandimangoes.test'`)).totp_pending }),
 }

@@ -66,11 +66,13 @@ export type Screen =
   | 'subscriptions'
   | 'whatsapp'
   | 'partnerNetwork'
+  | 'farmExperience'
+  | 'farmReports'
 
 const SCREENS: Record<Role, ReadonlySet<Screen> | 'all'> = {
   MANAGER: 'all',
   // Operators see farms without costs (docs/ops.md); Settings is for managers.
-  OPERATOR: new Set<Screen>(['today', 'batches', 'orders', 'orderDetail', 'packList', 'deliveries', 'claims', 'pincodes', 'planning', 'preorders', 'analytics', 'reviews', 'customers', 'farms', 'helpDesk', 'subscriptions', 'whatsapp', 'partnerNetwork']),
+  OPERATOR: new Set<Screen>(['today', 'batches', 'orders', 'orderDetail', 'packList', 'deliveries', 'claims', 'pincodes', 'planning', 'preorders', 'analytics', 'reviews', 'customers', 'farms', 'helpDesk', 'subscriptions', 'whatsapp', 'partnerNetwork', 'farmExperience']),
   PACKER: new Set<Screen>(['packList', 'deliveries', 'orderDetail']),
   // QC sees the Reviews page's ripeness accuracy only (no moderation).
   QC: new Set<Screen>(['batches', 'reviews']),

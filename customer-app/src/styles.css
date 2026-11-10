@@ -2781,3 +2781,110 @@ main:focus {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
+
+/* Farm Experience (FARM_EXPERIENCE): the landing page, the booking steps and a booking's itinerary. */
+.farm-card {
+  border-left: 4px solid var(--leaf);
+}
+.farm-hero h1 {
+  margin-bottom: var(--space-1);
+}
+.farm-name {
+  margin: 0 0 var(--space-2);
+  color: var(--mango-strong);
+  font-weight: 700;
+}
+.farm-journey,
+.farm-list {
+  margin: 0;
+  padding-left: var(--space-5, 1.5rem);
+  display: grid;
+  gap: var(--space-2);
+}
+.farm-varieties {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-3);
+}
+.farm-variety {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+}
+.farm-variety h3 {
+  margin: 0 0 var(--space-1);
+}
+.farm-variety p {
+  margin: 0 0 var(--space-1);
+}
+.farm-tiers {
+  margin: 0 0 var(--space-1);
+  padding-left: var(--space-4);
+}
+.farm-faqs details {
+  border-top: 1px solid var(--line);
+  padding: var(--space-2) 0;
+}
+.farm-faqs summary {
+  cursor: pointer;
+  font-weight: 600;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}
+.farm-step h2:focus {
+  outline: none;
+}
+.farm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0 var(--space-3);
+}
+.farm-quote {
+  font-weight: 700;
+}
+.farm-nav {
+  justify-content: space-between;
+  margin-top: var(--space-3);
+}
+.farm-checkin {
+  text-align: center;
+}
+.farm-checkin img {
+  display: block;
+  margin: 0 auto var(--space-2);
+  background: #fff;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+}
+.farm-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-lg, 1.25rem);
+  letter-spacing: 0.15em;
+  margin: 0;
+}
+.farm-meals {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: var(--space-3);
+  font-size: var(--text-sm, 0.9rem);
+}
+.farm-meals th,
+.farm-meals td {
+  border-bottom: 1px solid var(--line);
+  padding: var(--space-1) var(--space-2);
+  text-align: left;
+}
+.farm-meals caption {
+  text-align: left;
+  caption-side: top;
+}
+.farm-move {
+  display: grid;
+  gap: var(--space-2);
+}

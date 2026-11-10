@@ -142,6 +142,8 @@ const POLICY = object<ShopPolicy>({
       languages: optional('boolean'),
       // Partner With Us (docs/partner-network.md).
       partnerNetwork: optional('boolean'),
+      // Farm Experience (docs/farm-experience.md).
+      farmExperience: optional('boolean'),
     }),
   ),
   // Gift orders to many recipients (MULTI_GIFT): sent only while it is on.

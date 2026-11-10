@@ -47,6 +47,7 @@ import { sendManagerSummaries } from './manager-summary.js'
 import { rollupAndPruneFunnel } from './funnel.js'
 import { isOn, refreshSwitches } from './feature-switches.js'
 import { queueFollowupAlerts } from './partner/alerts.js'
+import { runFarmJobs } from './farm/jobs.js'
 import { runSubscriptionJobs } from './subscriptions.js'
 import { pruneWebhookEvents, replayWebhookEvents } from './webhook-events.js'
 import { counterProblems, stepProblems } from './alert-checks.js'
@@ -406,6 +407,8 @@ async function steps(forceAll) {
   if (isOn('SUBSCRIPTIONS')) out.subscriptions = await step('subscriptions', () => runSubscriptionJobs())
   // Partner Network follow-ups due within the hour or overdue: one team alert each (WHATSAPP_PARTNER_UPDATES, docs/partner-network.md).
   if (isOn('PARTNER_NETWORK') && env.WHATSAPP_PARTNER_UPDATES && env.PARTNER_ALERT_PHONES.length) out.partnerFollowups = await step('partner-followups', () => queueFollowupAlerts())
+  // Farm Experience (docs/farm-experience.md): visit reminders are queued before the send step.
+  if (isOn('FARM_EXPERIENCE')) out.farm = await step('farm', () => runFarmJobs())
   out.notified = await step('notifications', () => sendDueNotifications(), { sliceMs: SLICE.notifications })
   // Chat and staff replies decided but not sent (an instance died, or a retry is due): docs/whatsapp/RELIABILITY.md.
   out.chatSent = await step('whatsapp-messages', () => sendDueMessages(chatMessenger), { sliceMs: SLICE.notifications })
